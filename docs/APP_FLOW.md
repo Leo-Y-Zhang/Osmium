@@ -34,11 +34,14 @@ Two non-human entry points exist and matter as much:
 3. **Prompt.** The banner is followed by a blank line and the prompt, `osmium> `,
    with a visible caret. The kernel is idle in a halt loop between keystrokes.
 4. **The person types.** Each keystroke raises an interrupt, is decoded, and is
-   echoed at the caret. Backspace deletes leftwards, the arrow keys move within the
-   line, and Up and Down recall history. Nothing typed is written to the serial log.
+   echoed at the caret. Backspace deletes leftwards, and Up and Down recall history.
+   Nothing typed is written to the serial log — not the keystroke, not the line, not
+   the output it produces. That holds without qualification: the one route by which
+   typed text could have reached serial was the `panic` command's message, and it now
+   panics with a message fixed in the source.
 5. **They press Enter.** The line is parsed. The prompt line stays on screen, output
    is printed beneath it, and a fresh prompt follows. An unknown verb prints
-   `error: unknown command 'xyz'; try 'help'`, which is an outcome, not a failure
+   `unknown command: xyz (try 'help')`, which is an outcome, not a failure
    state: the shell is still at step 3.
 6. **They keep going, or they stop.** There is no exit. `shutdown` asks the machine
    to power off; anything else leaves them at the prompt indefinitely. Closing the
@@ -52,17 +55,17 @@ purpose is to clear the screen.
 
 | Command | Does | Error case |
 |---|---|---|
-| `help` | Lists every command with a one-line description. `help <cmd>` prints the longer form. | `help nosuch` → `error: unknown command 'nosuch'`. |
-| `echo <text>` | Prints its arguments back, after the shell's quoting rules. | Unterminated quote → `error: unterminated quote`. No arguments prints an empty line, which is correct, not an error. |
-| `clear` | Clears the character grid and redraws, prompt at the top. | None. |
-| `mem` | Heap used, free and total; usable physical memory; frames handed out; bytes zeroed so far. | None. Reads atomics and the heap's own counters. |
-| `uptime` | Time since kernel entry, from the 100 Hz tick counter, as `h m s`. | Before the timer is running (only reachable in a broken build) it prints `timer not running` rather than zero, because a plausible-looking zero is worse than saying nothing is known. |
-| `keymap` | Prints the active keyboard layout. `keymap uk` and `keymap us` switch it and confirm the change. | `keymap fr` → `error: unknown layout 'fr'; available: uk, us`. |
-| `sysinfo` | CPU vendor and brand string, feature flags relevant to the kernel, firmware type, framebuffer geometry and pixel format, tick rate, dropped-keystroke count, build profile and whether the `selftest` feature is compiled in. | None. |
-| `privacy` | Reports the three claims **as facts the build can support**, not as slogans: whether any networking or storage driver is compiled in (a compile-time constant, so it cannot drift from reality), that no filesystem is mounted because none exists, that zero-on-free is active, and the running total of bytes zeroed. Ends by naming the serial port as the one output channel and stating that typed input never reaches it. | None. |
-| `panic <message>` | Deliberately panics, to demonstrate the panic screen. Documented as a demonstration, not a defect. | None — it always succeeds by failing. |
-| `shutdown` | Asks the platform to power off. In QEMU this reaches the ACPI power-management port; on hardware without ACPI parsing there is no mechanism, so it falls back to a halt and prints `it is safe to switch off this machine. nothing was written to disk`, which is literally true here. | The fallback is not an error; it is the honest outcome and is worded as one. |
-| `selftest` | Runs the battery interactively and prints per-phase results to the screen. **The stack-overflow phase is skipped** in interactive mode, because it cannot return and would end the session; the screen says so rather than silently omitting it. | A failing phase prints in the danger colour, prefixed `FAILED:`, and the shell returns to the prompt. |
+| `help` | Lists every command with a one-line description. Arguments are ignored — there is no longer form. | None; it always prints the list. |
+| `echo <text>` | Prints its argument text back verbatim. There are no quoting rules; the text after the verb is one string. | None. No arguments prints an empty line, which is correct, not an error. |
+| `clear` | Clears the screen and homes the cursor; the next prompt is at the top. | None. |
+| `mem` | Heap used and free against its 1 MiB size; frames handed out of the usable total, with usable RAM in MiB. | None. Reads atomics and the heap's own counters. |
+| `uptime` | Time since interrupts came up, from the 100 Hz tick counter, as `up X.YY s (N ticks @ 100 Hz)`. | None. A broken timer shows a frozen count; proving the timer is the battery's job, not this command's. |
+| `keymap` | Prints the active keyboard layout. `keymap uk` and `keymap us` switch it and confirm the change. | `keymap fr` → `usage: keymap [us|uk]`. |
+| `sysinfo` | Version and architecture; the framebuffer's geometry, pixel format and depth; usable RAM and the size of the kernel heap; the active keymap; then the `uptime` line, tick rate included. Nothing about the CPU: reading vendor and brand strings means `cpuid`, and no part of Osmium needs to know, so it does not ask. | None. On a serial-only boot the display line is omitted rather than invented. |
+| `privacy` | Reports the four claims **as facts the build can support**, not as slogans: no network stack exists, nothing persists, freed heap blocks and handed-out frames are zeroed, and keystrokes render on this screen only, never on the serial port. Ends by stating that each claim is enforced by the CI self-test battery, not by policy. | None. |
+| `panic` | Deliberately panics, to demonstrate the panic screen. Documented as a demonstration, not a defect. **It takes no message argument, and that is a privacy decision rather than a missing feature:** a panic is reported on the serial port as well as the screen, so a message argument would be the one path by which something typed at this keyboard could reach serial. The message is fixed in the source instead. | None — it always succeeds by failing. Any text after the verb is ignored. |
+| `shutdown` | Prints `shutting down`, then exits the VM through the `isa-debug-exit` port under QEMU. On real hardware that port write is a no-op and the machine halts — safe to switch off, since nothing was ever written to disk. | The hardware fallback is not an error; it is the honest outcome. |
+| `selftest` | Re-runs the four checks that are safe to repeat — heap allocation, the zero-on-free sentinel, `int3`, and the PIT — printing one `[ ok ]` line each. It is the shell's own copy of them, not the boot battery itself: the battery is compiled in only under the `selftest` feature, and that build has no shell. **The paging probe and the stack overflow are left out**, because the probe maps a fixed address that cannot be mapped twice and the overflow cannot return. The screen does not currently name the two it leaves out, which is a gap in the output rather than in the tests. | A failing check prints `[FAIL]` in the danger colour instead of `[ ok ]`, and the shell returns to the prompt. |
 
 ## Every state of every screen
 
@@ -72,9 +75,9 @@ recorded rather than left blank.
 | Screen | Loading | Empty | Populated | Error | Unauthorised | Offline / slow |
 |---|---|---|---|---|---|---|
 | **Boot banner** | This screen *is* the loading state. Subsystem lines appear as each initialises, so a stall shows which subsystem it stalled in. | n/a — never empty; the banner is written before anything can be. | Banner plus initialisation lines plus the first prompt. | Init failure panics to the panic screen with the subsystem named. | **n/a — no accounts exist.** Whoever is at the keyboard is the operator. | **n/a — there is no network.** Every operation is local and completes in microseconds. |
-| **Shell prompt** | n/a — no waiting; the kernel halts between keystrokes and wakes on interrupt. | The first-run state: banner, blank line, `osmium> ` and a caret. It is explained, not blank: the banner directly above it says `type 'help' for commands`. | The prompt with a partially typed line and the caret at the cursor position. | A keystroke that produces no character (an unmapped key) is ignored silently; a full input buffer beeps nothing and simply refuses the character. | n/a | n/a |
-| **Command output** | n/a — every command completes in well under a frame. | A command with nothing to report says so in words: `mem` on an uninitialised heap prints `heap not initialised`, never a table of zeroes. | Output beneath the command line, then a new prompt. | `error: <what was wrong>; <what to do>`. Prefixed with `error:` in text, so the danger colour is reinforcement and never the only signal. The shell returns to the prompt; nothing is lost. | n/a | n/a |
-| **Panic screen** | n/a | n/a | n/a | **This screen is only ever the error state.** A danger-coloured band across the top carrying `KERNEL PANIC`, then the panic message, the source file and line, the register state and, where a fault provided one, the faulting address. The band, not a flooded background; see the [Design Brief](DESIGN_BRIEF.md) for why. The same text goes to serial. It ends with what to do: `this machine has stopped. nothing was written to disk. power-cycle to restart.` | n/a | n/a |
+| **Shell prompt** | n/a — no waiting; the kernel halts between keystrokes and wakes on interrupt. | The first-run state: banner, then `osmium> `. It is explained, not blank: the banner directly above it says `Type 'help' to begin.` | The prompt with a partially typed line; typed characters appear at the insertion point. | A keystroke that produces no character (an unmapped key) is ignored silently; a full input buffer beeps nothing and simply refuses the character. | n/a | n/a |
+| **Command output** | n/a — every command completes in well under a frame. | Commands with nothing to report still print their headline line rather than a blank. | Output beneath the command line, then a new prompt. | Errors are stated in words with the remedy inline — `unknown command: xyz (try 'help')`, `usage: keymap [us|uk]` — so text alone carries the signal and colour is never the only cue. The shell returns to the prompt; nothing is lost. | n/a | n/a |
+| **Panic screen** | n/a | n/a | n/a | **This screen is only ever the error state.** A danger-coloured `*** KERNEL PANIC ***` heading, then the panic message with its source file and line — for CPU exceptions the message includes the interrupt stack frame, and a page fault names the faulting address. Danger-coloured text, not a flooded background; see the [Design Brief](DESIGN_BRIEF.md) for why. The same text goes to serial. It ends with what to do: `The system is halted; reset the machine or close QEMU.` | n/a | n/a |
 
 Two entries above deserve to be stated outright rather than inferred from a table
 cell. **Unauthorised is not applicable because Osmium has no accounts, sessions or
@@ -142,11 +145,13 @@ it.
   cycle is the way back. That is a complete instruction, so it is a documented
   terminal state rather than a dead end in the defect sense.
 - **The halted state after `shutdown` on a platform with no power-off mechanism.**
-  Also terminal, also correctly worded: `it is safe to switch off this machine`.
+  Also terminal, and preceded by `shutting down`, so the stop is announced rather
+  than silent.
 
 Everything else returns to the prompt. There is no command that leaves the shell
 unresponsive, no modal state, and no way to get stuck part-way through entering
-something: Escape clears the current line and returns to an empty prompt.
+something: backspace erases and Enter always submits (a blank line is simply a new
+prompt).
 
 ## Accessibility
 
@@ -162,10 +167,11 @@ claimed is claimed, and the design choices that follow are made because of it.
 - **Focus is unambiguous and always visible.** There is one focus point, the caret at
   the prompt, and it is always rendered. There are no focusable elements to order and
   nothing that can steal focus.
-- **Colour is never the only signal.** Errors are prefixed `error:` in text; a failing
-  self-test phase is prefixed `FAILED:`; the panic screen is headed `KERNEL PANIC` in
-  words. Every one of these reads correctly in monochrome, and it has to, because the
-  serial log is monochrome and the serial log is what CI reads.
+- **Colour is never the only signal.** A failing self-test check is marked `[FAIL]`
+  where a passing one reads `[ ok ]`; an unknown command says so in words; the panic
+  screen is headed `KERNEL PANIC` in words. Every one of these reads correctly in
+  monochrome, and it has to, because the serial log is monochrome and the serial log
+  is what CI reads.
 - **The serial console carries the same content as the screen**, which makes it the
   practical accessibility route: a person who cannot read the framebuffer can read
   the serial stream in a terminal on the host, where their own assistive technology

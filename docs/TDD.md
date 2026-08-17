@@ -1,6 +1,6 @@
 # TDD — Osmium v1 kernel
 
-**Status:** draft — one open question blocks milestone M2; M0 and M1 are unblocked
+**Status:** current — matches the shipped v0.1.0 code; both open questions are resolved below
 **Date:** 2026-08-17 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
 
 ## Approach
@@ -18,9 +18,9 @@ tooling and never tries to build the kernel for the host.
 The workspace is pinned to a specific nightly in `rust-toolchain.toml`. This is not
 because the kernel wants nightly features: the `bootloader` crate's build script
 uses `-Zbuild-std` to compile its boot stages, which requires a nightly Cargo. The
-kernel's own use of unstable features is held to an allowlist enforced in CI (see
-Open Questions; the allowlist is currently proposed as exactly one entry, and that
-proposal is the open question).
+kernel's own use of unstable features is held to an allowlist enforced in CI —
+exactly one entry, `abi_x86_interrupt`; the Open Questions section records how
+that was decided.
 
 Everything the kernel claims about itself is proved by an in-kernel self-test
 battery compiled behind the `selftest` Cargo feature. The battery runs at boot,
@@ -53,7 +53,7 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 | Region | Virtual address | Size | Notes |
 |---|---|---|---|
 | Kernel heap | `0x_4444_4444_0000` | 1 MiB | Chosen to be obviously synthetic in a fault dump. Mapped page by page at M3 from frames supplied by the frame allocator. |
-| Double-fault stack (IST 0) | Allocated in `.bss` | 20 KiB | A `static mut` array; its top is written into `TSS.interrupt_stack_table[0]`. Never overlaps the kernel stack; that separation is the entire point of it. |
+| Double-fault stack (IST 0) | Allocated in `.bss` | 20 KiB | `DOUBLE_FAULT_STACK`: a byte array inside an `UnsafeCell` (which is what keeps it out of read-only memory) rather than a `static mut`, so no `&mut` to a mutable static is ever formed. Its top is written into `TSS.interrupt_stack_table[0]`. Never overlaps the kernel stack; that separation is the entire point of it. |
 | Physical memory window | Bootloader-chosen | All of RAM | Read via `boot_info.physical_memory_offset`; never hard-coded. |
 
 ### Global state table
@@ -64,42 +64,49 @@ interrupt-context deadlocks.
 
 | Global | Type | Initialised at | Protected by | Touched from IRQ? |
 |---|---|---|---|---|
-| `GDT` | `GlobalDescriptorTable` + selectors | M2, once | `spin::Lazy`, then immutable | No |
+| `GDT` | `GlobalDescriptorTable` + selectors | M2, once | `spin::LazyLock`, then immutable | No |
 | `TSS` | `TaskStateSegment` | M2, once | Immutable after load | Read by CPU only |
-| `IST0_STACK` | `[u8; 20 KiB]` | Static, in `.bss` | Written only by the CPU on double fault | Yes, by hardware |
-| `IDT` | `InterruptDescriptorTable` | M2, once | `spin::Lazy`, then immutable | Read by CPU only |
+| `DOUBLE_FAULT_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` | Written only by the CPU on double fault | Yes, by hardware |
+| `IDT` | `InterruptDescriptorTable` | M2, once | `spin::LazyLock`, then immutable | Read by CPU only |
 | `PICS` | `ChainedPics` | M2 | `spin::Mutex` | **Yes** — end-of-interrupt write. Held for a few instructions; never nested with any other lock. |
 | `TICKS` | `AtomicU64` | M2 | Atomic, `Relaxed` | **Yes** — incremented by the timer handler. |
-| `SCANCODE_RING` | Fixed-capacity lock-free ring, 128 bytes, static | M2 | Atomic head/tail indices | **Yes** — the sole IRQ-to-task channel. Full ring drops the oldest byte and increments a counter; it never blocks and never allocates. |
-| `SERIAL` | `SerialPort` | M1 | `spin::Mutex`, **`try_lock` only from IRQ context** | Yes, under `try_lock` — a contended log line is dropped, not deadlocked. |
-| `CONSOLE` | Framebuffer writer + character shadow grid | M1 (grid at M3) | `spin::Mutex` | **Never.** This is the hard rule below. |
-| `ALLOCATOR` | Zeroing wrapper over `LockedHeap` | M3 | `spin::Mutex` inside the heap | **Never** — no allocation in interrupt context, which is why the scancode ring is static. |
-| `FRAME_ALLOCATOR` | Bump allocator over the boot memory map | M3 | `spin::Mutex` | No |
-| `SELFTEST_PHASE` | `AtomicUsize` | M1 | Atomic | Read by the double-fault handler; see the battery protocol below. |
-| `BOOT_TSC` | `AtomicU64` | M1 | Atomic | No |
-| `ZEROED_BYTES` | `AtomicU64` | M3 | Atomic | No. Reported by the `privacy` command as evidence that zero-on-free is live. |
+| `BREAKPOINT_HITS`, `SCANCODES_SEEN` | `AtomicUsize` | M2 | Atomic, `Relaxed` | **Yes** — bumped by the breakpoint and keyboard handlers. Counters only; nothing reads them in interrupt context. |
+| `SCANCODE_QUEUE` | `Once<ArrayQueue<u8>>`, capacity 128 | M4; the queue's storage is allocated on the first `ScancodeStream::new()`, in task context | Lock-free queue, `Once` for the one-time construction | **Yes** — the sole IRQ-to-task channel. The handler pushes and never blocks or allocates. A full queue drops the byte that has just arrived — the newest, not the oldest — and nothing counts the loss. Scancodes arriving before the queue exists are dropped for the same reason: nobody is typing during early boot. |
+| `WAKER` | `AtomicWaker` | M4 | Its own atomics | **Yes** — the keyboard handler wakes the shell task through it after a successful push. See the `ALLOCATOR` row for the one drop that entails. |
+| `SERIAL1` | `SerialPort` at `0x3F8` | M1 | `spin::Mutex`, taken with a plain `lock` | **No.** Handlers never write to serial at all. The single exception is the double-fault handler on its terminal path, which disables interrupts and reclaims the lock before printing, because the holder it interrupted can never resume. |
+| `CONSOLE` | `Option<Console>`: glyph renderer writing straight to the framebuffer | M1 | `spin::Mutex` | **Never.** This is the hard rule below. |
+| `ALLOCATOR` | Zeroing wrapper over `LockedHeap` | M3 | `spin::Mutex` inside the heap | **Never allocates from IRQ, and frees from it only in a case that cannot arise.** The keyboard handler's `WAKER.wake()` consumes a cloned `Waker` and drops its `Arc<TaskWaker>`; a *last* drop would deallocate here, in interrupt context, against a lock the interrupted code may hold. It is never the last, and the condition is worth stating because the code depends on it: the executor's `waker_cache` holds a reference for as long as the task exists, and the shell task never completes. A woken task that can finish would break this row, so this row changes before that code does. |
+| `MAPPER`, `FRAME_ALLOCATOR` | `Option<OffsetPageTable>`, `Option<BootFrameAllocator>` | M3 | `spin::Mutex` | No |
+| `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
 
 **The concurrency rule, stated once and enforced everywhere:** an interrupt handler
-never takes the console lock, and never takes any lock it cannot acquire with
-`try_lock`. The timer and keyboard handlers touch atomics and the static scancode
-ring only. Kernel logging from interrupt context goes to serial under `try_lock` and
-is dropped on contention. This rule is why the keyboard path is a static ring rather
-than a heap-backed queue, and it is the reason there is no plausible deadlock
-between the shell and the interrupt handlers.
+touches atomics, the lock-free scancode queue, and one lock — the PIC's, for the
+end-of-interrupt write, which the main thread never holds once interrupts are
+enabled. Nothing else. It never takes the console lock, never takes the serial lock,
+never allocates and never logs; there is no `try_lock` fallback because there is no
+contended access to fall back from. That is stronger than the rule this document
+first proposed, and it is the reason there is no plausible deadlock between the
+shell and the interrupt handlers. The one handler that does write to serial is the
+double-fault handler, which is a terminal path: it disables interrupts, reclaims the
+lock from a holder that can never resume, prints, and exits.
 
 ### Correction to the original plan: three memory-design decisions
 
 Recorded here because they contradict the approved plan and the correction must not
 be quietly re-litigated during implementation.
 
-1. **The console back-buffer is a character grid, not a pixel double buffer.** The
-   plan called for a heap-backed double buffer. At the resolutions this bootloader
-   negotiates, a pixel double buffer is 1.2 MiB (640×480×4) to 3 MiB (1024×768×4),
-   larger than the entire 1 MiB heap, and a tenth of the target RAM floor. A
-   character-cell shadow grid of `(cols × rows)` cells holding a byte and a colour
-   costs roughly 8 KiB, makes scrolling a memory move in RAM rather than a read back
-   from write-combining video memory, and supports redraw. The pixel double buffer
-   is rejected on both the heap budget and the lightness pillar.
+1. **The console keeps no back-buffer at all.** The plan called for a heap-backed
+   pixel double buffer. At the resolutions this bootloader negotiates that is 1.2 MiB
+   (640×480×4) to 3 MiB (1024×768×4) — larger than the entire 1 MiB heap and a tenth
+   of the target RAM floor — so it is rejected on both the heap budget and the
+   lightness pillar. What shipped is lighter still than the character-cell shadow
+   grid this section originally proposed in its place: glyphs are rendered straight
+   into the framebuffer, and scrolling moves whole pixel rows inside it with
+   `copy_within`, so the console costs no kernel RAM beyond its cursor and geometry.
+   Two consequences, stated rather than discovered later: scrolling reads video
+   memory back, which the grid was meant to avoid; and the console cannot
+   reconstruct what is on screen, so there is no redraw and no scroll-back. Whichever
+   of those is wanted first is what brings the 8 KiB grid with it.
 2. **Physical frames are zeroed when handed out, not when released.** The plan said
    released frames are zeroed. The v1 frame allocator is a bump allocator over the
    boot memory map and never releases a frame, so a zero-on-release claim would be
@@ -121,47 +128,65 @@ be quietly re-litigated during implementation.
 
 ## Interfaces
 
-Signatures are indicative; contracts are binding.
+These are the shipped signatures; the contracts beside them are binding.
 
 **`kshared`** — pure, host-tested, no allocator, no hardware.
 
 ```rust
-pub const fn align_up(addr: u64, align: u64) -> u64;      // exists (M0)
-pub const fn align_down(addr: u64, align: u64) -> u64;    // exists (M0)
+pub const fn align_up(addr: u64, align: u64) -> u64;      // M0
+pub const fn align_down(addr: u64, align: u64) -> u64;    // M0
+pub const FRAME_SIZE: u64 = 4096;
 
-/// Usable byte ranges derived from the boot memory map, with the ranges the
-/// bootloader has already claimed removed. Pure arithmetic over a slice of
-/// (start, len, kind) triples so it is testable without a machine.
-pub fn usable_regions(regions: &[Region]) -> impl Iterator<Item = Region> + '_;
+/// The start address of every whole frame inside `[start, end)`, with partial
+/// frames clipped at both edges. Pure arithmetic over two integers, so the
+/// frame allocator's region maths is testable without a machine; the kernel
+/// keeps the part that needs hardware — deciding which regions are usable.
+/// Degenerate ranges (empty, reversed, or too small to hold one aligned
+/// frame) yield nothing rather than erroring.
+pub fn frame_starts(start: u64, end: u64) -> impl Iterator<Item = u64>;
 
-/// Line editor over a caller-supplied buffer. No allocation; the kernel owns
-/// the storage. Returns what the caller must do to the screen, so the editor
-/// itself never touches the console.
-pub struct LineEditor<'a> { /* buffer, cursor, history ring */ }
-impl<'a> LineEditor<'a> {
-    pub fn feed(&mut self, key: Key) -> EditResult; // Redraw | Submit(&str) | Nothing
+/// What a fed character did to the line buffer. The editor never touches the
+/// console: it reports the action and the caller renders exactly that, so the
+/// screen and the buffer cannot drift apart.
+pub enum EditAction { Echoed(char), Erased, Submitted, Ignored }
+
+/// Fixed-capacity ASCII line editor. It owns its storage — `[u8; LINE_CAP]`,
+/// inline — so it needs no allocator and no caller-supplied buffer, and a
+/// character past capacity is `Ignored` rather than written anywhere. History
+/// lives in the shell, which owns the heap; the editor holds one line.
+pub const LINE_CAP: usize = 256;
+pub struct LineEditor { /* buf, len */ }
+impl LineEditor {
+    pub const fn new() -> Self;
+    pub fn feed(&mut self, c: char) -> EditAction;
     pub fn line(&self) -> &str;
+    pub fn clear(&mut self);
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn set_line(&mut self, s: &str);   // history recall; truncates at capacity
 }
 
-/// Command parsing: splits a submitted line into a verb and arguments, with the
-/// quoting and whitespace rules the shell documents. Returns a parse error the
-/// shell can print, never a panic.
-pub fn parse_command(line: &str) -> Result<Command<'_>, ParseError>;
+/// Command parsing: splits a submitted line into a verb and the remainder,
+/// both trimmed. A blank line is `None`, which the shell treats as a no-op.
+/// There are no quoting rules and no error type, because nothing a person can
+/// type here is a parse failure — an unknown verb is the shell's business to
+/// report, not the parser's.
+pub fn parse_command(line: &str) -> Option<(&str, &str)>;
 ```
 
 **`kernel`** — the module surface, in dependency order.
 
 ```rust
-mod serial;      // SerialPort at 0x3F8; try_lock accessor for IRQ context
-mod framebuffer; // PixelWriter keyed off Info { pixel_format, stride, bytes_per_pixel }
-mod console;     // Console: character grid + glyph rendering + scrolling + ANSI colour
+mod serial;      // COM1 at 0x3F8 behind a plain Mutex, plus the panic path's force-unlock
+mod framebuffer; // Display: safe slice writes keyed off FrameBufferInfo
+mod console;     // Console: glyph rendering, wrapping, scrolling, caller-set colour
 mod logger;      // log::Log impl fanning out to console and serial, honouring the lock rule
 mod gdt;         // init(): GDT, TSS, IST0 for the double-fault stack
 mod interrupts;  // init_idt(), PIC remap to 32..47, timer at 100 Hz, keyboard IRQ
 mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 MiB)
 mod task;        // executor (cooperative), keyboard (ScancodeStream)
 mod shell;       // prompt, dispatch, command implementations
-mod selftest;    // #[cfg(feature = "selftest")] battery + phase tracking
+mod selftest;    // #[cfg(feature = "selftest")] battery; arms EXPECTING_DOUBLE_FAULT last
 mod qemu;        // exit_success() / exit_failure() via port 0xf4
 ```
 
@@ -171,51 +196,74 @@ mod qemu;        // exit_success() / exit_failure() via port 0xf4
 cargo xtask build [--selftest]                 # both images, size budget asserted
 cargo xtask run   [--bios|--uefi] [--mem=MB]   # interactive QEMU
 cargo xtask test  [--bios|--uefi] [--mem=MB]   # headless; asserts exit 33 AND serial grep
+cargo xtask test --shipped                     # boots the real image; asserts it logs
+                                               #   "boot complete; shell ready"
 ```
 
-`xtask test` forces the `selftest` feature on, streams serial output while capturing
-it, kills QEMU after a 120-second timeout and reports a timeout as a hang rather
-than a failure, and rejects any exit code that is neither 33 nor 35.
+`xtask test` (without `--shipped`) forces the `selftest` feature on, streams serial
+output while capturing it, kills QEMU after a 120-second timeout and reports a
+timeout as a hang rather than a failure, and rejects any exit code that is neither
+33 nor 35. `--mem` defaults to the measured per-firmware floors (24 MiB BIOS,
+48 MiB UEFI).
 
 ### Self-test battery protocol
 
-The battery is a sequence of phases. Before each phase it stores the phase index in
-`SELFTEST_PHASE` and logs the phase name to serial. On completion of the final phase
-it prints `SELFTEST PASSED` and exits 33; any assertion failure prints
-`SELFTEST FAILED: <phase> <reason>` and exits 35.
+The battery is a straight sequence of checks in `selftest::run`. Each one prints a
+single `[selftest] <area>: <what it proved> ... ok` line to serial as it passes, so
+the log names the last check that got through and a hang sits between that line and
+the next check in `run`. A failed assertion panics, and the panic handler does the
+rest: it prints the panic to serial and to the console, then `SELFTEST FAILED`, then
+exits 35.
 
-**The final phase is the deliberate stack overflow, and it cannot return**. The
-double-fault handler ends it. That creates a trap the plan did not account for: if
-the double-fault handler unconditionally prints `SELFTEST PASSED`, then an
-*accidental* double fault during any earlier phase is reported as success, and the
-CI gate silently inverts. The handler therefore reads `SELFTEST_PHASE` first:
+**The final check is the deliberate stack overflow, and it cannot return.** The
+double-fault handler ends it, which means the handler — not `run` — prints the
+battery's `SELFTEST PASSED` and exits 33. That creates a trap the plan did not
+account for: a handler that printed `SELFTEST PASSED` unconditionally would report an
+*accidental* double fault in any earlier check as success, and the CI gate would
+silently invert. The handler therefore takes its verdict from a flag the battery
+arms: `EXPECTING_DOUBLE_FAULT`, an `AtomicBool` compiled in only under the `selftest`
+feature, stored `true` immediately before the recursion that overflows the stack, and
+never cleared.
 
-- phase == `StackOverflow` → the expected outcome; print `SELFTEST PASSED`, exit 33.
-- any other phase → print `SELFTEST FAILED: double fault during <phase>`, exit 35.
+- Flag set → the expected outcome. Disable interrupts, reclaim the serial lock from
+  a holder that can never resume, print the resilience line and `SELFTEST PASSED`,
+  exit 33.
+- Flag clear → fall through to `panic!("double fault ...")` with the interrupt stack
+  frame, which reaches the panic handler above and exits 35.
 
-In a non-selftest build the double-fault handler renders the panic screen and halts.
+A boolean rather than a phase counter because the window it guards is one statement
+wide: nothing except the overflow check ever sets it, and nothing runs after that
+check. A counter would carry the same information about this trap and one more state
+to keep in step with the code. In a non-selftest build the flag does not exist at
+all, the handler always panics, and the panic path renders the panic screen and halts.
 
 ## Access control
 
 There is no RLS, no definer function and no `anon` role; there is one privilege
 level and whoever holds the keyboard holds it. The analogous artefact — the list of
 places where the compiler's guarantees are suspended, and the invariant that must
-hold at each — is the unsafe-block inventory. **Every `unsafe` block in the kernel
-belongs to one of these categories and carries a `// SAFETY:` comment naming the
-invariant. An `unsafe` block that does not fit a category is a design change and
-needs this document updated first.**
+hold at each — is the unsafe inventory. **Every `unsafe` block and every `unsafe
+impl` in the kernel belongs to one of these categories and carries a `// SAFETY:`
+comment naming the invariant. Anything unsafe that does not fit a category is a
+design change and needs this document updated first.** The comment half of that rule
+is machine-checked rather than reviewed: `main.rs` carries
+`#![warn(clippy::undocumented_unsafe_blocks)]`, CI runs clippy with `-D warnings`,
+and the lint covers `unsafe impl` items as well as blocks. Two rows below describe
+categories that hold no `unsafe` at all any more; they are kept because the reason
+each is empty is the design.
 
 | # | Category | Where | Invariant that makes it sound |
 |---|---|---|---|
 | 1 | **Port I/O** | `serial`, `interrupts` (PIC/PIT/keyboard), `qemu` | The port number is a compile-time constant naming a device this kernel owns exclusively. No other code writes that port. Widths match the device (`0x3F8` byte, `0xF4` doubleword, `0x60` byte). Reads have no side effects beyond the documented device behaviour. Notably, port `0x60` **must** be read in the keyboard handler or the controller stops delivering interrupts. |
-| 2 | **Page-table manipulation** | `memory::paging`, `memory::heap` | The `OffsetPageTable` is constructed once from `boot_info.physical_memory_offset`, which the caller has already checked is `Some`. The complete physical memory is mapped at that offset, guaranteed by `Mapping::Dynamic` in the bootloader config and re-checked, not assumed. A frame handed to `map_to` came from the frame allocator and is therefore unaliased. The TLB is flushed before the new mapping is read. |
-| 3 | **Descriptor-table loading** | `gdt`, `interrupts::init_idt` | The GDT, TSS and IDT are `'static` and are never mutated after being loaded. Segment selectors written to `CS` and `SS` index entries that exist in the GDT that was just loaded. The IST0 pointer is the top of a 20 KiB static array that nothing else uses. |
-| 4 | **Framebuffer writes** | `framebuffer` | The base pointer, `stride`, `bytes_per_pixel` and `pixel_format` come from the `FrameBufferInfo` the firmware negotiated, never hard-coded, because UEFI GOP and BIOS VBE differ, and both are boot-tested for exactly this reason. Every write is bounds-checked against `stride × height × bytes_per_pixel` before the pointer is formed. Writes are volatile; the memory is device memory, not ordinary RAM. |
+| 2 | **Page-table manipulation** | `memory`, `memory::heap` | The `OffsetPageTable` is constructed once from `boot_info.physical_memory_offset`, which the caller has already checked is `Some`. The complete physical memory is mapped at that offset, guaranteed by `Mapping::Dynamic` in the bootloader config and re-checked, not assumed. A frame handed to `map_to` came from the frame allocator and is therefore unaliased. The TLB is flushed before the new mapping is read. |
+| 3 | **Descriptor-table loading** | `gdt`, `interrupts::init` | The GDT, TSS and IDT are `'static` and are never mutated after being loaded. Segment selectors written to `CS` and `SS` index entries that exist in the GDT that was just loaded. The IST0 pointer is the top of a 20 KiB static array that nothing else uses. |
+| 4 | **Framebuffer writes** — *empty: `framebuffer` contains no `unsafe` at all* | `framebuffer` | The bootloader hands the framebuffer over as a `&'static mut [u8]`, so there is no pointer to form and nothing to suspend: `Display::set_pixel` rejects out-of-range coordinates, then indexes through `get_mut`, and `scroll_region_up` moves rows with `copy_within`. `stride`, `bytes_per_pixel` and `pixel_format` are read from the negotiated `FrameBufferInfo`, never hard-coded, because UEFI GOP and BIOS VBE differ and both are boot-tested for exactly that reason. This is stronger than the raw-pointer-with-a-bounds-check design this row used to describe: there, the check is a promise a reviewer has to re-verify after every edit; here a wrong stride or depth drops a pixel and cannot reach memory outside the buffer, because the compiler will not let it. |
 | 5 | **`hlt` and interrupt-flag control** | idle loop, `panic`, critical sections | `hlt` touches no memory (`options(nomem, nostack, preserves_flags)`). The idle path uses the enable-then-halt sequence so that a wake-up racing the halt is not lost. Interrupts are disabled only around a section that provably cannot block. |
-| 6 | **Static mutable access** | `IST0_STACK`, ring indices | Access is through raw pointers or atomics, never a `&mut` to a `static mut`. The double-fault stack is written only by the CPU. |
+| 6 | **Mutable statics** — *also empty of `unsafe` blocks, by construction* | `gdt` | There is no `static mut` in the kernel, so no `&mut` to one is ever formed. The double-fault stack is a byte array inside an `UnsafeCell`, which is what keeps it writable and in `.bss`; taking its address is a safe call, and the memory itself is written only by the CPU, only while handling a double fault. Everything else that changes is an atomic or sits behind a `spin::Mutex`. The `unsafe impl Sync` that this arrangement needs is row 10. |
 | 7 | **Zeroing a block being freed** | `memory::heap` allocator wrapper | The pointer and layout are those the caller passed to `dealloc`, so the block is live, owned by the allocator at that instant, and exactly `layout.size()` bytes. Zeroing happens **before** the inner `dealloc`; afterwards the allocator owns those bytes and writing them would corrupt the free list. |
-| 8 | **Panic-time console lock recovery** | `panic` handler, double-fault handler | The panic path may run while the console lock is held, including from interrupt context, which is the one case the concurrency rule cannot prevent. The lock is therefore force-released before rendering. Sound only because the machine is stopping: the handler halts and never returns, no other code will observe the console again, and rendering a legible panic is worth more than a lock invariant that has no future reader. **This is the only place the console lock may be broken, and the only place any lock is force-released.** It is never a pattern to copy. |
+| 8 | **Panic-time lock recovery**, serial and console | `panic` handler, double-fault handler | A panic may happen while either lock is held, including from interrupt context, which is the one case the concurrency rule cannot prevent. The order is always the same: interrupts off, reclaim, then report. The panic handler reclaims both because it writes to both; the double-fault handler's selftest exit reclaims serial only, because serial is the only sink it uses. Sound only because the machine is stopping — the handler halts or exits and never returns, no other code will observe either sink again, and a legible panic is worth more than a lock invariant with no future reader. **These two handlers are the only places any lock is force-released.** It is never a pattern to copy. |
 | 9 | **Selftest-only reads of freed memory** | `selftest`, `#[cfg(feature = "selftest")]` only | Present only in test builds. Reads are volatile, through a raw pointer, within a block whose size is known, and the value is used solely for an assertion. Not compiled into a shipped image. Prefer the sentinel-absence test, which needs no such read; if a direct read is used, it is confined to this row. |
+| 10 | **`unsafe impl`** — a promise about a whole type, not one expression | `memory::frames`, `memory::heap`, `gdt` | Three of them, each carrying its `// SAFETY:` comment on the impl itself, since there is no block to attach one to. **`FrameAllocator for BootFrameAllocator`** promises a frame is never handed out twice: `next` only ever grows, and it indexes a deterministic iterator over a boot memory map that does not change after hand-over, so frame *n* is returned exactly once. **`GlobalAlloc for ZeroOnFree`** adds nothing to `LockedHeap`'s contract and defers to it for both calls; the only extra act is scrubbing a block the caller has already relinquished, in the window between the caller's last legal access and the inner `dealloc` — after that `dealloc` the allocator owns those bytes, which is why the order is fixed (row 7). **`Sync for DoubleFaultStack`** covers the `UnsafeCell` of row 6: nothing in the kernel reads or writes that memory, so there is no cross-thread access to make sound; only the CPU touches it, and only on a double fault. |
 
 ## Migrations
 
@@ -227,33 +275,37 @@ Every green milestone is committed and pushed.
 
 | # | Does | Reversible? | Rollback |
 |---|---|---|---|
-| **M0** | Workspace, pinned toolchain, halt-loop kernel, `xtask` producing both images, CI for fmt/clippy/stable/host-tests/image-build, these four documents. **Complete on disk; not yet committed.** | Yes | Delete the tree; nothing is published. |
+| **M0** | Workspace, pinned toolchain, halt-loop kernel, `xtask` producing both images, CI for fmt/clippy/host-tests/image-build, these four documents. **Committed, pushed, CI green — as are all later milestones.** | Yes | Delete the tree; nothing is published. |
 | **M1** | Framebuffer pixel writer, glyph console with scrolling, serial, `log` fan-out, panic screen to both sinks. Under `--features selftest`, print `SELFTEST PASSED` and exit 33 so CI has a boot gate from the first milestone. Add the `boot-test` matrix job. | Yes | `git revert` the range; M0 still boots. |
-| **M2** | GDT, TSS, IST0 (20 KiB), IDT with breakpoint, general-protection and page-fault handlers (page fault reports CR2) and double fault. PIC remapped to 32..47, PIT at 100 Hz, keyboard IRQ reading port `0x60` into the static scancode ring. Self-tests: `int3` returns, ticks advance, page-fault formatting. | Yes | `git revert`; M1's console still boots and still passes its battery. |
-| **M3** | Frame allocator over the boot memory map (region maths in `kshared`, host-tested), `OffsetPageTable`, 1 MiB heap so `alloc` is live, zeroing allocator wrapper, frames zeroed on hand-out, console gains its character shadow grid. Self-tests: `Box`, 100k-element `Vec`, reuse after free, fresh page reads zero, sentinel absent after free. | Yes | `git revert`; M2 is heap-free and unaffected. |
-| **M4** | Cooperative executor over `alloc::task::Wake` with a `crossbeam_queue::ArrayQueue` ready queue (valid here: the heap exists from M3), enable-then-halt idle, scancode ring drained into a `ScancodeStream`, decoded with `pc-keyboard` 0.9's `ScancodeSet1::advance_state` and `EventDecoder::process_keyevent`. Self-test: a spawned task provably runs. | Yes | `git revert`; M3's synchronous battery still passes. |
-| **M5** | Line editor and history from `kshared`, the full command surface, boot time in the banner from a PIT-calibrated timestamp counter, the complete battery ending with the stack-overflow phase, the RAM floor measured and pinned, the size budget tightened to the measured value, the shipped-image boot job, README screenshot. | Yes | `git revert` to the M4 tag; every earlier gate still holds. |
+| **M2** | GDT, TSS, IST0 (20 KiB), IDT with breakpoint, invalid-opcode, general-protection and page-fault handlers (page fault reports CR2) and double fault. PIC remapped to 32..47, PIT at 100 Hz, keyboard IRQ reading port `0x60` — with nowhere yet to put the byte, so it only counts it. Self-tests: `int3` returns, ticks advance. | Yes | `git revert`; M1's console still boots and still passes its battery. |
+| **M3** | Frame allocator over the boot memory map (frame arithmetic in `kshared`, host-tested), `OffsetPageTable`, 1 MiB heap so `alloc` is live, zeroing allocator wrapper, frames zeroed on hand-out. Self-tests: `Box`, a 50k-element `Vec`, reuse after free, fresh page reads zero, sentinel absent after free. | Yes | `git revert`; M2 is heap-free and unaffected. |
+| **M4** | Cooperative executor over `alloc::task::Wake` with a `crossbeam_queue::ArrayQueue` ready queue (valid here: the heap exists from M3), enable-then-halt idle, and the keyboard IRQ's real destination — a second `ArrayQueue` behind `ScancodeStream`, drained by the task side and decoded with `pc-keyboard` 0.9's `ScancodeSet1::advance_state` and `EventDecoder::process_keyevent`. Self-test: a spawned task yields, wakes itself and completes. | Yes | `git revert`; M3's synchronous battery still passes. |
+| **M5** | The line editor from `kshared` (history is the shell's, because history needs the heap), the full command surface, boot-to-shell time in the banner from the PIT tick count, the complete battery ending with the stack-overflow check, the RAM floor measured and pinned per firmware, the size budget tightened to the measured value, the shipped-image boot job, README screenshot. | Yes | `git revert` to the M4 tag; every earlier gate still holds. |
 
-**The sequencing correction the plan needs:** the keyboard interrupt lands at M2 and
-must read port `0x60` and store the byte somewhere, but the heap does not exist until
-M3, and `crossbeam_queue::ArrayQueue::new` allocates. The M2 destination is therefore
-the static, fixed-capacity `SCANCODE_RING` described above, which allocates nothing
-and blocks nothing. `crossbeam-queue` is used at M4 for the executor's ready queue
-only. This keeps the interrupt path allocation-free permanently, which is the right
-end state anyway.
+**How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
+port `0x60` — the controller delivers no further interrupts until it is read — but
+the heap does not exist until M3, and `crossbeam_queue::ArrayQueue::new` allocates.
+The M2 handler therefore reads the byte, counts it in an atomic and drops it; there
+is no shell to type at yet, so nothing is lost that anybody meant to send. The real
+destination arrives at M4 once the heap is live: an `ArrayQueue<u8>` of 128 entries,
+constructed once inside a `Once` on the first `ScancodeStream::new()` — that is, in
+task context, before the shell reads its first key. The interrupt path is
+allocation-free permanently, which is the property that mattered; it is bought by
+allocating the queue exactly once on the task side rather than by keeping the queue
+static, and the handler still allocates nothing and blocks on nothing.
 
 ## Failure modes
 
 | What breaks | Who notices | How we detect it | How we undo it |
 |---|---|---|---|
 | **Triple fault** — a fault while handling a fault while handling a fault; the CPU resets. Most likely cause is a broken IDT or a double fault without a valid IST stack. | CI, as a boot that never produces a verdict | QEMU runs with `-no-reboot`, so it exits instead of looping; `xtask` sees an exit code that is neither 33 nor 35 and fails with that code. Without `-no-reboot` this presents as a hang. | `git revert` the commit touching `gdt` or `interrupts`. The M2 gate exists precisely to catch this in one milestone's worth of diff. |
-| **Boot hang** — no faults, no progress: a spin lock taken twice, a loop with no exit, firmware that never hands over. | CI, as a job that stops producing output | `xtask` kills QEMU after 120 s and reports a timeout distinctly from a failure; the job also has its own timeout. The serial log is uploaded with `if: always()`, so the last phase reached is visible. | `git revert`. The phase logging means the log names the last phase that started, which localises the hang to one milestone's code. |
-| **Interrupt-context deadlock** — a handler blocks on a lock the interrupted code holds. Classically: logging to the console from the timer handler. | Nobody, until the machine stops responding | Prevented structurally, not detected: the concurrency rule above, plus code review against the global-state table's "touched from IRQ" column, plus `try_lock`-only serial access from handlers. | Not applicable if the rule holds. If one is found, the fix is to move the offending access out of interrupt context, never to make the lock reentrant. |
-| **Heap exhaustion** — the 1 MiB heap fills. | The person at the keyboard | `alloc_error_handler` is a clean panic naming the requested layout and the heap's used and free byte counts, rendered on the panic screen. Not a silent hang, not a corrupt allocation. | Reduce the allocation, or raise the heap size deliberately and re-measure the RAM floor in the same commit. |
-| **Insufficient physical memory at boot** — the machine has less RAM than the heap and mappings need. | CI at the pinned floor; a person on a small machine | The heap initialiser checks the frame allocator's supply before mapping and panics with "need X KiB, have Y KiB" rather than page-faulting halfway through. | Boot with more memory, or lower the heap size. The pinned CI floor is the regression test for this. |
+| **Boot hang** — no faults, no progress: a spin lock taken twice, a loop with no exit, firmware that never hands over. | CI, as a job that stops producing output | `xtask` kills QEMU after 120 s and reports a timeout distinctly from a failure; the job also has its own timeout. The serial log is uploaded with `if: always()`, so the last check to pass is visible. | `git revert`. Each battery check prints its own `[selftest]` line as it passes, so the hang is between the last line in the log and the next check in `selftest::run` — one function, not one milestone. |
+| **Interrupt-context deadlock** — a handler blocks on a lock the interrupted code holds. Classically: logging to the console from the timer handler. | Nobody, until the machine stops responding | Prevented structurally, not detected: the concurrency rule above, plus code review against the global-state table's "touched from IRQ" column. Handlers take one lock, the PIC's, and the main thread never holds it once interrupts are enabled. | Not applicable if the rule holds. If one is found, the fix is to move the offending access out of interrupt context, never to make the lock reentrant. |
+| **Heap exhaustion** — the 1 MiB heap fills. | The person at the keyboard | There is no custom `alloc_error_handler`; Rust's default one panics, naming the size of the allocation that failed. That is a panic like any other here: interrupts off, the message on serial and on the panic screen, halted — and in a selftest build, exit 35. Not a silent hang and not a corrupt allocation. It does not report the heap's used and free counts, and it does not need to: `mem` reports those on demand, before anything has failed. | Reduce the allocation, or raise `HEAP_SIZE` deliberately and re-measure the RAM floor in the same commit. |
+| **Insufficient physical memory at boot** — the machine has less RAM than the boot needs. | CI at the pinned floor; a person on a small machine | Measured at 0.25 MB granularity around the floor: the **bootloader** runs out first, panicking with `FrameAllocationFailed` while mapping the kernel, and the kernel never runs — there is no observed window where the kernel-side `mapping the kernel heap failed` panic fires instead (that path exists but is shadowed by the earlier failure). The bootloader's panic reaches serial; `xtask` recognises it in the captured log and reports a bootloader OOM rather than calling the timeout a kernel hang. | Boot with more memory, or lower `HEAP_SIZE`. The pinned CI RAM floor, measured per firmware, is the regression test for this. |
 | **No framebuffer from firmware** | A person seeing a blank screen | `boot_info.framebuffer` is `None`. Handled, not a fault: the console falls back to serial-only, logs the fallback, and the shell and battery still run. | None needed; this is a supported configuration. |
 | **Firmware-specific pixel format assumption** — code that works on BIOS VBE and corrupts under UEFI GOP, or vice versa. | Whoever boots the other firmware | The renderer reads `pixel_format`, `stride` and `bytes_per_pixel` from the negotiated `FrameBufferInfo`, and **both firmwares are boot-tested in the CI matrix**. A hard-coded assumption fails one leg of the matrix. | `git revert`; the matrix names which firmware broke. |
-| **Scancode ring overflow** — typing faster than the executor drains. | Nobody, in practice | The ring drops the oldest byte and increments a dropped-keystroke counter reported by `sysinfo`. Documented as lossy by design; it must never block an interrupt handler. | Not a fault. If the counter is ever non-zero in normal use, the executor is too slow and that is the bug to fix. |
+| **Scancode queue overflow** — typing faster than the executor drains. | Nobody, in practice | The handler drops the byte it has just read — the newest — and nothing counts the loss, so there is no signal to watch. That is acceptable only because the case is unreachable in interactive use: the queue holds 128 scancodes, and the executor drains it on every wake, so filling it would need something on the order of a hundred keystrokes between two polls of a task that is woken by each one. Lossy by design, and never blocking, is the property that matters in an interrupt handler. | Not a fault. If it ever does happen the visible symptom is a swallowed keystroke, and the bug to fix is whatever is keeping the executor from being scheduled — not the queue. |
 | **Pinned nightly stops resolving or changes behaviour** | The first CI run after the pin moves | Every job fails at toolchain install or at build. | The pin is bumped only in a dedicated pull request that changes nothing else, so reverting that one commit restores a known-good toolchain. |
 | **Bootloader build stages fail to fetch** | First build on a cold cache | `bootloader` is pinned with `=0.11.17`, `Cargo.lock` is committed, and the CI cache is keyed on it. A fetch failure fails the `image-build` job loudly. | Re-run; if persistent, the pin is the thing to investigate, not the kernel. |
 | **A self-test passes vacuously** — asserts a property it does not exercise. | Nobody, which is what makes it the worst entry in this table | Each self-test must be **observed failing once** under a deliberate mutation before it counts as a test: break the zeroing wrapper, break the frame zeroing, remove the IST assignment, stop reading port `0x60`. Both outputs — the failing run and the passing run — are recorded. | Rewrite the test. A test that cannot be made to fail is deleted, not kept for reassurance. |
@@ -269,15 +321,17 @@ construction: no data has to be reconciled, because no data exists.
 
 Time to undo: one `git revert` plus one CI run, under fifteen minutes on a warm
 cache, and the person doing it at 2am needs to know nothing beyond which milestone
-introduced the fault, which the serial log's phase names tell them.
+introduced the fault, which the serial log's `[selftest]` lines tell them.
 
 Two rollbacks are cheap but need naming, because they are the ones that will
 actually be reached for:
 
 - **A toolchain pin bump** is always its own commit that changes nothing else, so
   reverting it cannot take working kernel code with it.
-- **A dependency addition** is likewise its own commit, together with the
-  allowlist update, so the allowlist and the tree cannot drift apart.
+- **A dependency addition** is likewise its own commit, so reverting it cannot take
+  working kernel code with it either — and if the crate trips the
+  `no-network-no-storage` gate, that has to be faced in the same commit rather than
+  discovered in someone else's.
 
 Nothing in v1 is irreversible. The only genuinely destructive act available in this
 project is repository deletion, which is out of scope for any automated process.
@@ -291,41 +345,53 @@ must be seen to break it.
 **Host tests — `cargo test -p kshared`** (fast, run on every push)
 
 - *Positive:* `align_up`/`align_down` round correctly at, above and below a page
-  boundary (present at M0). `usable_regions` yields exactly the usable ranges of a
-  representative boot memory map. The line editor inserts, deletes, moves and
-  submits; history recalls in order. `parse_command` splits verbs and arguments.
-- *Negative:* `parse_command` returns a `ParseError` — never a panic — on an
-  unterminated quote and on an unknown verb. The line editor refuses input past the
-  end of the caller's buffer instead of writing past it.
-- *Boundary:* an empty memory map yields no regions; a region of length zero is
-  dropped; a region ending exactly at a page boundary is not truncated; an empty
-  line submits as a no-op rather than an error; a line exactly the buffer's length
-  submits, and one byte more is rejected.
-- *Mutation:* invert the rounding direction in `align_up`; drop the last region in
-  `usable_regions`. Both must turn the suite red.
+  boundary (present at M0). `frame_starts` yields every whole frame of a range and
+  clips the partial ones at both edges. The editor echoes, accumulates, backspaces
+  and submits without storing the newline; `set_line` replaces the line for history
+  recall. `parse_command` splits a verb from its arguments and trims both.
+- *Negative:* the editor ignores everything it cannot hold or render — a character
+  past `LINE_CAP`, a control character, a non-ASCII one — reporting `Ignored`
+  instead of writing anywhere, and backspace on an empty line is `Ignored` rather
+  than an underflow. `parse_command` returns `None` on a blank line instead of an
+  empty verb. Neither has an error type, because neither has a way to fail: an
+  unknown verb is the shell's to report.
+- *Boundary:* a reversed range, an empty one, and one too small to hold a single
+  aligned frame all yield nothing; a range that is already frame-aligned is not
+  truncated; a line of exactly `LINE_CAP` characters is accepted and the next
+  character refused; `set_line` truncates at capacity rather than running past it.
+- *Contract:* one test rebuilds the line buffer from the returned `EditAction`s
+  alone and compares it with `line()` after every single keystroke — through a
+  typed-and-corrected line, over the capacity ceiling and back, then a
+  20,000-keystroke storm mixing printable, control, edit and non-ASCII characters.
+  That is what makes "the renderer cannot drift from the buffer" a checked property
+  rather than a convention, and it is why `feed` returns an action at all.
+- *Mutation:* invert the rounding direction in `align_up`; clip one frame too many
+  in `frame_starts`; return `Echoed` for a character the editor did not store. Each
+  must turn the suite red.
 
 **In-kernel battery — `cargo xtask test --bios` and `--uefi`, at the pinned floor**
 
 - *Positive, per milestone:* the banner reaches serial (M1); `int3` returns to the
   next instruction and the timer's tick count advances (M2); a `Box` allocates, a
-  100,000-element `Vec` grows and frees, and a freed block is reused (M3); a spawned
-  task provably runs and sets a flag the battery reads (M4); the full battery
-  completes and every phase logged is a phase that ran (M5).
+  50,000-element `Vec` grows and frees, and a freed block is reused (M3); a spawned
+  task yields, wakes itself through the ready queue and completes, setting a flag the
+  battery reads (M4); the full battery completes and every line it logged is a check
+  that ran (M5).
 - *Negative — the privacy claims, which are the tests that justify the project:*
   a sentinel word written throughout a heap block appears **nowhere** in the
   allocation handed back after that block is freed; a freshly mapped page reads as
   all zero before anything writes to it.
 - *Negative — the survivability claim:* a deliberate kernel stack overflow raises a
   double fault, the handler runs on IST0, and the verdict it prints depends on
-  `SELFTEST_PHASE`, so an accidental double fault in an earlier phase prints
-  `FAILED` and exits 35.
+  `EXPECTING_DOUBLE_FAULT`, which only the overflow check arms — so an accidental
+  double fault anywhere earlier panics, prints `SELFTEST FAILED` and exits 35.
 - *Boundary:* the battery passes at the pinned minimal RAM, not merely at a
   comfortable default. Both firmwares pass. The default, non-selftest image reaches
   the interactive prompt; the shipped artefact is boot-proven, not just its test
   sibling. Both images are under the size budget.
 - *Mutation, each observed failing once:* remove the zeroing wrapper (the sentinel
   test must fail); stop zeroing frames on hand-out (the fresh-page test must fail);
-  remove the IST0 assignment (the stack-overflow phase must triple-fault into a
+  remove the IST0 assignment (the stack-overflow check must triple-fault into a
   non-33 exit rather than passing); stop reading port `0x60` in the keyboard handler
   (input must stop after one keystroke); hard-code a pixel format (one firmware leg
   of the matrix must fail).
@@ -336,9 +402,17 @@ must be seen to break it.
 - The unstable-feature allowlist gate (see Open Questions): the set of
   `#![feature(...)]` attributes in `kernel/` must equal the allowlist exactly.
   *Mutation:* add any feature attribute; the job must fail.
-- The dependency allowlist gate: the kernel's resolved dependency set must equal
-  the allowlist. *Mutation:* add a crate; the job must fail. This is what makes "no
-  network stack exists" a checked statement rather than a promise.
+- The `no-network-no-storage` gate: a job that greps `kernel/src`, `kshared/src` and
+  `kernel/Cargo.toml` for the tokens a network or storage driver would have to bring
+  with it — `smoltcp`, `tcp`, `socket`, `ethernet`, `virtio`, `dhcp`, `http`,
+  `fatfs`, `ext4`, `nvme`, `ahci`, `ata` and their neighbours — and fails on a hit.
+  Source and manifest, not the resolved dependency graph: it catches a driver written
+  by hand as well as one pulled in as a crate, which an allowlist over
+  `cargo metadata` would not. *Mutation:* add a crate or a module with any of those
+  names; the job must fail. This is what makes "no network stack exists" a checked
+  statement rather than a promise. Its reach is worth stating too: it is a token
+  grep, so a crate with an innocuous name still needs a person to notice it. The gate
+  makes adding networking a deliberate act, not an impossible one.
 - Image size budget, asserted in `xtask build` on every build.
 
 **Manual, once, before v1 is tagged**
@@ -359,20 +433,23 @@ must be seen to break it.
    then the panic screen. Add `SELFTEST PASSED` and the exit device. Add the
    `boot-test` CI matrix over `{bios, uefi}`. From here on, every push is
    boot-proven.
-4. **Add the dependency-allowlist CI job.** Cheap, and it is the gate that makes the
-   PRD's first privacy claim checkable. Doing it before more crates land means it
-   never has to be retrofitted.
+4. **Add the `no-network-no-storage` CI job.** Cheap, and it is the gate that makes
+   the PRD's first privacy claim checkable. Doing it before more code lands means it
+   never has to be retrofitted against a tree that already violates it.
 5. **M2:** GDT and TSS with IST0 first, then the IDT with breakpoint and double
    fault, then general protection and page fault, then the PIC remap, then the PIT,
-   then the keyboard handler and the static scancode ring. Self-tests as each lands.
-6. **M3:** region maths in `kshared` with host tests first, then the frame allocator,
-   then `OffsetPageTable`, then the heap, then the zeroing wrapper, then the console
-   shadow grid. The two privacy self-tests land with the code they test, and each is
-   observed failing under its mutation before the milestone is called done.
-7. **M4:** executor, waker, `ScancodeStream`, `pc-keyboard` decode. Note that
-   `pc-keyboard` 0.9's API differs from the widely copied 0.7-era examples.
-8. **M5:** line editor and history in `kshared` (host-tested before wiring), then the
-   command surface, then the banner's boot time, then the stack-overflow phase last.
+   then the keyboard handler, which reads port `0x60` and counts the byte until M4
+   gives it somewhere to go. Self-tests as each lands.
+6. **M3:** frame arithmetic in `kshared` with host tests first, then the frame
+   allocator, then `OffsetPageTable`, then the heap, then the zeroing wrapper. The two
+   privacy self-tests land with the code they test, and each is observed failing under
+   its mutation before the milestone is called done.
+7. **M4:** executor, waker, the scancode queue behind `ScancodeStream`, `pc-keyboard`
+   decode. Note that `pc-keyboard` 0.9's API differs from the widely copied 0.7-era
+   examples.
+8. **M5:** the line editor in `kshared` (host-tested before wiring), then the command
+   surface and its history, then the banner's boot time, then the stack-overflow
+   check last.
 9. **Measure, then pin.** Bisect the RAM floor by re-running `xtask test --mem=N`
    downwards until it fails; pin the CI value just above the floor and record both
    numbers in the README. Tighten the image budget to the measured size plus a
@@ -386,10 +463,15 @@ must be seen to break it.
 12. **Release:** README screenshot from a real boot, `SESSION_HANDOFF.md` current,
     tag v1.
 
-## Open questions
+## Open questions (both now resolved)
 
 **1. Does the kernel keep a zero-unstable-features rule, or an allowlist of exactly
-one? — blocks M2 only. Owner's decision.**
+one? — RESOLVED: option (a) shipped.** The kernel carries exactly
+`#![feature(abi_x86_interrupt)]`, and the `feature-allowlist` CI job asserts the
+set of `#![feature(...)]` attributes under `kernel/` and `kshared/` is exactly that
+one entry. The `stable-compat` job was removed — it could never go green anyway,
+since the `x86_64` crate's own `step_trait` code needs nightly. The original
+analysis is kept below as the record of why.
 
 The plan states that the kernel source stays stable-clean with zero `#![feature]`
 attributes, enforced by the `stable-compat` CI job that exists today. **That is not
@@ -429,7 +511,9 @@ because nothing before M2 needs the feature. **The answer must land before the f
 IDT commit**, because retrofitting the gate after handlers exist means writing a
 gate against code that already violates it.
 
-**2. What is the actual RAM floor?** Not answerable by design; it is measured at step
-9 above. The target is 32 MiB or less. The current `DEFAULT_TEST_MEM_MB` of 128 in
-`xtask` is an explicit placeholder, and the lightness gate is not a gate until that
-number is a measured one. This is tracked, not open in the blocking sense.
+**2. What is the actual RAM floor? — RESOLVED: measured 2026-08-17 on QEMU 11.1.**
+BIOS boots and passes the full battery at **24 MiB** and fails at 20; UEFI passes at
+**48 MiB** and fails at 40, the difference being OVMF's own footprint rather than
+the kernel's. `xtask` pins `BIOS_TEST_MEM_MB = 24` and `UEFI_TEST_MEM_MB = 48` and
+CI boots at exactly those values, so the lightness gate is now a measured gate: a
+RAM-hunger regression fails the build. The BIOS figure beats the 32 MiB target.

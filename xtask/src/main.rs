@@ -16,10 +16,11 @@ const QEMU_EXIT_SUCCESS: i32 = 33; // kernel wrote 0x10
 const QEMU_EXIT_FAILURE: i32 = 35; // kernel wrote 0x11
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Lightness gates: boot + selftest must fit in this much RAM.
-/// Measured 2026-08-17 (QEMU 11.1): BIOS passes at 24 MB and fails at 20;
-/// UEFI passes at 48 MB and fails at 40 — the difference is OVMF's own
-/// footprint, not the kernel's. Pinned at the measured floors so RAM-hunger
-/// regressions fail the gate.
+/// Measured floors 2026-08-17 (QEMU 11.1): BIOS passes at 21 MB, fails at
+/// 20; UEFI passes at 46, fails at 45 — the UEFI premium is OVMF's own
+/// footprint, not the kernel's. CI pins slightly above the floors (3 MB
+/// BIOS, 2 MB UEFI of recorded headroom) to absorb QEMU-version variance;
+/// a regression larger than that headroom fails the gate.
 const BIOS_TEST_MEM_MB: u32 = 24;
 const UEFI_TEST_MEM_MB: u32 = 48;
 /// Lightness gate: disk images must stay under this ceiling; growth is a
@@ -147,7 +148,9 @@ fn build_images(selftest: bool) -> Result<Images> {
 /// Pinned OVMF firmware build for UEFI boots, fetched on demand.
 const OVMF_RELEASE: &str = "edk2-stable202411-r1";
 /// sha256 of the release tarball above; a re-pointed release fails loudly
-/// instead of silently substituting guest firmware.
+/// instead of silently substituting guest firmware. Verified at download
+/// time only — an already-extracted tree (e.g. restored from the CI cache)
+/// is trusted without re-hashing.
 const OVMF_SHA256: &str = "963fc6cef6a0560cec97381ed22a7d5c76f440c8212529a034cb465466cd57cc";
 
 fn fetch_ovmf() -> Result<(PathBuf, PathBuf)> {
@@ -275,6 +278,12 @@ const SHIPPED_MARKER: &str = "boot complete; shell ready";
 /// selftest build and asserts the QEMU exit code AND the serial log;
 /// `--shipped` boots the real image and asserts it reaches the shell.
 fn test(opts: &Opts) -> Result<()> {
+    if opts.shipped && opts.selftest {
+        bail!("--shipped and --selftest are contradictory: shipped boots the non-selftest image");
+    }
+    if opts.mem_override == Some(0) {
+        bail!("--mem=0 is not a machine; QEMU would silently fall back to its default");
+    }
     let images = build_images(!opts.shipped)?;
     let mut cmd = qemu_command(&images, opts, true)?;
     cmd.stdout(Stdio::piped())
@@ -304,9 +313,17 @@ fn test(opts: &Opts) -> Result<()> {
 
     let status = loop {
         if opts.shipped && captured.lock().unwrap().contains(SHIPPED_MARKER) {
+            // The marker alone could mask a crash moments later; give the
+            // shell a beat and make sure no panic followed it.
+            thread::sleep(Duration::from_millis(500));
+            let log = captured.lock().unwrap().clone();
             child.kill().ok();
             child.wait().ok();
             reader.join().ok();
+            if log.contains("KERNEL PANIC") {
+                bail!("shipped image reached the shell and then panicked");
+            }
+            verify_ram_claim(&log, opts.mem_mb())?;
             println!(
                 "\nshipped-image boot OK ({}, {} MiB RAM, {:.1}s): reached \"{SHIPPED_MARKER}\"",
                 if opts.uefi { "UEFI" } else { "BIOS" },
@@ -322,8 +339,16 @@ fn test(opts: &Opts) -> Result<()> {
             child.kill().ok();
             child.wait().ok();
             reader.join().ok();
+            let log = captured.lock().unwrap().clone();
+            if log.contains("FrameAllocationFailed") || log.contains("ERROR: panicked") {
+                bail!(
+                    "boot timed out after {}s: the BOOTLOADER panicked before the kernel ran \
+                     (usually below the RAM floor) — see the log above",
+                    BOOT_TIMEOUT.as_secs()
+                );
+            }
             bail!(
-                "boot test timed out after {}s — the kernel hung",
+                "boot test timed out after {}s — no verdict and no bootloader panic; the kernel hung",
                 BOOT_TIMEOUT.as_secs()
             );
         }
@@ -343,11 +368,43 @@ fn test(opts: &Opts) -> Result<()> {
     if !serial_log.contains("SELFTEST PASSED") {
         bail!("qemu exited with the success code but the serial log lacks 'SELFTEST PASSED'");
     }
+    verify_ram_claim(&serial_log, opts.mem_mb())?;
     println!(
         "\nboot test OK ({}, {} MiB RAM, {:.1}s)",
         if opts.uefi { "UEFI" } else { "BIOS" },
         opts.mem_mb(),
         start.elapsed().as_secs_f32()
     );
+    Ok(())
+}
+
+/// The success line quotes the requested RAM size, so that figure must match
+/// what the machine really had: the kernel logs `<used>/<total> frames`, and
+/// total*4096 has to sit plausibly under the request (firmware reservations
+/// eat some, but never more than ~40%). Catches a wrong `--mem` turning the
+/// lightness claim into fiction — e.g. a value QEMU rejects and silently
+/// replaces with its 128 MiB default.
+fn verify_ram_claim(serial_log: &str, mem_mb: u32) -> Result<()> {
+    let total_frames = serial_log
+        .lines()
+        .filter(|line| line.contains(" frames"))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|token| token.contains('/'))
+                .and_then(|token| token.split('/').nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .next_back();
+    let Some(total_frames) = total_frames else {
+        bail!("the serial log never reported usable frames; cannot verify the RAM figure");
+    };
+    let usable_mb = total_frames * 4096 / (1024 * 1024);
+    let claimed_mb = u64::from(mem_mb);
+    if usable_mb > claimed_mb || usable_mb * 10 < claimed_mb * 6 {
+        bail!(
+            "the kernel saw {usable_mb} MiB usable but this test claims {claimed_mb} MiB; \
+             the lightness figure must be measured, not quoted"
+        );
+    }
     Ok(())
 }

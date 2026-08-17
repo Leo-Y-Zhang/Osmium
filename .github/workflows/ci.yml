@@ -42,11 +42,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - shell: bash
+        # Explicit if/exit, not `! grep`: set -e ignores the failure of an
+        # inverted command, which made the first version of this gate inert.
         run: |
-          ! grep -riE 'smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b' \
-              kernel/src kshared/src kernel/Cargo.toml
-          ! grep -riE 'fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b' \
-              kernel/src kshared/src kernel/Cargo.toml
+          if grep -riE 'smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b' \
+              kernel/src kshared/src kernel/Cargo.toml; then
+            echo "network token found in the kernel tree" >&2
+            exit 1
+          fi
+          if grep -riE 'fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b' \
+              kernel/src kshared/src kernel/Cargo.toml; then
+            echo "storage token found in the kernel tree" >&2
+            exit 1
+          fi
           echo "no network or storage tokens in the kernel"
 
   host-tests:

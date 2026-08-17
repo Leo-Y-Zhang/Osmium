@@ -8,9 +8,9 @@ construction, light by measurement**.
 ![The Osmium shell answering `help` and `privacy`](docs/screenshot.png)
 
 Osmium boots from BIOS or UEFI, renders its own glyph console on the framebuffer,
-takes keyboard input through an async executor, and drops you at a shell — in
-about 20 ms, inside 24 MiB of RAM. Every push to `main` must boot in QEMU under
-CI and pass an in-kernel self-test battery; `main` is never un-bootable.
+takes keyboard input through an async executor, and drops you at a shell — inside
+24 MiB of RAM. Every push to `main` must boot in QEMU under CI and pass an
+in-kernel self-test battery; `main` is never un-bootable.
 
 ## Privacy by construction
 
@@ -32,12 +32,16 @@ The `privacy` command reports these live.
 
 ## Light by measurement
 
-- Boots and passes the full battery in **24 MiB** of RAM (BIOS) or **48 MiB**
-  (UEFI — the difference is OVMF's own footprint, not the kernel's). CI runs at
-  exactly these values, so a RAM-hunger regression fails the build.
+- Boots and passes the full battery with a measured floor of **21 MiB** of RAM
+  on BIOS and **46 MiB** on UEFI (the difference is OVMF's own footprint, not
+  the kernel's). CI boots at 24 and 48 MiB — floor plus a small, recorded
+  headroom for QEMU-version variance — so a real RAM-hunger regression fails
+  the build. The boot test also cross-checks the kernel's own memory-map
+  report against the configured size, so the figure is measured, not quoted.
 - Disk images are ~**2.5 MiB**, asserted under a 4 MiB budget on every build.
-- Boot-to-shell in roughly **20 ms** under QEMU (PIT-measured, shown in the
-  banner).
+- The shell is up about **20 ms after interrupts enable** (PIT-measured, shown
+  in the banner — the timer cannot see the boot stages before it starts, so
+  that is the honest span).
 
 ## What's inside
 

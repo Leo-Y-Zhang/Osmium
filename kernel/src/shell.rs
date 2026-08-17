@@ -118,7 +118,12 @@ fn banner() {
             env!("CARGO_PKG_VERSION")
         );
         con.set_color(FOREGROUND);
-        let _ = writeln!(con, "boot-to-shell: ~{ms} ms. Type 'help' to begin.");
+        // The PIT starts at interrupts::init, so earlier boot stages are
+        // outside its sight; the label says exactly what is measured.
+        let _ = writeln!(
+            con,
+            "shell ready {ms} ms after interrupts-on. Type 'help' to begin."
+        );
     });
 }
 

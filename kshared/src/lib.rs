@@ -99,11 +99,14 @@ impl LineEditor {
     }
 
     /// Replaces the contents (history recall). Truncates at capacity;
-    /// non-printable and non-ASCII characters are skipped.
+    /// control and non-ASCII characters are skipped rather than interpreted
+    /// (a backspace in `s` must not delete characters already set).
     pub fn set_line(&mut self, s: &str) {
         self.clear();
         for c in s.chars() {
-            let _ = self.feed(c);
+            if c.is_ascii() && !c.is_ascii_control() {
+                let _ = self.feed(c);
+            }
         }
     }
 }
@@ -222,6 +225,15 @@ mod tests {
     }
 
     #[test]
+    fn set_line_skips_control_chars_instead_of_interpreting_them() {
+        let mut ed = LineEditor::new();
+        ed.set_line("ab\u{8}c");
+        assert_eq!(ed.line(), "abc"); // the backspace must not delete 'b'
+        ed.set_line("a\u{7f}b\nc");
+        assert_eq!(ed.line(), "abc");
+    }
+
+    #[test]
     fn parse_command_splits_and_trims() {
         assert_eq!(parse_command("help"), Some(("help", "")));
         assert_eq!(
@@ -235,5 +247,79 @@ mod tests {
         );
         assert_eq!(parse_command(""), None);
         assert_eq!(parse_command("   "), None);
+    }
+
+    /// The `EditAction` contract: an action tells the caller exactly what
+    /// happened to the buffer, so a renderer that draws one cell per
+    /// `Echoed` and rubs out one per `Erased` can never drift from
+    /// `line()`. Here the buffer is *reconstructed from the actions alone*
+    /// and must equal the real one after every single keystroke.
+    #[test]
+    fn edit_actions_account_for_every_buffered_char() {
+        fn step(ed: &mut LineEditor, model: &mut Vec<char>, c: char) {
+            let before = model.len();
+            match ed.feed(c) {
+                EditAction::Echoed(got) => {
+                    assert_eq!(got, c, "Echoed {got:?} but {c:?} was fed");
+                    model.push(got);
+                }
+                EditAction::Erased => {
+                    assert!(
+                        before > 0,
+                        "Erased on an empty line: the renderer would rub out the prompt"
+                    );
+                    model.pop();
+                }
+                // Both leave the buffer untouched; the caller clears it.
+                EditAction::Submitted | EditAction::Ignored => {}
+            }
+            let rebuilt: String = model.iter().collect();
+            assert_eq!(ed.len(), model.len(), "length drifted after feeding {c:?}");
+            assert_eq!(ed.line(), rebuilt, "contents drifted after feeding {c:?}");
+        }
+
+        let mut ed = LineEditor::new();
+        let mut model: Vec<char> = Vec::new();
+
+        // A typed-and-corrected line, ending in a submit (which must leave
+        // the buffer alone for the caller to read).
+        for c in "echo hi\u{8}\u{8}there\n".chars() {
+            step(&mut ed, &mut model, c);
+        }
+        assert_eq!(ed.line(), "echo there");
+        ed.clear();
+        model.clear();
+
+        // Backspacing past empty, then over the capacity ceiling and back.
+        for c in "\u{8}\u{8}\u{8}".chars() {
+            step(&mut ed, &mut model, c);
+        }
+        for _ in 0..LINE_CAP + 8 {
+            step(&mut ed, &mut model, 'x');
+        }
+        for _ in 0..12 {
+            step(&mut ed, &mut model, '\u{8}');
+        }
+        for c in "back-under-the-cap".chars() {
+            step(&mut ed, &mut model, c);
+        }
+
+        // Adversarial storm: printable, control, wide, and edit keys mixed.
+        let menu: Vec<char> = "ab z9~\u{8}\u{7f}\n\r\t\u{1b}\u{0}é€"
+            .chars()
+            .chain('\u{80}'..='\u{85}')
+            .collect();
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..20_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            step(
+                &mut ed,
+                &mut model,
+                menu[(seed >> 33) as usize % menu.len()],
+            );
+        }
+        assert!(ed.len() <= LINE_CAP);
     }
 }

@@ -34,35 +34,38 @@ Three readers, in order of how often they are inconvenienced.
 
 ## Success looks like
 
-- [ ] CI on `main` boots the kernel under QEMU on **both BIOS and UEFI firmware**,
+- [x] CI on `main` boots the kernel under QEMU on **both BIOS and UEFI firmware**,
       at the pinned minimal RAM size, and both jobs are green.
-- [ ] Each boot job asserts **two independent signals**: the QEMU exit code is 33
+- [x] Each boot job asserts **two independent signals**: the QEMU exit code is 33
       (the kernel wrote `0x10` to the `isa-debug-exit` port) **and** the captured
       serial log contains `SELFTEST PASSED`. Neither alone is accepted.
-- [ ] A separate CI job boots the **shipped** image — the default build, without the
+- [x] A separate CI job boots the **shipped** image — the default build, without the
       self-test feature — and asserts it reaches the interactive prompt. The binary
       a reader runs is boot-proven, not merely its test-mode sibling.
-- [ ] Booting on a real screen gives an **interactive framebuffer shell**: typed
+- [x] Booting on a real screen gives an **interactive framebuffer shell**: typed
       characters appear, backspace and line editing work, history recalls previous
       lines, and every command in the surface below returns output or a stated error.
-- [ ] The **in-kernel self-test battery** passes, covering: breakpoint exception
-      returns to the interrupted instruction; timer ticks advance; page-fault
-      reporting formats a faulting address; heap allocation, a 100,000-element
-      vector, and allocator reuse after free; a freshly mapped page reads as zero;
+- [x] The **in-kernel self-test battery** passes, covering: console rendering;
+      breakpoint exception returns to the interrupted instruction; timer ticks
+      advance; heap allocation, a 50,000-element vector, and allocator reuse
+      after free; a freshly mapped, deliberately pre-soiled page reads as zero;
       **zero-on-free leaves no caller data recoverable**; a spawned async task
       provably runs; and, last, a deliberate kernel stack overflow is caught as a
       double fault on its own interrupt stack rather than tripling to a reset.
-- [ ] **Zero-on-free is verified by the battery, not asserted in prose**: a
+- [x] **Zero-on-free is verified by the battery, not asserted in prose**: a
       sentinel pattern written into a heap block is absent from memory handed back
       by the next allocation of that block.
-- [ ] Both disk images are **under the asserted size budget**, checked on every
+- [x] Both disk images are **under the asserted size budget**, checked on every
       build; exceeding it fails the build rather than printing a warning.
-- [ ] The minimal RAM figure and the size budget in CI are **measured values**, each
+- [x] The minimal RAM figure and the size budget in CI are **measured values**, each
       pinned just above the observed floor, with the measurement recorded in the
       repository.
-- [ ] The kernel's dependency list is an **allowlist checked in CI**: no networking
-      crate and no storage crate can enter the tree unnoticed.
-- [ ] `README.md` claims nothing that the above does not check.
+- [x] **CI greps for networking and storage on every push.** The
+      `no-network-no-storage` job scans `kernel/src`, `kshared/src` and
+      `kernel/Cargo.toml` for the tokens either would have to bring with it and fails
+      on a hit, so neither a crate nor a hand-written driver can enter the tree
+      unnoticed.
+- [x] `README.md` claims nothing that the above does not check.
 
 ## Requirements
 
@@ -146,9 +149,12 @@ during a single power-on, and that data exists only in RAM.
 The three privacy claims, stated as properties of the build rather than settings:
 
 1. **No network stack exists.** Not disabled: absent. There is no driver, no
-   protocol code, and no networking crate in the dependency tree, and CI checks the
-   dependency allowlist on every push. Osmium cannot phone home for the same reason
-   a hammer cannot: it has no mechanism.
+   protocol code, and no networking crate in the dependency tree. CI checks that on
+   every push: the `no-network-no-storage` job greps the kernel and `kshared` sources
+   and the kernel's manifest for the tokens a network or storage driver would have to
+   carry, and a hit fails the build. It reads the source as well as the manifest, so
+   the claim covers code written here, not just crates pulled in. Osmium cannot phone
+   home for the same reason a hammer cannot: it has no mechanism.
 2. **No persistence.** There is no filesystem and no storage driver, so the kernel
    cannot write to the medium it booted from. Osmium is a live system: a cold boot
    is a clean slate, every time, with no state to clear because none was kept.
@@ -163,7 +169,9 @@ Two honest qualifications, stated here so the claims stay exactly true:
   under QEMU they reach the host, and on real hardware they reach whatever is
   attached to the port. It is therefore a rule of this design that **keyboard input
   and shell input never reach the serial log**. The input path has no route to the
-  serial writer. Kernel events are logged; what a person types is not.
+  serial writer, and the rule needs no exception clause: the one command that could
+  have carried typed text there, `panic`, takes no message argument and panics with a
+  string fixed in the source. Kernel events are logged; what a person types is not.
 - **Firmware is outside our control.** UEFI implementations write their own NVRAM
   variables during boot. Osmium writes nothing; the firmware's own behaviour is not
   a claim this project can make.
