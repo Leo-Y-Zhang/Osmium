@@ -65,7 +65,7 @@ jobs:
         run: |
           net='smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|rtl8139|ne2k|ne2000|pcnet|802\.11|wifi|\bnic\b|\bpacket\b|virtio|dhcp|\bdns\b|\bhttp\b'
           storage='fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b|floppy|\bfdc\b|\bscsi\b|\blba\b|\bsector\b|sdhci'
-          srcs="kernel/src kshared/src kernel/Cargo.toml kshared/Cargo.toml"
+          srcs="kernel/src kshared/src user kernel/Cargo.toml kshared/Cargo.toml"
           for p in $srcs; do
             test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
           done

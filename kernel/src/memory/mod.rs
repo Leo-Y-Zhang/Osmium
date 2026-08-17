@@ -46,8 +46,8 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
 /// Maps one user-accessible page at `virt`. The `USER_ACCESSIBLE` flag must be
 /// on the intermediate tables too, not just the leaf — the classic mistake is
 /// setting it only on the leaf and getting a fault from ring 3 anyway — so
-/// this uses `map_to_with_table_flags`. Permissions can be tightened later
-/// with [`make_read_only`] (W^X once a program has been copied in).
+/// this uses `map_to_with_table_flags`. Permissions are adjusted later with
+/// [`update_user_page`] (W^X once a program has been copied in).
 pub fn map_user_page(virt: u64, writable: bool, executable: bool) {
     use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
     let mut mapper = MAPPER.lock();
@@ -76,26 +76,33 @@ pub fn map_user_page(virt: u64, writable: bool, executable: bool) {
     }
 }
 
-/// Drops the WRITABLE flag on an already-mapped page, leaving every other
-/// flag — NO_EXECUTE included — exactly as it was. (An earlier version
-/// rewrote the flags wholesale, which silently cleared NX; harmless for the
-/// executable code page it was written for, and a W^X hole for any non-
-/// executable page a later caller tightens.)
-pub fn make_read_only(virt: u64) {
+/// Rewrites the WRITABLE and NO_EXECUTE bits of an already-mapped user page,
+/// preserving every other flag. The ELF loader maps segments writable+NX for
+/// the copy, then locks each page to its final W^X permissions here; the
+/// flags are adjusted bit by bit, never rewritten wholesale (an earlier
+/// version of the tightening helper did that and silently cleared NX).
+pub fn update_user_page(virt: u64, writable: bool, executable: bool) {
     use x86_64::structures::paging::mapper::TranslateResult;
     use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB, Translate};
     let mut mapper = MAPPER.lock();
     let mapper = mapper.as_mut().expect("memory not initialised");
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
     let TranslateResult::Mapped { flags, .. } = mapper.translate(page.start_address()) else {
-        panic!("make_read_only on an unmapped page");
+        panic!("update_user_page on an unmapped page");
     };
-    // SAFETY: `page` is already mapped; this only clears WRITABLE, and the
-    // TLB is flushed.
+    let mut new = flags & !(PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE);
+    if writable {
+        new |= PageTableFlags::WRITABLE;
+    }
+    if !executable {
+        new |= PageTableFlags::NO_EXECUTE;
+    }
+    // SAFETY: `page` is already mapped; only W and NX change, and the TLB is
+    // flushed.
     unsafe {
         mapper
-            .update_flags(page, flags & !PageTableFlags::WRITABLE)
-            .expect("tightening user code flags failed")
+            .update_flags(page, new)
+            .expect("updating user page flags failed")
             .flush();
     }
 }
@@ -150,8 +157,11 @@ pub fn no_stray_user_mappings() -> bool {
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
     fn covers_user_window(base: u64, span: u64) -> bool {
+        // The whole ELF image window is one 2 MiB page-table region, so an
+        // intermediate reaches it iff its range contains the window base;
+        // the stack page sits in its own region.
         let contains = |addr: u64| addr >= base && addr < base.saturating_add(span);
-        contains(crate::usermode::USER_CODE_ADDR) || contains(crate::usermode::USER_STACK_ADDR)
+        contains(kshared::elf::USER_IMAGE_BASE) || contains(crate::usermode::USER_STACK_ADDR)
     }
 
     fn walk(table: &PageTable, offset: u64, level: u8, base: u64) -> bool {

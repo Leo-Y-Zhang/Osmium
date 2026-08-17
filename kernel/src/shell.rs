@@ -343,11 +343,13 @@ fn keymap(args: &str, layout_name: &mut &'static str, decoder: &mut EventDecoder
 }
 
 fn user_command() {
-    let exit = crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
-    field(
-        "user:    ",
-        &format!("ring-3 program exited with CS={exit:#x} (CPL {})", exit & 3),
-    );
+    match crate::usermode::run_hello() {
+        Ok(exit) => field(
+            "user:    ",
+            &format!("hello ELF exited with CS={exit:#x} (CPL {})", exit & 3),
+        ),
+        Err(e) => println_con(&format!("user: the embedded ELF was refused: {e:?}")),
+    }
 }
 
 fn shutdown() -> ! {

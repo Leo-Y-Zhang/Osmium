@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod elf;
+
 /// Aligns `addr` upwards to `align`, which must be a power of two.
 pub const fn align_up(addr: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());

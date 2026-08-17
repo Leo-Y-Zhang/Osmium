@@ -1,0 +1,14 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately NOT a member of the parent workspace: the kernel's build
+# script compiles this crate with a nested cargo invocation, and sharing the
+# workspace (and its target-dir lock) with the invoking build would deadlock.
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

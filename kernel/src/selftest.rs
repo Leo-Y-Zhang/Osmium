@@ -18,9 +18,10 @@ pub fn run() -> ! {
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
     shell_processes_a_scripted_session();
+    elf_loader_refuses_wx();
     user_program_runs_in_ring3();
     no_stray_user_mappings_after_ring3();
-    make_read_only_preserves_nx();
+    update_user_page_enforces_wx();
     measure_console_scroll();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
@@ -186,31 +187,38 @@ fn heap_is_not_executable() {
     serial_println!("[selftest] security: kernel heap is non-executable ... ok");
 }
 
-/// Maps a user page with NX, tightens it read-only, and asserts NX survived —
-/// the flags must be narrowed, never rewritten. (The wholesale-rewrite
-/// mutation of `make_read_only` fails exactly here.)
-fn make_read_only_preserves_nx() {
+/// Exercises the loader's flag plumbing on a probe page: tightening to
+/// read-only must keep NX; granting execute must clear it; nothing else may
+/// change. (The wholesale-rewrite mutation of `update_user_page` fails
+/// exactly here.)
+fn update_user_page_enforces_wx() {
     use x86_64::structures::paging::PageTableFlags;
     let addr = crate::usermode::USER_STACK_ADDR;
     crate::memory::map_user_page(addr, true, false);
-    crate::memory::make_read_only(addr);
+    crate::memory::update_user_page(addr, false, false);
     let flags = crate::memory::translate_flags(addr).expect("probe page is not mapped");
     assert!(
         !flags.contains(PageTableFlags::WRITABLE),
-        "make_read_only left the page writable"
+        "update_user_page left the page writable"
     );
     assert!(
         flags.contains(PageTableFlags::NO_EXECUTE),
-        "make_read_only dropped NO_EXECUTE while tightening"
+        "update_user_page dropped NO_EXECUTE while tightening to read-only"
+    );
+    crate::memory::update_user_page(addr, false, true);
+    let flags = crate::memory::translate_flags(addr).expect("probe page is not mapped");
+    assert!(
+        !flags.contains(PageTableFlags::NO_EXECUTE),
+        "update_user_page failed to clear NX for an executable page"
     );
     crate::memory::unmap_user_page(addr);
     // This probe mapped a user page of its own; audit its teardown the same
     // way the ring-3 run's teardown is audited.
     assert!(
         crate::memory::no_stray_user_mappings(),
-        "the NX probe's own teardown left a user-accessible leaf"
+        "the W^X probe's own teardown left a user-accessible leaf"
     );
-    serial_println!("[selftest] security: make_read_only narrows flags, NX preserved ... ok");
+    serial_println!("[selftest] security: user page flags narrow correctly (W^X plumbing) ... ok");
 }
 
 fn heap_refuses_oversized_allocation() {
@@ -274,12 +282,13 @@ fn shell_processes_a_scripted_session() {
 }
 
 fn user_program_runs_in_ring3() {
-    // The demo trashes every callee-saved register before exiting; a clean
-    // return here shows the kernel tolerates a register-hostile program. It
-    // exits with its own CS, whose low two bits are the CPL — the
-    // discriminating assertion (launching in ring 0 instead makes it fail,
-    // which the M6 mutation confirms).
-    let exit = crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
+    // The embedded `hello` ELF proves the whole loader path: parse, per-
+    // segment W^X mapping, a volatile write into its own data segment (which
+    // faults if .data is mapped read-only), and syscalls. It exits with its
+    // own CS, whose low two bits are the CPL — the discriminating assertion
+    // (launching in ring 0 instead makes it fail, which the M6 mutation
+    // confirmed).
+    let exit = crate::usermode::run_hello().expect("the embedded hello ELF was refused");
     assert_eq!(
         exit & 3,
         3,
@@ -287,8 +296,41 @@ fn user_program_runs_in_ring3() {
         exit & 3
     );
     serial_println!(
-        "[selftest] usermode: program ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
+        "[selftest] usermode: hello ELF ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
     );
+}
+
+/// Feeds the loader a crafted image whose single segment claims to be both
+/// writable and executable; the parse must refuse it before anything is
+/// mapped.
+fn elf_loader_refuses_wx() {
+    use kshared::elf::{ElfError, USER_IMAGE_BASE};
+    let mut img = alloc::vec![0u8; 64 + 56 + 16];
+    img[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    img[4] = 2; // 64-bit
+    img[5] = 1; // little-endian
+    img[6] = 1; // version
+    img[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    img[18..20].copy_from_slice(&62u16.to_le_bytes()); // x86-64
+    img[24..32].copy_from_slice(&USER_IMAGE_BASE.to_le_bytes()); // entry
+    img[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+    img[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+    img[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
+    let ph = 64;
+    img[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    img[ph + 4..ph + 8].copy_from_slice(&7u32.to_le_bytes()); // RWX
+    img[ph + 8..ph + 16].copy_from_slice(&120u64.to_le_bytes()); // offset
+    img[ph + 16..ph + 24].copy_from_slice(&USER_IMAGE_BASE.to_le_bytes());
+    img[ph + 32..ph + 40].copy_from_slice(&16u64.to_le_bytes()); // filesz
+    img[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // memsz
+    assert!(
+        matches!(
+            crate::usermode::run_elf(&img),
+            Err(ElfError::WritableAndExecutable)
+        ),
+        "a writable-and-executable segment was not refused"
+    );
+    serial_println!("[selftest] security: loader refuses a W+X segment ... ok");
 }
 
 /// Measures the current scroll implementation (framebuffer `copy_within`) so

@@ -1,33 +1,38 @@
 //! Ring 3 and a software-interrupt (`int 0x80`) system-call path — Osmium's
-//! privilege boundary.
+//! privilege boundary — plus the ELF64 loader that feeds it.
 //!
-//! The kernel maps a user-only code page and stack, drops to ring 3 with an
-//! `iretq`, and runs a flat code blob (ELF loading is a later milestone). The
-//! program returns to the kernel by issuing `int 0x80` with `SYS_EXIT`; the
-//! entry stub restores the kernel stack saved before the jump and returns to
-//! `run_user`'s caller. Other syscalls dispatch to Rust and `iretq` back.
+//! The user program is a real, linker-scripted Rust ELF (`user/hello`, built
+//! by the kernel's build script and embedded here). [`run_elf`] parses it
+//! with `kshared::elf` (host-tested, refusal-by-default), maps each `PT_LOAD`
+//! segment writable-and-NX for the copy, locks every page to its final W^X
+//! permissions, and drops to ring 3 with an `iretq`. The program returns to
+//! the kernel by issuing `int 0x80` with `SYS_EXIT`; the entry stub restores
+//! the kernel stack saved before the jump and returns to the launcher. Other
+//! syscalls dispatch to Rust and `iretq` back.
 //!
-//! Privacy carries over: the frame the user runs on is zeroed on hand-out like
-//! every other, so no previous owner's bytes are visible to the program, and
-//! the self-tests audit the page tables both before ring 3 has run and again
+//! Privacy carries over: the frames the user runs on are zeroed on hand-out
+//! like every other (which is also what makes BSS correct for free), and the
+//! self-tests audit the page tables both before ring 3 has run and again
 //! after teardown — no kernel mapping is ever user-accessible, and no user
 //! leaf survives a run.
 //!
-//! M6 boundaries, stated so they are not mistaken for isolation guarantees:
+//! Boundaries, stated so they are not mistaken for isolation guarantees:
 //! - **A misbehaving user program is fatal.** Every exception handler panics,
 //!   so a ring-3 fault (bad memory access, `#DE`, a privileged instruction,
 //!   `int n` for any vector but 0x80) takes the whole kernel down. There is no
 //!   process model yet to terminate just the program; that is a later
 //!   milestone.
-//! - **One program at a time.** `run_user` uses fixed addresses and a single
+//! - **One program at a time.** The loader uses fixed addresses and a single
 //!   continuation slot; it is not reentrant, which the cooperative single-core
 //!   model guarantees today.
 //! - **Frames are not reclaimed.** The bump allocator never frees, so each
-//!   `run_user` leaks two leaf frames (8 KiB); many manual `user` invocations
-//!   would eventually exhaust RAM and panic.
+//!   run leaks its mapped frames (a few pages); many manual `user` shell
+//!   invocations would eventually exhaust RAM and panic. The parser's
+//!   64-page budget bounds how fast a single load can drain the allocator.
 
 use crate::gdt;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kshared::elf::{ElfError, LoadPlan};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
@@ -37,17 +42,21 @@ const SYS_WRITE: u64 = 1;
 /// The kernel stack pointer saved by `jump_to_user`, so `SYS_EXIT` can return
 /// to the launcher instead of `iretq`-ing back to a finished program.
 /// Invariant: `SYS_EXIT` reads this blindly, sound only because ring 3 is
-/// reachable *only* through `run_user`, which always writes it before any
+/// reachable *only* through `enter_ring3`, which always writes it before any
 /// ring-3 instruction can execute.
 static KERNEL_CONTINUATION_RSP: AtomicU64 = AtomicU64::new(0);
 /// The exit code the user program passed to `SYS_EXIT`.
 static USER_EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 
-/// The fixed user window: one code page and one stack page. The page-table
-/// audit (`memory::no_stray_user_mappings`) allows user-accessible
-/// intermediate entries only where they reach these two addresses.
-pub(crate) const USER_CODE_ADDR: u64 = 0x40_0000;
+/// The user stack page. Program segments live in the image window
+/// (`kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`); the stack sits outside
+/// it, and the page-table audit (`memory::no_stray_user_mappings`) allows
+/// user-accessible intermediate entries only where they reach one of the two.
 pub(crate) const USER_STACK_ADDR: u64 = 0x80_0000;
+
+/// The user program: a real linker-scripted Rust ELF built from `user/hello`
+/// by the kernel's build script and embedded as bytes.
+static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
 
 /// The `int 0x80` entry, as a raw address for the IDT gate (installed at DPL 3
 /// in `interrupts.rs` so ring 3 may issue the instruction).
@@ -55,25 +64,65 @@ pub fn syscall_entry_addr() -> u64 {
     int80_entry as *const () as u64
 }
 
-/// Runs a flat ring-3 code blob and returns the value it passed to `SYS_EXIT`.
-/// Not reentrant — one user program at a time, which is all v1 needs.
-pub fn run_user(code: &[u8]) -> u64 {
-    assert!(code.len() <= 4096, "user blob must fit in one page");
-    // Code page: user-accessible, writable while we copy, then read-only+exec.
-    crate::memory::map_user_page(USER_CODE_ADDR, true, true);
-    // SAFETY: the page was just mapped writable and is at least `code.len()`
-    // bytes; we own it exclusively until the program runs.
-    unsafe {
-        core::ptr::copy_nonoverlapping(code.as_ptr(), USER_CODE_ADDR as *mut u8, code.len());
+/// Runs the embedded `hello` ELF in ring 3.
+pub fn run_hello() -> Result<u64, ElfError> {
+    run_elf(HELLO_ELF)
+}
+
+/// Parses, maps, runs and tears down a static ELF64 user program; returns
+/// the value it passed to `SYS_EXIT`. Refusal happens before anything is
+/// mapped. Not reentrant — one user program at a time, which is all the
+/// cooperative single-core model needs.
+pub fn run_elf(image: &[u8]) -> Result<u64, ElfError> {
+    let plan: LoadPlan = kshared::elf::parse_elf64(image)?;
+
+    // Map every segment writable + NX for the copy: a page is never writable
+    // and executable at the same time, even transiently.
+    for seg in plan.segments() {
+        for page in 0..seg.page_count() {
+            crate::memory::map_user_page(seg.vaddr + page * 4096, true, false);
+        }
+        // SAFETY: the pages were just mapped writable and cover `memsz`
+        // bytes; the parser bounds-checked `file_start..+filesz` against the
+        // image. The `memsz` tail past `filesz` is BSS, and frames arrive
+        // zeroed, so it is already correct.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                image.as_ptr().add(seg.file_start),
+                seg.vaddr as *mut u8,
+                seg.filesz as usize,
+            );
+        }
     }
-    crate::memory::make_read_only(USER_CODE_ADDR); // W^X on the code page
+    // Lock each page to its final W^X permissions (the parser refused any
+    // segment claiming both).
+    for seg in plan.segments() {
+        for page in 0..seg.page_count() {
+            crate::memory::update_user_page(seg.vaddr + page * 4096, seg.writable, seg.executable);
+        }
+    }
     // Stack page: user-accessible, writable, never executable.
     crate::memory::map_user_page(USER_STACK_ADDR, true, false);
 
+    let code = enter_ring3(plan.entry, USER_STACK_ADDR + 4096);
+
+    // Tear the user mappings down so the loader can run again (the frames
+    // are not reclaimed — bump allocator — only the mappings).
+    for seg in plan.segments() {
+        for page in 0..seg.page_count() {
+            crate::memory::unmap_user_page(seg.vaddr + page * 4096);
+        }
+    }
+    crate::memory::unmap_user_page(USER_STACK_ADDR);
+    Ok(code)
+}
+
+/// Drops to ring 3 at `entry` and returns the program's `SYS_EXIT` value.
+/// The caller has already mapped the code and stack.
+fn enter_ring3(entry: u64, stack_top: u64) -> u64 {
     let sel = gdt::selectors();
     let user_cs = u64::from(sel.user_code.0); // RPL 3 already in the selector
     let user_ss = u64::from(sel.user_data.0);
-    let stack_top = USER_STACK_ADDR + 4096;
 
     // The int 0x80 gate clears IF on the way in, so control returns here with
     // interrupts disabled; restore them only if the caller had them enabled.
@@ -82,15 +131,11 @@ pub fn run_user(code: &[u8]) -> u64 {
     // SAFETY: entering ring 3 at a mapped user code page with a mapped user
     // stack and the ring-3 selectors; SYS_EXIT returns control here with the
     // callee-saved registers restored by the entry stub.
-    unsafe { jump_to_user(USER_CODE_ADDR, stack_top, user_cs, user_ss) };
+    unsafe { jump_to_user(entry, stack_top, user_cs, user_ss) };
     let code = USER_EXIT_CODE.load(Ordering::SeqCst);
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
     }
-    // Tear the user mappings down so run_user can be called again (the frames
-    // are not reclaimed — bump allocator — only the mappings).
-    crate::memory::unmap_user_page(USER_CODE_ADDR);
-    crate::memory::unmap_user_page(USER_STACK_ADDR);
     code
 }
 
@@ -207,35 +252,3 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, _a1: u64) -> u64 {
         _ => u64::MAX,
     }
 }
-
-/// A tiny ring-3 program: report a byte via `SYS_WRITE`, then set every
-/// callee-saved register to -1 before exiting with its own code segment. The
-/// register trashing makes the program hostile to the kernel's register state;
-/// a clean return shows the boundary tolerates it. The exit code is CS, whose
-/// low two bits are the CPL. Hand-assembled flat x86-64.
-#[rustfmt::skip]
-pub const DEMO_PROGRAM: &[u8] = &[
-    // mov eax, 1 (SYS_WRITE)
-    0xb8, 0x01, 0x00, 0x00, 0x00,
-    // mov edi, 0x55 ('U')
-    0xbf, 0x55, 0x00, 0x00, 0x00,
-    // int 0x80
-    0xcd, 0x80,
-    // clobber every callee-saved register with -1
-    0x48, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff, // mov rbx, -1
-    0x48, 0xc7, 0xc5, 0xff, 0xff, 0xff, 0xff, // mov rbp, -1
-    0x49, 0xc7, 0xc4, 0xff, 0xff, 0xff, 0xff, // mov r12, -1
-    0x49, 0xc7, 0xc5, 0xff, 0xff, 0xff, 0xff, // mov r13, -1
-    0x49, 0xc7, 0xc6, 0xff, 0xff, 0xff, 0xff, // mov r14, -1
-    0x49, 0xc7, 0xc7, 0xff, 0xff, 0xff, 0xff, // mov r15, -1
-    // mov ax, cs
-    0x8c, 0xc8,
-    // and eax, 0xffff
-    0x25, 0xff, 0xff, 0x00, 0x00,
-    // mov edi, eax  (exit code = CS)
-    0x89, 0xc7,
-    // xor eax, eax  (SYS_EXIT)
-    0x31, 0xc0,
-    // int 0x80
-    0xcd, 0x80,
-];

@@ -64,10 +64,13 @@ The `privacy` command reports these live.
   1 MiB kernel heap
 - A cooperative async executor (waker-based); the keyboard stream and the shell
   are async tasks, and an idle Osmium sits in `hlt`
-- **Ring 3 and a system-call path**: the kernel drops to CPL 3 to run a
-  user-only code blob on a W^X page, which returns through an `int 0x80`
-  syscall (`SYS_WRITE`/`SYS_EXIT`); a self-test proves it executed in ring 3
-  and that no kernel mapping is user-accessible
+- **Ring 3, a system-call path, and an ELF loader**: the kernel parses a
+  real, linker-scripted Rust ELF (`user/hello`), maps each `PT_LOAD` segment
+  with per-segment W^X permissions, drops to CPL 3 to run it, and takes it
+  back through an `int 0x80` syscall (`SYS_WRITE`/`SYS_EXIT`). The parser is
+  host-tested and refuses W+X segments, out-of-window addresses and malformed
+  images; self-tests prove the program executed in ring 3, that a W+X image
+  is refused, and that no kernel mapping is ever user-accessible
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
   `keymap` (us/uk), `user`, `selftest`, `panic`, `shutdown` — with an insertion
   cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
@@ -136,10 +139,10 @@ happened — that observation is worth more than any amount of emulator CI.
 
 ## Roadmap
 
-Ring 3 + syscalls landed as M6 (see above). Still ahead: ELF loading (the user
-program is a flat blob today), a RAM-disk filesystem, preemptive scheduling,
-APIC/HPET, and SMP. Networking is on no roadmap; if it ever lands, it ships off
-by default.
+Ring 3 + syscalls landed as M6; ELF loading landed as M7 (the user program is
+a real linker-scripted Rust binary). Still ahead: a RAM-disk filesystem,
+preemptive scheduling, APIC/HPET, and SMP. Networking is on no roadmap; if it
+ever lands, it ships off by default.
 
 ## Try it without building
 
