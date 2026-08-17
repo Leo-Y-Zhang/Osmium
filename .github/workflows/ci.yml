@@ -25,16 +25,24 @@ jobs:
 
   # The kernel is allowed exactly ONE unstable feature: abi_x86_interrupt,
   # which IDT handlers require. This gate fails the build if any other
-  # nightly feature creeps into kernel or kshared source.
+  # nightly feature creeps into kernel or kshared source. It matches the
+  # feature-enabling call shape `feature(...)` regardless of carrier, so a
+  # `#![cfg_attr(..., feature(...))]` cannot slip past the plain-attribute
+  # regex the first version used. (Cargo-feature cfgs use `feature = "..."`,
+  # never `feature(...)`, so there is no collision.)
   feature-allowlist:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          found="$(grep -rho '#!\[feature([^)]*)\]' kernel/src kshared/src | sort -u || true)"
-          echo "unstable features found: ${found:-none}"
-          test "$found" = '#![feature(abi_x86_interrupt)]'
+      - shell: bash
+        run: |
+          for p in kernel/src kshared/src; do
+            test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
+          done
+          found="$(grep -rhoE 'feature\([a-zA-Z_0-9, ]+\)' kernel/src kshared/src | sort -u || true)"
+          echo "feature-enabling attributes found: ${found:-none}"
+          test "$found" = 'feature(abi_x86_interrupt)'
 
   # Privacy pillar, enforced structurally: no network or storage code may
   # enter the kernel. Greps sources and manifests for driver and protocol
@@ -48,24 +56,34 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - shell: bash
-        # Explicit if/exit, not `! grep`: set -e ignores the failure of an
-        # inverted command, which made the first version of this gate inert.
+        # Two hardening rules, both learned from gates that could not fail:
+        # (1) explicit if/exit, not `! grep` — set -e ignores an inverted
+        # command's failure; (2) grep's exit code is captured and ONLY 1
+        # (searched, no match) passes — `if grep` treats a grep ERROR (exit
+        # 2, e.g. a renamed path) the same as "no match" and the gate would
+        # silently pass forever after a refactor. Paths are also preflighted.
         run: |
-          net='smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b'
-          storage='fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b'
+          net='smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|rtl8139|ne2k|ne2000|pcnet|802\.11|wifi|\bnic\b|\bpacket\b|virtio|dhcp|\bdns\b|\bhttp\b'
+          storage='fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b|floppy|\bfdc\b|\bscsi\b|\blba\b|\bsector\b|sdhci'
           srcs="kernel/src kshared/src kernel/Cargo.toml kshared/Cargo.toml"
-          if grep -riE "$net" $srcs; then
-            echo "network token found in the kernel tree" >&2; exit 1
+          for p in $srcs; do
+            test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
+          done
+          rc=0; grep -riE "$net" $srcs || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "network token found (or grep error, rc=$rc) in the kernel tree" >&2; exit 1
           fi
-          if grep -riE "$storage" $srcs; then
-            echo "storage token found in the kernel tree" >&2; exit 1
+          rc=0; grep -riE "$storage" $srcs || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "storage token found (or grep error, rc=$rc) in the kernel tree" >&2; exit 1
           fi
           # The resolved graph: xtask's host-side fatfs/gpt stay invisible here
           # because we scope to the kernel crate only.
           tree="$(cargo tree -p kernel --target x86_64-unknown-none --edges normal --prefix none | sort -u)"
           echo "$tree"
-          if echo "$tree" | grep -iE "$net|$storage"; then
-            echo "network or storage crate links into the kernel" >&2; exit 1
+          rc=0; echo "$tree" | grep -iE "$net|$storage" || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "network or storage crate links into the kernel (or grep error, rc=$rc)" >&2; exit 1
           fi
           echo "no network or storage tokens in the kernel sources, manifests or dependency graph"
 
@@ -78,9 +96,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - shell: bash
+        # Same discipline as the no-network gate: paths preflighted, and only
+        # grep exit 1 (searched, found nothing) passes — a renamed file must
+        # fail the gate, not disarm it.
         run: |
-          if grep -nE 'serial_print|log::' kernel/src/shell.rs kernel/src/task/keyboard.rs; then
-            echo "the input path writes to serial or the log; keystrokes could leak" >&2
+          files="kernel/src/shell.rs kernel/src/task/keyboard.rs"
+          for p in $files; do
+            test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
+          done
+          rc=0; grep -nE 'serial_print|log::' $files || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "the input path writes to serial or the log (or grep error, rc=$rc); keystrokes could leak" >&2
             exit 1
           fi
           echo "input path is free of serial and log calls"
