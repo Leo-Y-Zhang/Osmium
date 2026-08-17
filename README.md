@@ -135,7 +135,9 @@ device) and boot it in legacy/CSM mode. Known caveats before anyone does:
 - Scroll performance is untested on real, uncached framebuffers.
 
 If you boot Osmium on a real machine, record the make, firmware and what
-happened — that observation is worth more than any amount of emulator CI.
+happened — that observation is worth more than any amount of emulator CI. File
+it with the [real-hardware boot report form](https://github.com/Leo-Y-Zhang/Osmium/issues/new?template=hardware-report.yml),
+and results collect in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Roadmap
 
