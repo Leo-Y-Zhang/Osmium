@@ -19,7 +19,8 @@ than a policy:
 
 - **No network stack exists.** Nothing can phone home — the capability is
   absent, not disabled. Enforced by CI's `no-network-no-storage` gate, which
-  greps the kernel tree and manifest on every push so it cannot creep back.
+  greps the kernel sources, manifests and the resolved dependency graph on
+  every push, so neither hand-written code nor a transitive crate can creep in.
 - **No persistence.** RAM-only live system: no disk writes, no filesystem; a
   cold boot is a clean slate. The same CI gate covers storage drivers.
 - **Freed memory is zeroed.** Heap blocks are scrubbed before they re-enter the
@@ -42,7 +43,8 @@ The `privacy` command reports these live.
   the build. The boot test also cross-checks the kernel's own memory-map
   report against the configured size, so the figure is measured, not quoted.
 - Disk images are **2.1–2.5 MiB**, asserted under a 4 MiB budget on every build.
-- The shell is up about **20 ms after interrupts enable** (PIT-measured, shown
+- The shell is up about **20 ms after interrupts enable** — CI parses that
+  figure from the boot log and fails above a 200 ms ceiling (PIT-measured, shown
   in the banner — the timer cannot see the boot stages before it starts, so
   that is the honest span).
 
@@ -109,6 +111,24 @@ The kernel uses exactly one unstable feature (`abi_x86_interrupt`, required for
 IDT handlers); a CI gate fails the build if any other nightly feature creeps
 in. The image-build tooling itself needs the pinned nightly because the
 bootloader's build system uses `-Zbuild-std`.
+
+## Real hardware
+
+Osmium is proven on both firmwares under QEMU 11.1; it has **not** yet been
+validated on a physical machine, and the honest position is worth stating
+rather than implying otherwise. To try it on metal, write a raw image to a USB
+stick (`dd if=target/img/osmium-bios.img of=/dev/sdX bs=4M` — pick the right
+device) and boot it in legacy/CSM mode. Known caveats before anyone does:
+
+- **Input is PS/2** (port `0x60`, IRQ 1). A USB keyboard needs the firmware's
+  legacy PS/2 emulation; a machine in pure-UEFI mode with that disabled will
+  likely have a dead keyboard, though the boot and self-tests are unaffected.
+- **`shutdown` halts rather than powering off** on hardware without the QEMU
+  debug-exit port — it says so and stops, as the App Flow documents.
+- Scroll performance is untested on real, uncached framebuffers.
+
+If you boot Osmium on a real machine, record the make, firmware and what
+happened — that observation is worth more than any amount of emulator CI.
 
 ## Roadmap (deliberately not in v1)
 

@@ -324,8 +324,9 @@ fn test(opts: &Opts) -> Result<()> {
                 bail!("shipped image reached the shell and then panicked");
             }
             verify_ram_claim(&log, opts.mem_mb())?;
+            let boot_ms = verify_boot_latency(&log)?;
             println!(
-                "\nshipped-image boot OK ({}, {} MiB RAM, {:.1}s): reached \"{SHIPPED_MARKER}\"",
+                "\nshipped-image boot OK ({}, {} MiB RAM, {boot_ms} ms to shell, {:.1}s): reached \"{SHIPPED_MARKER}\"",
                 if opts.uefi { "UEFI" } else { "BIOS" },
                 opts.mem_mb(),
                 start.elapsed().as_secs_f32()
@@ -407,4 +408,23 @@ fn verify_ram_claim(serial_log: &str, mem_mb: u32) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The kernel logs `shell ready (<n> ms after interrupts-on)`; parse it and
+/// fail if boot-to-shell exceeds a generous ceiling (10x the observed ~20 ms),
+/// so the README's latency claim is CI-gated the same way the RAM figure is.
+const BOOT_LATENCY_CEILING_MS: u64 = 200;
+
+fn verify_boot_latency(serial_log: &str) -> Result<u64> {
+    let ms = serial_log
+        .lines()
+        .find_map(|line| {
+            let after = line.split("shell ready (").nth(1)?;
+            after.split(" ms").next()?.trim().parse::<u64>().ok()
+        })
+        .context("the serial log never reported a boot-to-shell time")?;
+    if ms > BOOT_LATENCY_CEILING_MS {
+        bail!("boot-to-shell was {ms} ms, over the {BOOT_LATENCY_CEILING_MS} ms ceiling");
+    }
+    Ok(ms)
 }

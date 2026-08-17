@@ -12,6 +12,8 @@ pub fn run() -> ! {
     heap_allocations_work();
     freed_heap_memory_is_zeroed();
     fresh_page_is_mapped_zeroed_writable();
+    kernel_mappings_are_supervisor_only();
+    heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
@@ -134,6 +136,49 @@ fn async_task_with_waker_runs() {
         "spawned async task did not run to completion via its waker"
     );
     serial_println!("[selftest] executor: task yielded, woke itself, completed ... ok");
+}
+
+fn kernel_mappings_are_supervisor_only() {
+    assert!(
+        crate::memory::no_user_accessible_mappings(),
+        "a page-table entry is user-accessible while the kernel has no ring 3"
+    );
+    serial_println!("[selftest] privacy: no mapping is user-accessible ... ok");
+}
+
+fn heap_refuses_oversized_allocation() {
+    use alloc::alloc::{alloc, dealloc};
+    use core::alloc::Layout;
+    // black_box on the layout is load-bearing: without it LLVM propagates the
+    // allocator shim's returns-non-null assumption and folds the check away
+    // (same failure class as the zero-on-free sentinel — observed here too).
+    let huge = core::hint::black_box(
+        Layout::from_size_align(crate::memory::heap::HEAP_SIZE as usize * 2, 8).unwrap(),
+    );
+    // SAFETY: a valid, non-zero layout; a null return is the documented refusal.
+    let refused = core::hint::black_box(unsafe { alloc(huge) });
+    if !refused.is_null() {
+        // SAFETY: undo it so the battery can continue (should be unreachable).
+        unsafe { dealloc(refused, huge) };
+    }
+    assert!(
+        refused.is_null(),
+        "oversized allocation unexpectedly succeeded"
+    );
+    // The allocator is still usable and zero-on-free still holds afterwards.
+    let ok = Layout::from_size_align(64, 8).unwrap();
+    // SAFETY: matched alloc/dealloc of a valid layout; the block is only
+    // touched while owned.
+    unsafe {
+        let p = alloc(ok);
+        assert!(
+            !p.is_null(),
+            "heap did not recover after refusing an oversized request"
+        );
+        p.write_volatile(0x5a);
+        dealloc(p, ok);
+    }
+    serial_println!("[selftest] heap: oversized request refused, allocator intact ... ok");
 }
 
 fn report_memory_stats() {

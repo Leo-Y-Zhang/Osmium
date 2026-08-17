@@ -37,28 +37,53 @@ jobs:
           test "$found" = '#![feature(abi_x86_interrupt)]'
 
   # Privacy pillar, enforced structurally: no network or storage code may
-  # enter the kernel. Greps sources and the kernel manifest for driver and
-  # protocol tokens; a hit fails the build and forces a deliberate decision.
+  # enter the kernel. Greps sources and manifests for driver and protocol
+  # tokens, AND greps the RESOLVED kernel dependency graph so a transitive
+  # crate cannot smuggle networking in unseen. A hit fails the build.
   no-network-no-storage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - shell: bash
+        # Explicit if/exit, not `! grep`: set -e ignores the failure of an
+        # inverted command, which made the first version of this gate inert.
+        run: |
+          net='smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b'
+          storage='fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b'
+          srcs="kernel/src kshared/src kernel/Cargo.toml kshared/Cargo.toml"
+          if grep -riE "$net" $srcs; then
+            echo "network token found in the kernel tree" >&2; exit 1
+          fi
+          if grep -riE "$storage" $srcs; then
+            echo "storage token found in the kernel tree" >&2; exit 1
+          fi
+          # The resolved graph: xtask's host-side fatfs/gpt stay invisible here
+          # because we scope to the kernel crate only.
+          tree="$(cargo tree -p kernel --target x86_64-unknown-none --edges normal --prefix none | sort -u)"
+          echo "$tree"
+          if echo "$tree" | grep -iE "$net|$storage"; then
+            echo "network or storage crate links into the kernel" >&2; exit 1
+          fi
+          echo "no network or storage tokens in the kernel sources, manifests or dependency graph"
+
+  # Structural tripwire for the keystroke-privacy claim: the input path must
+  # contain no serial or logging call, so a typed byte has no route off-device.
+  # (The behavioural proof is the sendkey serial-silence test in boot-shipped.)
+  input-path-has-no-serial:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - shell: bash
-        # Explicit if/exit, not `! grep`: set -e ignores the failure of an
-        # inverted command, which made the first version of this gate inert.
         run: |
-          if grep -riE 'smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b' \
-              kernel/src kshared/src kernel/Cargo.toml; then
-            echo "network token found in the kernel tree" >&2
+          if grep -nE 'serial_print|log::' kernel/src/shell.rs kernel/src/task/keyboard.rs; then
+            echo "the input path writes to serial or the log; keystrokes could leak" >&2
             exit 1
           fi
-          if grep -riE 'fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b' \
-              kernel/src kshared/src kernel/Cargo.toml; then
-            echo "storage token found in the kernel tree" >&2
-            exit 1
-          fi
-          echo "no network or storage tokens in the kernel"
+          echo "input path is free of serial and log calls"
 
   host-tests:
     runs-on: ubuntu-latest

@@ -24,6 +24,7 @@ mod serial;
 #[cfg(not(feature = "selftest"))]
 mod shell;
 mod task;
+mod time;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
@@ -41,6 +42,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    time::mark_boot();
     serial_println!("Osmium v{}: serial up", env!("CARGO_PKG_VERSION"));
 
     // Split the borrow once so each subsystem takes only its own field.
@@ -73,9 +75,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ),
         None => log::warn!("bootloader provided no framebuffer; running serial-only"),
     }
+    time::stamp(time::Phase::ConsoleReady);
 
     gdt::init();
     interrupts::init();
+    time::stamp(time::Phase::InterruptsOn);
     log::info!(
         "gdt+tss loaded, interrupts enabled (PIT {} Hz)",
         interrupts::TICK_HZ
@@ -90,6 +94,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
     memory::init(phys_offset, memory_regions);
+    time::stamp(time::Phase::MemoryReady);
     let (heap_used, heap_free) = memory::heap::stats();
     let (frames_used, frames_total) = memory::frame_stats();
     log::info!(
@@ -98,12 +103,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     #[cfg(feature = "selftest")]
-    selftest::run();
+    {
+        time::calibrate();
+        time::report();
+        selftest::run();
+    }
 
     #[cfg(not(feature = "selftest"))]
     {
-        // xtask's shipped-image boot proof greps the serial log for this line.
-        log::info!("boot complete; shell ready");
+        // xtask's shipped-image boot proof greps the serial log for the
+        // "boot complete; shell ready" prefix and parses the ms figure (the
+        // same PIT-measured span the on-screen banner shows) to gate it. This
+        // is a boot diagnostic, not keystroke output, so serial is correct.
+        let boot_ms = interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+            * (1000 / interrupts::TICK_HZ);
+        log::info!("boot complete; shell ready ({boot_ms} ms after interrupts-on)");
         let mut executor = task::executor::Executor::new();
         executor.spawn(task::Task::new(shell::run()));
         executor.run()

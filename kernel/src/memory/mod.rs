@@ -7,6 +7,7 @@ pub mod frames;
 pub mod heap;
 
 use bootloader_api::info::MemoryRegions;
+use core::sync::atomic::{AtomicU64, Ordering};
 use frames::BootFrameAllocator;
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -15,12 +16,16 @@ use x86_64::structures::paging::{OffsetPageTable, PageTable};
 
 pub static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 pub static FRAME_ALLOCATOR: Mutex<Option<BootFrameAllocator>> = Mutex::new(None);
+/// The bootloader's physical-memory mapping offset, stored so the page-table
+/// audit can walk the live tables without re-deriving it.
+static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Initialises paging and the frame allocator, then maps the kernel heap.
 /// `physical_memory_offset` must be the bootloader's all-of-physical-memory
 /// mapping (guaranteed by `BOOTLOADER_CONFIG`); the caller fails closed if
 /// the bootloader did not provide one.
 pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions) {
+    PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset, Ordering::Relaxed);
     let offset = VirtAddr::new(physical_memory_offset);
     // SAFETY: the bootloader maps all physical memory at `offset`, and this
     // is the only mapper ever constructed over the active page table.
@@ -54,10 +59,53 @@ unsafe fn active_level_4_table(offset: VirtAddr) -> &'static mut PageTable {
     unsafe { &mut *virt.as_mut_ptr() }
 }
 
-/// Maps one fresh page at a fixed probe address and returns it; the
-/// self-test battery uses it to prove mapping works and frames arrive zeroed.
+/// Walks the live page tables and returns true if NO present mapping, at any
+/// level, is user-accessible. In v1 there is no ring 3, so the honest
+/// invariant is that nothing is reachable from user mode; M6 tightens this to
+/// "only the declared user range". The battery asserts it, and mapping the
+/// probe page `USER_ACCESSIBLE` makes it fail.
+#[cfg(feature = "selftest")]
+pub fn no_user_accessible_mappings() -> bool {
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
+    fn walk(table_phys: u64, offset: u64, level: u8) -> bool {
+        let virt = offset + table_phys;
+        // SAFETY: `table_phys` is a present page-table frame and `offset` maps
+        // all physical memory, so this reference is valid and read-only;
+        // recursion is bounded by the four paging levels.
+        let table = unsafe { &*(virt as *const PageTable) };
+        for entry in table.iter() {
+            if entry.is_unused() {
+                continue;
+            }
+            if entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                return false;
+            }
+            let leaf = level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE);
+            if !leaf && !walk(entry.addr().as_u64(), offset, level - 1) {
+                return false;
+            }
+        }
+        true
+    }
+
+    let (l4, _) = Cr3::read();
+    walk(l4.start_address().as_u64(), offset, 4)
+}
+
+/// Maps one fresh page at a fixed probe address and returns it; the self-test
+/// battery uses it to prove mapping works and frames arrive zeroed. The
+/// `user_accessible` argument is normally `false`; flipping it to `true` is
+/// the mutation that proves [`no_user_accessible_mappings`] catches a
+/// user-visible mapping.
 #[cfg(feature = "selftest")]
 pub fn map_probe_page() -> VirtAddr {
+    map_probe_page_inner(false)
+}
+
+#[cfg(feature = "selftest")]
+fn map_probe_page_inner(user_accessible: bool) -> VirtAddr {
     use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 
     const PROBE: u64 = 0x_5555_5555_0000;
@@ -69,7 +117,10 @@ pub fn map_probe_page() -> VirtAddr {
     // Pre-soil the frame so the zero assertion proves the allocator's scrub.
     allocator.soil_next_frame(0xC3);
     let frame = allocator.allocate_frame().expect("out of physical frames");
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    if user_accessible {
+        flags |= PageTableFlags::USER_ACCESSIBLE;
+    }
     // SAFETY: a fixed, otherwise-unused virtual page mapped to a frame the
     // allocator just handed out exclusively.
     unsafe {
