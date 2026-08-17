@@ -5,10 +5,13 @@
 
 ## Approach
 
-Osmium is a three-crate Cargo workspace. `kernel/` is a `no_std` binary built for
+Osmium is a three-crate Cargo workspace, plus `user/hello` — a standalone crate the
+kernel's build script compiles into the embedded user ELF. `kernel/` is a `no_std`
+binary built for
 `x86_64-unknown-none`; it owns everything that touches hardware. `kshared/` is a
 `no_std` library of pure logic — address arithmetic, memory-region maths, the line
-editor, command parsing — with no hardware access and no allocator requirement, so
+editor, command parsing, the ELF loader front-end — with no hardware access and no
+allocator requirement, so
 it compiles for the host and is covered by ordinary `cargo test`. `xtask/` is a host
 binary that builds the kernel, wraps it into BIOS and UEFI disk images with the
 `bootloader` crate, drives QEMU, and enforces the size and RAM budgets; the
@@ -46,7 +49,7 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 | `mappings.physical_memory` | `Some(Mapping::Dynamic)` | All physical memory is mapped at a bootloader-chosen virtual offset. Required from day one because M3's frame allocator and page-table code cannot function without it, and changing it later would invalidate every address in this table. |
 | `kernel_stack_size` | 100 KiB | Deep enough for glyph rendering and the battery; small enough that the deliberate stack-overflow test terminates quickly. |
 | Physical memory offset | `boot_info.physical_memory_offset` | An `Optional<u64>`. **The `None` case is real** and must fail closed with a legible panic naming the missing mapping, never `unwrap()` on the assumption that the config above was honoured. |
-| Framebuffer | `boot_info.framebuffer` | Also an `Optional`. **The `None` case is real**: firmware may provide no framebuffer. The console degrades to serial-only, the shell still runs over serial, and the self-test battery still passes. It is not a panic. |
+| Framebuffer | `boot_info.framebuffer` | Also an `Optional`. **The `None` case is real**: firmware may provide no framebuffer. The kernel logs the fallback and continues; boot and the self-test battery are proven over serial. The shell renders to the console only (the keystroke-privacy rule), so this is a supported *degraded* configuration — boot-proven, not interactive. It is not a panic. |
 
 ### Fixed virtual addresses
 
@@ -54,6 +57,10 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 |---|---|---|---|
 | Kernel heap | `0x_4444_4444_0000` | 1 MiB | Chosen to be obviously synthetic in a fault dump. Mapped page by page at M3 from frames supplied by the frame allocator. |
 | Double-fault stack (IST 0) | Allocated in `.bss` | 20 KiB | `DOUBLE_FAULT_STACK`: a byte array inside an `UnsafeCell` (which is what keeps it out of read-only memory) rather than a `static mut`, so no `&mut` to a mutable static is ever formed. Its top is written into `TSS.interrupt_stack_table[0]`. Never overlaps the kernel stack; that separation is the entire point of it. |
+| NMI stack (IST 1), machine-check stack (IST 2) | Allocated in `.bss` | 20 KiB each | Same `IstStack` arrangement as IST 0, wired in `gdt.rs`, so those faults too run on known-good memory. |
+| Ring-0 privilege stack (TSS RSP0) | Allocated in `.bss` | 20 KiB | `PRIVILEGE_STACK`: the stack the CPU switches to when `int 0x80` traps in from ring 3. |
+| User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy. Mapped only while a user program runs; unmapped and audited afterwards. |
+| User stack page | `0x80_0000` | 4 KiB | `usermode::USER_STACK_ADDR`: user-accessible, writable, never executable; sits outside the image window and the audit knows both. |
 | Physical memory window | Bootloader-chosen | All of RAM | Read via `boot_info.physical_memory_offset`; never hard-coded. |
 
 ### Global state table
@@ -78,6 +85,11 @@ interrupt-context deadlocks.
 | `ALLOCATOR` | Zeroing wrapper over `LockedHeap` | M3 | `spin::Mutex` inside the heap | **Never allocates from IRQ, and frees from it only in a case that cannot arise.** The keyboard handler's `WAKER.wake()` consumes a cloned `Waker` and drops its `Arc<TaskWaker>`; a *last* drop would deallocate here, in interrupt context, against a lock the interrupted code may hold. It is never the last, and the condition is worth stating because the code depends on it: the executor's `waker_cache` holds a reference for as long as the task exists, and the shell task never completes. A woken task that can finish would break this row, so this row changes before that code does. |
 | `MAPPER`, `FRAME_ALLOCATOR` | `Option<OffsetPageTable>`, `Option<BootFrameAllocator>` | M3 | `spin::Mutex` | No |
 | `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
+| `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition (TSS RSP0) | Yes, by hardware |
+| `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `jump_to_user` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's `SYS_EXIT` path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_ring3`, which always writes it first |
+| `USER_EXIT_CODE` | `AtomicU64` | M6; per `SYS_EXIT` | Atomic, `SeqCst` | Written by the `int 0x80` entry; read by the launcher after control returns |
+| `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
+| `CYCLES_PER_MS` | `AtomicU64`, `#[cfg(feature = "selftest")]` only | `time::calibrate`, battery builds only | Atomic, `Relaxed` | No |
 
 **The concurrency rule, stated once and enforced everywhere:** an interrupt handler
 touches atomics, the lock-free scancode queue, and one lock — the PIC's, for the
@@ -124,7 +136,12 @@ be quietly re-litigated during implementation.
    caller data survives**: write a sentinel word throughout a block, free it,
    allocate the same size again, and assert the sentinel word appears nowhere in
    what comes back. Remove the zeroing wrapper and this test fails, which is the
-   property a test needs to have.
+   property a test needs to have. One refinement the shipped test carries: the scan
+   starts **past the first 16 bytes**. The Hole node lands there after the scrub,
+   and a metadata byte can legitimately equal the sentinel (an aligned hole
+   pointer's middle byte, say), which would turn the privacy test red with no
+   privacy bug. Bytes 16.. are caller data and still prove the scrub — deleting the
+   wrapper leaves 240 sentinel bytes in them.
 
 ## Interfaces
 
@@ -150,20 +167,43 @@ pub fn frame_starts(start: u64, end: u64) -> impl Iterator<Item = u64>;
 /// screen and the buffer cannot drift apart.
 pub enum EditAction { Echoed(char), Erased, Submitted, Ignored }
 
-/// Fixed-capacity ASCII line editor. It owns its storage — `[u8; LINE_CAP]`,
-/// inline — so it needs no allocator and no caller-supplied buffer, and a
-/// character past capacity is `Ignored` rather than written anywhere. History
-/// lives in the shell, which owns the heap; the editor holds one line.
+/// Fixed-capacity ASCII line editor with an insertion cursor. It owns its
+/// storage — `[u8; LINE_CAP]`, inline — so it needs no allocator and no
+/// caller-supplied buffer, and a character past capacity is `Ignored` rather
+/// than written anywhere. Insertion and deletion happen at the cursor, so
+/// mid-line editing keeps buffer and cursor consistent. History lives in the
+/// shell, which owns the heap; the editor holds one line.
 pub const LINE_CAP: usize = 256;
-pub struct LineEditor { /* buf, len */ }
+pub struct LineEditor { /* buf, len, cursor */ }
 impl LineEditor {
     pub const fn new() -> Self;
     pub fn feed(&mut self, c: char) -> EditAction;
     pub fn line(&self) -> &str;
+    pub fn cursor(&self) -> usize;         // byte index in 0..=len
+    pub fn move_left(&mut self) -> bool;   // each returns whether it moved
+    pub fn move_right(&mut self) -> bool;
+    pub fn move_home(&mut self);
+    pub fn move_end(&mut self);
     pub fn clear(&mut self);
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn set_line(&mut self, s: &str);   // history recall; truncates at capacity
+}
+
+/// ELF64 loader front-end (`kshared::elf`): pure parsing and validation, no
+/// hardware, no allocator, host-tested. Refusal is the default — an image is
+/// loadable only if every check passes (W+X, out-of-window, unaligned,
+/// overlapping, oversize and entry-not-executable images are all `Err` before
+/// anything maps). The kernel maps and copies what a `LoadPlan` describes.
+pub mod elf {
+    pub const USER_IMAGE_BASE: u64 = 0x40_0000;
+    pub const USER_IMAGE_END: u64 = 0x60_0000;
+    pub const MAX_SEGMENTS: usize = 8;
+    pub const MAX_TOTAL_PAGES: u64 = 64;   // caps frames one load can consume
+    pub struct Segment { /* vaddr, file range, memsz, writable, executable */ }
+    pub struct LoadPlan { /* segments, entry */ }
+    pub enum ElfError { /* one named variant per failed check */ }
+    pub fn parse_elf64(image: &[u8]) -> Result<LoadPlan, ElfError>;
 }
 
 /// Command parsing: splits a submitted line into a verb and the remainder,
@@ -181,10 +221,14 @@ mod serial;      // COM1 at 0x3F8 behind a plain Mutex, plus the panic path's fo
 mod framebuffer; // Display: safe slice writes keyed off FrameBufferInfo
 mod console;     // Console: glyph rendering, wrapping, scrolling, caller-set colour
 mod logger;      // log::Log impl fanning out to console and serial, honouring the lock rule
-mod gdt;         // init(): GDT, TSS, IST0 for the double-fault stack
-mod interrupts;  // init_idt(), PIC remap to 32..47, timer at 100 Hz, keyboard IRQ
-mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 MiB)
+mod gdt;         // init(): GDT (kernel + user segments), TSS, three IST stacks, RSP0
+mod interrupts;  // init(): IDT (incl. the DPL-3 int 0x80 gate), PIC remap to 32..47,
+                 //   timer at 100 Hz, keyboard IRQ
+mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 MiB, NX),
+                 //   user-page map/update/unmap, the page-table audit
+mod time;        // TSC boot-phase marks; battery-only PIT calibration to microseconds
 mod task;        // executor (cooperative), keyboard (ScancodeStream)
+mod usermode;    // ring 3: run_elf over kshared::elf, int 0x80 entry, teardown
 mod shell;       // prompt, dispatch, command implementations
 mod selftest;    // #[cfg(feature = "selftest")] battery; arms EXPECTING_DOUBLE_FAULT last
 mod qemu;        // exit_success() / exit_failure() via port 0xf4
@@ -198,13 +242,22 @@ cargo xtask run   [--bios|--uefi] [--mem=MB]   # interactive QEMU
 cargo xtask test  [--bios|--uefi] [--mem=MB]   # headless; asserts exit 33 AND serial grep
 cargo xtask test --shipped                     # boots the real image; asserts it logs
                                                #   "boot complete; shell ready"
+cargo xtask test --image=<path>                # boots that exact file instead of building;
+                                               #   the release workflow proves the very
+                                               #   bytes it uploads
+cargo xtask privacy                            # boots the shipped image, types a sentinel
+                                               #   through the QEMU monitor, drives
+                                               #   `shutdown` from the keyboard, and asserts
+                                               #   post-boot serial is EMPTY (allowlist, not
+                                               #   sentinel blocklist)
 ```
 
 `xtask test` (without `--shipped`) forces the `selftest` feature on, streams serial
 output while capturing it, kills QEMU after a 120-second timeout and reports a
 timeout as a hang rather than a failure, and rejects any exit code that is neither
-33 nor 35. `--mem` defaults to the measured per-firmware floors (24 MiB BIOS,
-48 MiB UEFI).
+33 nor 35. `--mem` defaults to the pinned per-firmware values (24 MiB BIOS,
+48 MiB UEFI — the measured floors of 21 and 46 plus a recorded headroom; the xtask
+constants' comment is the authoritative record).
 
 ### Self-test battery protocol
 
@@ -214,6 +267,20 @@ the log names the last check that got through and a hang sits between that line 
 the next check in `run`. A failed assertion panics, and the panic handler does the
 rest: it prints the panic to serial and to the console, then `SELFTEST FAILED`, then
 exits 35.
+
+The order in `run` is the contract: boot reached `kernel_main`; console renders and
+the cursor advances; `int3` handled and execution resumed; every installed IDT
+exception vector read back present; PIT ticks advance; heap `Box` + 50k-element
+`Vec`; zero-on-free sentinel absent (the scan starts past the allocator's 16-byte
+Hole node); a fresh, deliberately pre-soiled page maps zeroed and writable; the
+page-table audit — no mapping is user-accessible before ring 3 has ever run; the
+kernel heap is NX; an oversized allocation is refused with the allocator intact; an
+async task completes through its waker; a scripted shell session via injected
+scancodes; a crafted W+X ELF image is refused; the embedded `hello` ELF runs at
+CPL 3 and returns via syscall; the page-table audit again, AFTER the ring-3
+teardown; `update_user_page` narrows W and NX correctly (the W^X plumbing); the
+console scroll cost is measured; memory stats are reported; and, last and
+unreturning, the deliberate stack overflow.
 
 **The final check is the deliberate stack overflow, and it cannot return.** The
 double-fault handler ends it, which means the handler — not `run` — prints the
@@ -256,14 +323,19 @@ each is empty is the design.
 |---|---|---|---|
 | 1 | **Port I/O** | `serial`, `interrupts` (PIC/PIT/keyboard), `qemu` | The port number is a compile-time constant naming a device this kernel owns exclusively. No other code writes that port. Widths match the device (`0x3F8` byte, `0xF4` doubleword, `0x60` byte). Reads have no side effects beyond the documented device behaviour. Notably, port `0x60` **must** be read in the keyboard handler or the controller stops delivering interrupts. |
 | 2 | **Page-table manipulation** | `memory`, `memory::heap` | The `OffsetPageTable` is constructed once from `boot_info.physical_memory_offset`, which the caller has already checked is `Some`. The complete physical memory is mapped at that offset, guaranteed by `Mapping::Dynamic` in the bootloader config and re-checked, not assumed. A frame handed to `map_to` came from the frame allocator and is therefore unaliased. The TLB is flushed before the new mapping is read. |
-| 3 | **Descriptor-table loading** | `gdt`, `interrupts::init` | The GDT, TSS and IDT are `'static` and are never mutated after being loaded. Segment selectors written to `CS` and `SS` index entries that exist in the GDT that was just loaded. The IST0 pointer is the top of a 20 KiB static array that nothing else uses. |
+| 3 | **Descriptor-table loading** | `gdt`, `interrupts::init` | The GDT, TSS and IDT are `'static` and are never mutated after being loaded. Segment selectors written to `CS` and `SS` index entries that exist in the GDT that was just loaded. Each IST pointer (double fault, NMI, machine check) and the TSS RSP0 privilege stack is the top of a dedicated 20 KiB static array that nothing else uses. One honest limit, stated rather than implied away: these stacks have **no guard pages** — an overflow there does not fault, it silently corrupts adjacent `.bss`. The battery proves the *kernel* stack's overflow is caught; nothing yet proves the same for the IST/RSP0 stacks. |
 | 4 | **Framebuffer writes** — *empty: `framebuffer` contains no `unsafe` at all* | `framebuffer` | The bootloader hands the framebuffer over as a `&'static mut [u8]`, so there is no pointer to form and nothing to suspend: `Display::set_pixel` rejects out-of-range coordinates, then indexes through `get_mut`, and `scroll_region_up` moves rows with `copy_within`. `stride`, `bytes_per_pixel` and `pixel_format` are read from the negotiated `FrameBufferInfo`, never hard-coded, because UEFI GOP and BIOS VBE differ and both are boot-tested for exactly that reason. This is stronger than the raw-pointer-with-a-bounds-check design this row used to describe: there, the check is a promise a reviewer has to re-verify after every edit; here a wrong stride or depth drops a pixel and cannot reach memory outside the buffer, because the compiler will not let it. |
 | 5 | **`hlt` and interrupt-flag control** | idle loop, `panic`, critical sections | `hlt` touches no memory (`options(nomem, nostack, preserves_flags)`). The idle path uses the enable-then-halt sequence so that a wake-up racing the halt is not lost. Interrupts are disabled only around a section that provably cannot block. |
-| 6 | **Mutable statics** — *also empty of `unsafe` blocks, by construction* | `gdt` | There is no `static mut` in the kernel, so no `&mut` to one is ever formed. The double-fault stack is a byte array inside an `UnsafeCell`, which is what keeps it writable and in `.bss`; taking its address is a safe call, and the memory itself is written only by the CPU, only while handling a double fault. Everything else that changes is an atomic or sits behind a `spin::Mutex`. The `unsafe impl Sync` that this arrangement needs is row 10. |
+| 6 | **Mutable statics** — *also empty of `unsafe` blocks, by construction* | `gdt` | There is no `static mut` in the kernel, so no `&mut` to one is ever formed. The interrupt and privilege stacks — three ISTs and TSS RSP0 — are byte arrays inside `UnsafeCell`s, which is what keeps them writable and in `.bss`; taking an address is a safe call, and the memory itself is written only by the CPU: the ISTs while handling the fault each slot is wired to, RSP0 on a privilege transition into the kernel. Everything else that changes is an atomic or sits behind a `spin::Mutex`. The `unsafe impl Sync` pair this arrangement needs is row 10. |
 | 7 | **Zeroing a block being freed** | `memory::heap` allocator wrapper | The pointer and layout are those the caller passed to `dealloc`, so the block is live, owned by the allocator at that instant, and exactly `layout.size()` bytes. Zeroing happens **before** the inner `dealloc`; afterwards the allocator owns those bytes and writing them would corrupt the free list. |
 | 8 | **Panic-time lock recovery**, serial and console | `panic` handler, double-fault handler | A panic may happen while either lock is held, including from interrupt context, which is the one case the concurrency rule cannot prevent. The order is always the same: interrupts off, reclaim, then report. The panic handler reclaims both because it writes to both; the double-fault handler's selftest exit reclaims serial only, because serial is the only sink it uses. Sound only because the machine is stopping — the handler halts or exits and never returns, no other code will observe either sink again, and a legible panic is worth more than a lock invariant with no future reader. **These two handlers are the only places any lock is force-released.** It is never a pattern to copy. |
-| 9 | **Selftest-only reads of freed memory** | `selftest`, `#[cfg(feature = "selftest")]` only | Present only in test builds. Reads are volatile, through a raw pointer, within a block whose size is known, and the value is used solely for an assertion. Not compiled into a shipped image. Prefer the sentinel-absence test, which needs no such read; if a direct read is used, it is confined to this row. |
-| 10 | **`unsafe impl`** — a promise about a whole type, not one expression | `memory::frames`, `memory::heap`, `gdt` | Three of them, each carrying its `// SAFETY:` comment on the impl itself, since there is no block to attach one to. **`FrameAllocator for BootFrameAllocator`** promises a frame is never handed out twice: `next` only ever grows, and it indexes a deterministic iterator over a boot memory map that does not change after hand-over, so frame *n* is returned exactly once. **`GlobalAlloc for ZeroOnFree`** adds nothing to `LockedHeap`'s contract and defers to it for both calls; the only extra act is scrubbing a block the caller has already relinquished, in the window between the caller's last legal access and the inner `dealloc` — after that `dealloc` the allocator owns those bytes, which is why the order is fixed (row 7). **`Sync for DoubleFaultStack`** covers the `UnsafeCell` of row 6: nothing in the kernel reads or writes that memory, so there is no cross-thread access to make sound; only the CPU touches it, and only on a double fault. |
+| 9 | **Test reads of freed memory** | `selftest` (`#[cfg(feature = "selftest")]`), and the shell's `selftest` command, which ships a runtime twin of the zero-on-free check | Reads are volatile, through a raw pointer, within a block whose size is known, and the value is used solely for an assertion. The battery copy is not compiled into a shipped image; the shell's twin is, under exactly the same discipline. Prefer the sentinel-absence test, which needs no such read; if a direct read is used, it is confined to this row. |
+| 10 | **`unsafe impl`** — a promise about a whole type, not one expression | `memory::frames`, `memory::heap`, `gdt` | Four of them, each carrying its `// SAFETY:` comment on the impl itself, since there is no block to attach one to. **`FrameAllocator for BootFrameAllocator`** promises a frame is never handed out twice: `next` only ever grows, and it indexes a deterministic iterator over a boot memory map that does not change after hand-over, so frame *n* is returned exactly once. **`GlobalAlloc for ZeroOnFree`** adds nothing to `LockedHeap`'s contract and defers to it for both calls; the only extra act is scrubbing a block the caller has already relinquished, in the window between the caller's last legal access and the inner `dealloc` — after that `dealloc` the allocator owns those bytes, which is why the order is fixed (row 7). **`Sync for IstStack`** covers the three IST `UnsafeCell`s of row 6: nothing in the kernel reads or writes that memory, so there is no cross-thread access to make sound; only the CPU touches it, and only while handling the fault the slot is wired to. **`Sync for PrivilegeStack`** is the same promise for the TSS RSP0 stack: only the CPU writes it, on a privilege transition into the kernel. |
+| 11 | **Naked ring transitions** | `usermode::jump_to_user`, `usermode::int80_entry` | `jump_to_user` pushes the SysV callee-saved registers, saves RSP into `KERNEL_CONTINUATION_RSP` *before* any ring-3 instruction can execute, builds the `iretq` frame with the ring-3 selectors, and scrubs every GP register so ring 3 sees no kernel state. `int80_entry` runs `cld` before any Rust code (an interrupt gate clears IF but **not** DF, and SysV requires DF=0 at a call boundary); `SYS_EXIT` restores the saved kernel stack and its callee-saved registers and `ret`s into the launcher; every other syscall marshals into the SysV ABI, aligns the stack, calls `syscall_dispatch`, scrubs the caller-saved registers (keeping `rax`, the return value) and `iretq`s back. |
+| 12 | **User-image copy** | `usermode::run_elf` | The `copy_nonoverlapping` writes to pages just mapped writable that cover `memsz` bytes; the parser bounds-checked `file_start..+filesz` against the image before anything was mapped. The `memsz` tail past `filesz` is BSS, and frames arrive zeroed, so it is already correct. |
+| 13 | **DPL-3 gate install** | `interrupts` (IDT construction) | The `int 0x80` handler address is a valid naked entry that ends in `iretq` (or, for `SYS_EXIT`, restores the saved kernel stack and returns); DPL 3 lets a ring-3 program issue `int 0x80` without a #GP — and only that vector, since every other gate stays DPL 0. |
+| 14 | **`rdtsc`** | `time` | Reads the timestamp counter; no memory effects. |
+| 15 | **EFER.NXE** | `memory::init` | The CPU is already in long mode (EFER.LME set by the bootloader); the update only adds NXE, which every x86_64 CPU supports, and it runs before any NX mapping is created so the bit is honoured everywhere it is set. |
 
 ## Migrations
 
@@ -281,6 +353,8 @@ Every green milestone is committed and pushed.
 | **M3** | Frame allocator over the boot memory map (frame arithmetic in `kshared`, host-tested), `OffsetPageTable`, 1 MiB heap so `alloc` is live, zeroing allocator wrapper, frames zeroed on hand-out. Self-tests: `Box`, a 50k-element `Vec`, reuse after free, fresh page reads zero, sentinel absent after free. | Yes | `git revert`; M2 is heap-free and unaffected. |
 | **M4** | Cooperative executor over `alloc::task::Wake` with a `crossbeam_queue::ArrayQueue` ready queue (valid here: the heap exists from M3), enable-then-halt idle, and the keyboard IRQ's real destination — a second `ArrayQueue` behind `ScancodeStream`, drained by the task side and decoded with `pc-keyboard` 0.9's `ScancodeSet1::advance_state` and `EventDecoder::process_keyevent`. Self-test: a spawned task yields, wakes itself and completes. | Yes | `git revert`; M3's synchronous battery still passes. |
 | **M5** | The line editor from `kshared` (history is the shell's, because history needs the heap), the full command surface, boot-to-shell time in the banner from the PIT tick count, the complete battery ending with the stack-overflow check, the RAM floor measured and pinned per firmware, the size budget tightened to the measured value, the shipped-image boot job, README screenshot. | Yes | `git revert` to the M4 tag; every earlier gate still holds. |
+| **M6** | Ring 3 and the `int 0x80` system-call path: user GDT segments, TSS RSP0 privilege stack, the DPL-3 gate, `jump_to_user`/`int80_entry` with register scrubbing both ways, and the page-table audit. Self-tests: the user program runs at CPL 3; no mapping is user-accessible. | Yes | `git revert`; M5's single-ring kernel still boots and passes its battery. |
+| **M7** | ELF loading: `user/hello`, a linker-scripted Rust ELF built by the kernel's build script and embedded as bytes; `kshared::elf`, a host-tested refusal-first parser; per-segment W^X via `update_user_page`; the kernel heap made NX. Self-tests: a W+X image refused, the audit re-run after teardown, W^X flag plumbing. | Yes | `git revert`; M6 still proves the ring transition. |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
 port `0x60` — the controller delivers no further interrupts until it is read — but
@@ -302,8 +376,8 @@ static, and the handler still allocates nothing and blocks on nothing.
 | **Boot hang** — no faults, no progress: a spin lock taken twice, a loop with no exit, firmware that never hands over. | CI, as a job that stops producing output | `xtask` kills QEMU after 120 s and reports a timeout distinctly from a failure; the job also has its own timeout. The serial log is uploaded with `if: always()`, so the last check to pass is visible. | `git revert`. Each battery check prints its own `[selftest]` line as it passes, so the hang is between the last line in the log and the next check in `selftest::run` — one function, not one milestone. |
 | **Interrupt-context deadlock** — a handler blocks on a lock the interrupted code holds. Classically: logging to the console from the timer handler. | Nobody, until the machine stops responding | Prevented structurally, not detected: the concurrency rule above, plus code review against the global-state table's "touched from IRQ" column. Handlers take one lock, the PIC's, and the main thread never holds it once interrupts are enabled. | Not applicable if the rule holds. If one is found, the fix is to move the offending access out of interrupt context, never to make the lock reentrant. |
 | **Heap exhaustion** — the 1 MiB heap fills. | The person at the keyboard | There is no custom `alloc_error_handler`; Rust's default one panics, naming the size of the allocation that failed. That is a panic like any other here: interrupts off, the message on serial and on the panic screen, halted — and in a selftest build, exit 35. Not a silent hang and not a corrupt allocation. It does not report the heap's used and free counts, and it does not need to: `mem` reports those on demand, before anything has failed. | Reduce the allocation, or raise `HEAP_SIZE` deliberately and re-measure the RAM floor in the same commit. |
-| **Insufficient physical memory at boot** — the machine has less RAM than the boot needs. | CI at the pinned floor; a person on a small machine | Measured at 0.25 MB granularity around the floor: the **bootloader** runs out first, panicking with `FrameAllocationFailed` while mapping the kernel, and the kernel never runs — there is no observed window where the kernel-side `mapping the kernel heap failed` panic fires instead (that path exists but is shadowed by the earlier failure). The bootloader's panic reaches serial; `xtask` recognises it in the captured log and reports a bootloader OOM rather than calling the timeout a kernel hang. | Boot with more memory, or lower `HEAP_SIZE`. The pinned CI RAM floor, measured per firmware, is the regression test for this. |
-| **No framebuffer from firmware** | A person seeing a blank screen | `boot_info.framebuffer` is `None`. Handled, not a fault: the console falls back to serial-only, logs the fallback, and the shell and battery still run. | None needed; this is a supported configuration. |
+| **Insufficient physical memory at boot** — the machine has less RAM than the boot needs. | CI at the pinned floor; a person on a small machine | Measured at 0.25 MB granularity around the floor: the **bootloader** runs out first, panicking with `FrameAllocationFailed` while mapping the kernel, and the kernel never runs — there is no observed window where the kernel-side `mapping the kernel heap failed` panic fires instead (that path exists but is shadowed by the earlier failure). The bootloader's panic reaches serial; `xtask` recognises it in the captured log and reports a bootloader OOM rather than calling the timeout a kernel hang. | Boot with more memory, or lower `HEAP_SIZE`. The pinned CI RAM value — measured floor plus recorded headroom, per firmware — is the regression test for this. |
+| **No framebuffer from firmware** | A person seeing a blank screen | `boot_info.framebuffer` is `None`. Handled, not a fault: the console stays absent, the kernel logs the fallback over serial, and boot and the battery still run and pass. The shell renders to the console only, so this configuration is boot-proven, not interactive. | None needed; this is a supported degraded configuration. |
 | **Firmware-specific pixel format assumption** — code that works on BIOS VBE and corrupts under UEFI GOP, or vice versa. | Whoever boots the other firmware | The renderer reads `pixel_format`, `stride` and `bytes_per_pixel` from the negotiated `FrameBufferInfo`, and **both firmwares are boot-tested in the CI matrix**. A hard-coded assumption fails one leg of the matrix. | `git revert`; the matrix names which firmware broke. |
 
 ## Deferred, with measurement — write-only console scroll
@@ -388,7 +462,9 @@ must be seen to break it.
   50,000-element `Vec` grows and frees, and a freed block is reused (M3); a spawned
   task yields, wakes itself through the ready queue and completes, setting a flag the
   battery reads (M4); the full battery completes and every line it logged is a check
-  that ran (M5).
+  that ran (M5); the embedded `hello` ELF runs at CPL 3 and returns via syscall, a
+  crafted W+X image is refused before anything maps, and the page-table audit holds
+  both before ring 3 has ever run and again after its teardown (M6/M7).
 - *Negative — the privacy claims, which are the tests that justify the project:*
   a sentinel word written throughout a heap block appears **nowhere** in the
   allocation handed back after that block is freed; a freshly mapped page reads as
@@ -406,7 +482,10 @@ must be seen to break it.
   remove the IST0 assignment (the stack-overflow check must triple-fault into a
   non-33 exit rather than passing); stop reading port `0x60` in the keyboard handler
   (input must stop after one keystroke); hard-code a pixel format (one firmware leg
-  of the matrix must fail).
+  of the matrix must fail); launch the user program in ring 0 (the CPL assertion
+  must fail); map its `.data` read-only (the program's volatile write-back must
+  fault); leave a USER probe leaf or a surviving stack mapping (the audit must
+  fail); rewrite `update_user_page` wholesale (the NX-preservation check must fail).
 
 **Build gates**
 
@@ -414,13 +493,16 @@ must be seen to break it.
 - The unstable-feature allowlist gate (see Open Questions): the set of
   `#![feature(...)]` attributes in `kernel/` must equal the allowlist exactly.
   *Mutation:* add any feature attribute; the job must fail.
-- The `no-network-no-storage` gate: a job that greps `kernel/src`, `kshared/src` and
-  `kernel/Cargo.toml` for the tokens a network or storage driver would have to bring
-  with it — `smoltcp`, `tcp`, `socket`, `ethernet`, `virtio`, `dhcp`, `http`,
-  `fatfs`, `ext4`, `nvme`, `ahci`, `ata` and their neighbours — and fails on a hit.
-  Source and manifest, not the resolved dependency graph: it catches a driver written
-  by hand as well as one pulled in as a crate, which an allowlist over
-  `cargo metadata` would not. *Mutation:* add a crate or a module with any of those
+- The `no-network-no-storage` gate: a job that greps `kernel/src`, `kshared/src`,
+  `user` and both kernel-side manifests for the tokens a network or storage driver
+  would have to bring with it — `smoltcp`, `tcp`, `socket`, `ethernet`, `virtio`,
+  `dhcp`, `http`, `fatfs`, `ext4`, `nvme`, `ahci`, `ata` and their neighbours — and
+  fails on a hit. Source, manifests **and** the resolved dependency graph: the job
+  also greps `cargo tree -p kernel` output, so a transitive crate cannot smuggle
+  networking in unseen, and it catches a driver written by hand as well as one
+  pulled in as a crate. Only grep exit 1 (searched, found nothing) passes, and the
+  paths are preflighted — a renamed path fails the gate instead of disarming it.
+  *Mutation:* add a crate or a module with any of those
   names; the job must fail. This is what makes "no network stack exists" a checked
   statement rather than a promise. Its reach is worth stating too: it is a token
   grep, so a crate with an innocuous name still needs a person to notice it. The gate
@@ -524,8 +606,10 @@ IDT commit**, because retrofitting the gate after handlers exist means writing a
 gate against code that already violates it.
 
 **2. What is the actual RAM floor? — RESOLVED: measured 2026-08-17 on QEMU 11.1.**
-BIOS boots and passes the full battery at **24 MiB** and fails at 20; UEFI passes at
-**48 MiB** and fails at 40, the difference being OVMF's own footprint rather than
-the kernel's. `xtask` pins `BIOS_TEST_MEM_MB = 24` and `UEFI_TEST_MEM_MB = 48` and
-CI boots at exactly those values, so the lightness gate is now a measured gate: a
-RAM-hunger regression fails the build. The BIOS figure beats the 32 MiB target.
+BIOS boots and passes the full battery at **21 MiB** and fails at 20; UEFI passes at
+**46 MiB** and fails at 45, the difference being OVMF's own footprint rather than
+the kernel's. `xtask` pins `BIOS_TEST_MEM_MB = 24` and `UEFI_TEST_MEM_MB = 48` —
+floor plus a small, recorded headroom (3 MB BIOS, 2 MB UEFI) to absorb QEMU-version
+variance — and CI boots at exactly those values, so the lightness gate is a
+measured gate: a regression larger than that headroom fails the build. The BIOS
+floor beats the 32 MiB target.
