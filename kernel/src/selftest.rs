@@ -8,6 +8,7 @@ pub fn run() -> ! {
     serial_println!("[selftest] boot: reached kernel_main ... ok");
     console_renders_and_advances();
     breakpoint_handled_and_returns();
+    idt_has_all_installed_vectors();
     timer_ticks_advance();
     heap_allocations_work();
     freed_heap_memory_is_zeroed();
@@ -196,6 +197,23 @@ fn breakpoint_handled_and_returns() {
     let after = crate::interrupts::BREAKPOINT_HITS.load(Ordering::Relaxed);
     assert!(after > before, "breakpoint handler did not run");
     serial_println!("[selftest] interrupts: int3 handled, execution resumed ... ok");
+}
+
+fn idt_has_all_installed_vectors() {
+    use x86_64::instructions::tables::sidt;
+    let base = sidt().base.as_u64();
+    for &vec in crate::interrupts::INSTALLED_EXCEPTION_VECTORS {
+        // Each IDT gate is 16 bytes; the options half-word (present is bit 15)
+        // sits at offset 4.
+        // SAFETY: `base` is the loaded IDT and `vec` < 256, so this is in-bounds.
+        let options =
+            unsafe { core::ptr::read_volatile((base + u64::from(vec) * 16 + 4) as *const u16) };
+        assert!(
+            options & (1 << 15) != 0,
+            "IDT exception vector {vec} is not present"
+        );
+    }
+    serial_println!("[selftest] idt: all installed exception vectors present ... ok");
 }
 
 fn timer_ticks_advance() {

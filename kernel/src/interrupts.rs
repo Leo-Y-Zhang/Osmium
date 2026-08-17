@@ -48,18 +48,88 @@ pub static SCANCODES_SEEN: AtomicUsize = AtomicUsize::new(0);
 pub static EXPECTING_DOUBLE_FAULT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Generates a named panicking handler for a fault that carries no error
+/// code. A named handler means a fault gets its correct diagnosis instead of
+/// re-faulting into a misleading #GP off a non-present gate.
+macro_rules! exception {
+    ($name:ident, $msg:literal) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            panic!(concat!($msg, "\n{:#?}"), frame);
+        }
+    };
+}
+
+/// The same, for faults that push an error code.
+macro_rules! exception_ec {
+    ($name:ident, $msg:literal) => {
+        extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
+            panic!(
+                concat!($msg, " (error code {:#x})\n{:#?}"),
+                error_code, frame
+            );
+        }
+    };
+}
+
+exception!(divide_error_handler, "divide error (#DE)");
+exception!(debug_handler, "debug exception (#DB)");
+exception!(nmi_handler, "non-maskable interrupt (NMI)");
+exception!(overflow_handler, "overflow (#OF)");
+exception!(bound_range_handler, "bound range exceeded (#BR)");
+exception!(device_not_available_handler, "device not available (#NM)");
+exception!(x87_floating_point_handler, "x87 floating-point (#MF)");
+exception!(simd_floating_point_handler, "SIMD floating-point (#XM)");
+exception!(virtualization_handler, "virtualization (#VE)");
+exception_ec!(invalid_tss_handler, "invalid TSS (#TS)");
+exception_ec!(segment_not_present_handler, "segment not present (#NP)");
+exception_ec!(stack_segment_fault_handler, "stack-segment fault (#SS)");
+exception_ec!(alignment_check_handler, "alignment check (#AC)");
+exception_ec!(cp_protection_handler, "control-protection (#CP)");
+
+extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
+    panic!("machine check (#MC) — hardware reported an unrecoverable error\n{frame:#?}");
+}
+
 static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     let mut idt = InterruptDescriptorTable::new();
+    // Faults with no error code.
+    idt.divide_error.set_handler_fn(divide_error_handler);
+    idt.debug.set_handler_fn(debug_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.overflow.set_handler_fn(overflow_handler);
+    idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.device_not_available
+        .set_handler_fn(device_not_available_handler);
+    idt.x87_floating_point
+        .set_handler_fn(x87_floating_point_handler);
+    idt.simd_floating_point
+        .set_handler_fn(simd_floating_point_handler);
+    idt.virtualization.set_handler_fn(virtualization_handler);
+    // Faults with an error code.
+    idt.invalid_tss.set_handler_fn(invalid_tss_handler);
+    idt.segment_not_present
+        .set_handler_fn(segment_not_present_handler);
+    idt.stack_segment_fault
+        .set_handler_fn(stack_segment_fault_handler);
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
-    // SAFETY: the IST index is backed by a real, dedicated stack (gdt.rs).
+    idt.alignment_check.set_handler_fn(alignment_check_handler);
+    idt.cp_protection_exception
+        .set_handler_fn(cp_protection_handler);
+    // SAFETY: each IST index below is backed by a real, dedicated stack
+    // (gdt.rs) — the whole point is to run these on known-good memory.
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        idt.non_maskable_interrupt
+            .set_handler_fn(nmi_handler)
+            .set_stack_index(gdt::NMI_IST_INDEX);
+        idt.machine_check
+            .set_handler_fn(machine_check_handler)
+            .set_stack_index(gdt::MACHINE_CHECK_IST_INDEX);
     }
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
@@ -67,6 +137,13 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     idt[PIC_1_OFFSET + 7].set_handler_fn(spurious_handler);
     idt
 });
+
+/// The exception vectors this kernel installs a handler on. The self-test
+/// battery reads the loaded IDT back and asserts each of these is present.
+#[cfg(feature = "selftest")]
+pub const INSTALLED_EXCEPTION_VECTORS: &[u8] = &[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21,
+];
 
 /// PIT channel 0 reload value for ~100 Hz (1_193_182 Hz / 11932).
 const PIT_DIVISOR: u16 = 11932;

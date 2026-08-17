@@ -1,6 +1,7 @@
-//! GDT + TSS. IST slot 0 carries a dedicated stack so a double fault — e.g.
-//! from a kernel stack overflow — executes on known-good memory instead of
-//! the very stack that just overflowed.
+//! GDT + TSS. Three IST slots carry dedicated stacks so the faults most
+//! likely to arrive on a broken stack — a double fault (e.g. from a kernel
+//! stack overflow), an NMI, and a machine check — execute on known-good
+//! memory instead of whatever stack was in trouble.
 
 use core::cell::UnsafeCell;
 use spin::LazyLock;
@@ -11,26 +12,40 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-const DOUBLE_FAULT_STACK_SIZE: usize = 20 * 1024;
+pub const NMI_IST_INDEX: u16 = 1;
+pub const MACHINE_CHECK_IST_INDEX: u16 = 2;
 
-/// Writable static backing for the double-fault stack. A plain (non-mut)
-/// static would land in read-only memory; UnsafeCell keeps it in .bss.
+const IST_STACK_SIZE: usize = 20 * 1024;
+
+/// Writable static backing for one interrupt stack. A plain (non-mut) static
+/// would land in read-only memory; `UnsafeCell` keeps it in `.bss`.
 #[repr(C, align(16))]
-struct DoubleFaultStack(UnsafeCell<[u8; DOUBLE_FAULT_STACK_SIZE]>);
+struct IstStack(UnsafeCell<[u8; IST_STACK_SIZE]>);
 
-// SAFETY: only the CPU touches this memory, and only while handling a double
-// fault; the kernel never reads or writes it directly.
-unsafe impl Sync for DoubleFaultStack {}
+// SAFETY: only the CPU touches this memory, and only while handling the fault
+// its IST slot is wired to; the kernel never reads or writes it directly.
+unsafe impl Sync for IstStack {}
 
-static DOUBLE_FAULT_STACK: DoubleFaultStack =
-    DoubleFaultStack(UnsafeCell::new([0; DOUBLE_FAULT_STACK_SIZE]));
+impl IstStack {
+    const fn new() -> Self {
+        IstStack(UnsafeCell::new([0; IST_STACK_SIZE]))
+    }
+
+    /// Top of the stack (stacks grow downwards).
+    fn top(&self) -> VirtAddr {
+        VirtAddr::from_ptr(self.0.get()) + IST_STACK_SIZE as u64
+    }
+}
+
+static DOUBLE_FAULT_STACK: IstStack = IstStack::new();
+static NMI_STACK: IstStack = IstStack::new();
+static MACHINE_CHECK_STACK: IstStack = IstStack::new();
 
 static TSS: LazyLock<TaskStateSegment> = LazyLock::new(|| {
     let mut tss = TaskStateSegment::new();
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        let start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.get());
-        start + DOUBLE_FAULT_STACK_SIZE as u64 // stacks grow downwards
-    };
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = DOUBLE_FAULT_STACK.top();
+    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = NMI_STACK.top();
+    tss.interrupt_stack_table[MACHINE_CHECK_IST_INDEX as usize] = MACHINE_CHECK_STACK.top();
     tss
 });
 
@@ -52,7 +67,7 @@ static GDT: LazyLock<(GlobalDescriptorTable, Selectors)> = LazyLock::new(|| {
 pub fn init() {
     GDT.0.load();
     // SAFETY: the selectors index the GDT loaded on the line above, and the
-    // TSS's IST entry points at valid, unused stack memory.
+    // TSS's IST entries point at valid, unused stack memory.
     unsafe {
         CS::set_reg(GDT.1.code);
         SS::set_reg(GDT.1.data);
