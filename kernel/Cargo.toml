@@ -7,6 +7,11 @@ publish = false
 [dependencies]
 bootloader_api = "0.11.17"
 kshared = { path = "../kshared" }
+log = { version = "0.4", default-features = false }
+noto-sans-mono-bitmap = "0.3.2"
+spin = "0.12"
+uart_16550 = "0.3"
+x86_64 = "0.15.5"
 
 [features]
 # Runs the in-kernel self-test battery at boot and exits QEMU with a verdict.
