@@ -96,6 +96,7 @@ fn privacy() -> Result<()> {
     const SENTINEL: &str = "osmiumsecretzqxj";
     const MONITOR_PORT: u16 = 55532;
     let images = build_images(false)?;
+    let medium_before = sha256_file(&images.bios)?;
     let mut cmd = Command::new(qemu_program());
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", images.bios.display()))
@@ -192,6 +193,7 @@ fn privacy() -> Result<()> {
             post_boot.trim()
         );
     }
+    verify_no_persistence(&images.bios, &medium_before)?;
     println!(
         "\nkeystroke-privacy OK: the shell executed typed input (clean exit) and the \
          serial port stayed silent after boot (sentinel \"{SENTINEL}\" typed)"
@@ -250,6 +252,14 @@ struct Images {
     uefi: PathBuf,
 }
 
+impl Images {
+    /// The one file QEMU is handed as a writable `-drive` for this firmware —
+    /// and therefore the exact file the no-persistence gate hashes.
+    fn boot_medium(&self, uefi: bool) -> &Path {
+        if uefi { &self.uefi } else { &self.bios }
+    }
+}
+
 fn build_images(selftest: bool) -> Result<Images> {
     let kernel = build_kernel(selftest)?;
     let root = workspace_root();
@@ -291,6 +301,16 @@ const OVMF_RELEASE: &str = "edk2-stable202411-r1";
 /// is trusted without re-hashing.
 const OVMF_SHA256: &str = "963fc6cef6a0560cec97381ed22a7d5c76f440c8212529a034cb465466cd57cc";
 
+/// Hex sha256 of a file's contents: used to verify the OVMF download, and
+/// either side of a QEMU run to prove the boot medium came back byte-identical.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path).with_context(|| format!("reading {} to hash it", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn fetch_ovmf() -> Result<(PathBuf, PathBuf)> {
     let root = workspace_root();
     let dir = root.join("target/ovmf");
@@ -312,12 +332,7 @@ fn fetch_ovmf() -> Result<(PathBuf, PathBuf)> {
         if !status.success() {
             bail!("OVMF download failed: {url}");
         }
-        let digest = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(fs::read(&archive).context("reading the OVMF archive")?);
-            format!("{:x}", hasher.finalize())
-        };
+        let digest = sha256_file(&archive).context("hashing the OVMF archive")?;
         if digest != OVMF_SHA256 {
             bail!("OVMF checksum mismatch: got {digest}, expected {OVMF_SHA256}");
         }
@@ -361,11 +376,7 @@ fn qemu_program() -> PathBuf {
 }
 
 fn qemu_command(images: &Images, opts: &Opts, headless: bool) -> Result<Command> {
-    let image = if opts.uefi {
-        &images.uefi
-    } else {
-        &images.bios
-    };
+    let image = images.boot_medium(opts.uefi);
     let mut cmd = Command::new(qemu_program());
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image.display()))
@@ -432,6 +443,8 @@ fn test(opts: &Opts) -> Result<()> {
         },
         None => build_images(!opts.shipped)?,
     };
+    let boot_medium = images.boot_medium(opts.uefi);
+    let medium_before = sha256_file(boot_medium)?;
     let mut cmd = qemu_command(&images, opts, true)?;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -472,6 +485,7 @@ fn test(opts: &Opts) -> Result<()> {
             }
             verify_ram_claim(&log, opts.mem_mb())?;
             let boot_ms = verify_boot_latency(&log)?;
+            verify_no_persistence(boot_medium, &medium_before)?;
             println!(
                 "\nshipped-image boot OK ({}, {} MiB RAM, {boot_ms} ms to shell, {:.1}s): reached \"{SHIPPED_MARKER}\"",
                 if opts.uefi { "UEFI" } else { "BIOS" },
@@ -517,12 +531,27 @@ fn test(opts: &Opts) -> Result<()> {
         bail!("qemu exited with the success code but the serial log lacks 'SELFTEST PASSED'");
     }
     verify_ram_claim(&serial_log, opts.mem_mb())?;
+    verify_no_persistence(boot_medium, &medium_before)?;
     println!(
         "\nboot test OK ({}, {} MiB RAM, {:.1}s)",
         if opts.uefi { "UEFI" } else { "BIOS" },
         opts.mem_mb(),
         start.elapsed().as_secs_f32()
     );
+    Ok(())
+}
+
+/// Behavioural proof of the no-persistence claim: QEMU is handed the image as
+/// a plain writable `-drive`, so nothing but a guest write can change its
+/// bytes. Hash it before the spawn, hash it again once the child is gone, and
+/// a single differing byte means the kernel wrote to the medium it booted
+/// from. The OVMF vars pflash copy is deliberately not covered — firmware
+/// writes there by design, and it is not the boot medium.
+fn verify_no_persistence(image: &Path, before: &str) -> Result<()> {
+    let after = sha256_file(image)?;
+    if after != before {
+        bail!("the boot medium was written during the run - the no-persistence claim is broken");
+    }
     Ok(())
 }
 
@@ -574,4 +603,86 @@ fn verify_boot_latency(serial_log: &str) -> Result<u64> {
         bail!("boot-to-shell was {ms} ms, over the {BOOT_LATENCY_CEILING_MS} ms ceiling");
     }
     Ok(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two lines the gates parse, in the shape the kernel really logs them
+    /// (`kernel/src/main.rs`): the memory line carrying `<used>/<total> frames`
+    /// and the boot-complete line carrying the millisecond figure.
+    fn serial_log(frames_total: u64, boot_ms: u64) -> String {
+        format!(
+            "[INFO ] memory: heap 100 KiB (65536 B used, 36864 B free), 12/{frames_total} frames\n\
+             [INFO ] boot complete; shell ready ({boot_ms} ms after interrupts-on)\n"
+        )
+    }
+
+    #[test]
+    fn ram_claim_accepts_a_measured_figure() {
+        // 5376 frames * 4 KiB = 21 MiB usable, plausibly under the 24 MiB asked for.
+        verify_ram_claim(&serial_log(5376, 20), BIOS_TEST_MEM_MB).unwrap();
+    }
+
+    #[test]
+    fn ram_claim_rejects_qemus_128_mib_default() {
+        // The failure this gate exists for: QEMU rejects the `-m` value, quietly
+        // substitutes its 128 MiB default, and the lightness claim becomes fiction.
+        let err = verify_ram_claim(&serial_log(32768, 20), BIOS_TEST_MEM_MB).unwrap_err();
+        assert!(err.to_string().contains("saw 128 MiB usable"), "{err}");
+    }
+
+    #[test]
+    fn ram_claim_rejects_far_less_memory_than_claimed() {
+        // 2560 frames = 10 MiB, well below the 60% floor for a 24 MiB machine.
+        let err = verify_ram_claim(&serial_log(2560, 20), BIOS_TEST_MEM_MB).unwrap_err();
+        assert!(err.to_string().contains("saw 10 MiB usable"), "{err}");
+    }
+
+    #[test]
+    fn ram_claim_rejects_a_log_with_no_frames_line() {
+        let log = "[INFO ] boot complete; shell ready (20 ms after interrupts-on)\n";
+        let err = verify_ram_claim(log, BIOS_TEST_MEM_MB).unwrap_err();
+        assert!(
+            err.to_string().contains("never reported usable frames"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn boot_latency_returns_the_measured_figure() {
+        assert_eq!(verify_boot_latency(&serial_log(5376, 20)).unwrap(), 20);
+    }
+
+    #[test]
+    fn boot_latency_rejects_a_boot_over_the_ceiling() {
+        let err = verify_boot_latency(&serial_log(5376, 250)).unwrap_err();
+        assert!(err.to_string().contains("was 250 ms"), "{err}");
+    }
+
+    #[test]
+    fn boot_latency_rejects_a_log_with_no_latency_line() {
+        let log = "[INFO ] memory: heap 100 KiB (65536 B used, 36864 B free), 12/5376 frames\n";
+        let err = verify_boot_latency(log).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("never reported a boot-to-shell time"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sha256_file_matches_the_known_digest() {
+        // The canonical sha256("abc") vector, so the helper is checked against
+        // an outside answer rather than against itself.
+        let path = env::temp_dir().join(format!("osmium-xtask-sha256-{}.bin", std::process::id()));
+        fs::write(&path, b"abc").expect("writing the fixture file");
+        let digest = sha256_file(&path);
+        fs::remove_file(&path).ok();
+        assert_eq!(
+            digest.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }
