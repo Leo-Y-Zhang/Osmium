@@ -66,6 +66,8 @@ pub fn map_probe_page() -> VirtAddr {
     let mapper = mapper.as_mut().expect("memory not initialised");
     let allocator = allocator.as_mut().expect("memory not initialised");
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(PROBE));
+    // Pre-soil the frame so the zero assertion proves the allocator's scrub.
+    allocator.soil_next_frame(0xC3);
     let frame = allocator.allocate_frame().expect("out of physical frames");
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
     // SAFETY: a fixed, otherwise-unused virtual page mapped to a frame the

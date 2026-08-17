@@ -35,6 +35,20 @@ impl BootFrameAllocator {
     pub fn stats(&self) -> (usize, usize) {
         (self.next, self.usable_frames().count())
     }
+
+    /// Deliberately dirties the frame the next `allocate_frame` will return.
+    /// QEMU hands out pre-zeroed RAM, so without this the zero-on-hand-out
+    /// selftest would pass even with the scrub deleted — it must prove OUR
+    /// zeroing, not the emulator's.
+    #[cfg(feature = "selftest")]
+    pub fn soil_next_frame(&self, pattern: u8) {
+        if let Some(frame) = self.usable_frames().nth(self.next) {
+            let virt = self.physical_memory_offset + frame.start_address().as_u64();
+            // SAFETY: the frame is usable RAM mapped at the physical-memory
+            // offset and has not been handed to anyone yet.
+            unsafe { core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), pattern, 4096) };
+        }
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
