@@ -81,7 +81,17 @@ fn freed_heap_memory_is_zeroed() {
         // read_volatile is load-bearing: a plain read of freshly-allocated
         // memory is undef to LLVM, which constant-folds the comparison away
         // and turns this test into decoration (observed doing exactly that).
-        let stale = (0..layout.size())
+        //
+        // The scan starts past the first 16 bytes: linked_list_allocator
+        // writes its free-list node (Hole { size, next }) into the head of a
+        // freed block AFTER our scrub — the scrub must come first or it would
+        // corrupt the free list — and a metadata byte can legitimately equal
+        // the sentinel (an aligned hole pointer's middle byte, say), which
+        // would turn this privacy test red with no privacy bug. Bytes 16..
+        // are caller data and still prove the scrub: deleting it leaves 240
+        // sentinel bytes here.
+        const HOLE_META: usize = 16;
+        let stale = (HOLE_META..layout.size())
             .filter(|&i| p2.add(i).read_volatile() == 0xA5)
             .count();
         assert_eq!(stale, 0, "freed memory still holds {stale} sentinel bytes");

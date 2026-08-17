@@ -405,8 +405,12 @@ fn freed_memory_is_zeroed() -> bool {
             return false;
         }
         // Volatile: a plain read of fresh-alloc memory is undef and LLVM
-        // folds the check away (see the battery's twin of this test).
-        let clean = p1 == p2 && (0..layout.size()).all(|i| p2.add(i).read_volatile() != 0xA5);
+        // folds the check away (see the battery's twin of this test). The
+        // scan skips the allocator's 16-byte free-list node at the block
+        // head for the reason the twin documents.
+        const HOLE_META: usize = 16;
+        let clean =
+            p1 == p2 && (HOLE_META..layout.size()).all(|i| p2.add(i).read_volatile() != 0xA5);
         dealloc(p2, layout);
         clean
     }
