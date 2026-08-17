@@ -57,7 +57,10 @@ pub fn init(
         let frame = frame_allocator
             .allocate_frame()
             .ok_or(MapToError::FrameAllocationFailed)?;
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // The heap holds data, never code: NO_EXECUTE closes what would
+        // otherwise be a writable-and-executable megabyte (NXE is enabled
+        // before this runs, so the bit is honoured).
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         // SAFETY: pages in a fixed, otherwise-unused virtual range, each
         // mapped to a frame the allocator just handed out exclusively.
         unsafe { mapper.map_to(page, frame, flags, frame_allocator)?.flush() };

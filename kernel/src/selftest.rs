@@ -14,10 +14,13 @@ pub fn run() -> ! {
     freed_heap_memory_is_zeroed();
     fresh_page_is_mapped_zeroed_writable();
     kernel_mappings_are_supervisor_only();
+    heap_is_not_executable();
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
     shell_processes_a_scripted_session();
     user_program_runs_in_ring3();
+    no_stray_user_mappings_after_ring3();
+    make_read_only_preserves_nx();
     measure_console_scroll();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
@@ -154,10 +157,60 @@ fn async_task_with_waker_runs() {
 
 fn kernel_mappings_are_supervisor_only() {
     assert!(
-        crate::memory::no_user_accessible_mappings(),
-        "a page-table entry is user-accessible while the kernel has no ring 3"
+        crate::memory::no_stray_user_mappings(),
+        "a stray user-accessible mapping exists before ring 3 has ever run"
     );
     serial_println!("[selftest] privacy: no mapping is user-accessible ... ok");
+}
+
+/// Re-audits the page tables AFTER the ring-3 round trip: the teardown must
+/// leave no user-accessible leaf anywhere, and user-accessible intermediates
+/// only where they reach the declared user window. Without this second look,
+/// battery ordering alone hid whatever `run_user` left behind.
+fn no_stray_user_mappings_after_ring3() {
+    assert!(
+        crate::memory::no_stray_user_mappings(),
+        "a user-accessible mapping survived the ring-3 teardown"
+    );
+    serial_println!("[selftest] privacy: ring-3 teardown left no user-accessible leaf ... ok");
+}
+
+fn heap_is_not_executable() {
+    use x86_64::structures::paging::PageTableFlags;
+    let flags = crate::memory::translate_flags(crate::memory::heap::HEAP_START)
+        .expect("heap start is not mapped");
+    assert!(
+        flags.contains(PageTableFlags::NO_EXECUTE),
+        "the kernel heap is executable (W^X violation)"
+    );
+    serial_println!("[selftest] security: kernel heap is non-executable ... ok");
+}
+
+/// Maps a user page with NX, tightens it read-only, and asserts NX survived —
+/// the flags must be narrowed, never rewritten. (The wholesale-rewrite
+/// mutation of `make_read_only` fails exactly here.)
+fn make_read_only_preserves_nx() {
+    use x86_64::structures::paging::PageTableFlags;
+    let addr = crate::usermode::USER_STACK_ADDR;
+    crate::memory::map_user_page(addr, true, false);
+    crate::memory::make_read_only(addr);
+    let flags = crate::memory::translate_flags(addr).expect("probe page is not mapped");
+    assert!(
+        !flags.contains(PageTableFlags::WRITABLE),
+        "make_read_only left the page writable"
+    );
+    assert!(
+        flags.contains(PageTableFlags::NO_EXECUTE),
+        "make_read_only dropped NO_EXECUTE while tightening"
+    );
+    crate::memory::unmap_user_page(addr);
+    // This probe mapped a user page of its own; audit its teardown the same
+    // way the ring-3 run's teardown is audited.
+    assert!(
+        crate::memory::no_stray_user_mappings(),
+        "the NX probe's own teardown left a user-accessible leaf"
+    );
+    serial_println!("[selftest] security: make_read_only narrows flags, NX preserved ... ok");
 }
 
 fn heap_refuses_oversized_allocation() {

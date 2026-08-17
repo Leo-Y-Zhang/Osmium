@@ -7,7 +7,6 @@ pub mod frames;
 pub mod heap;
 
 use bootloader_api::info::MemoryRegions;
-use core::sync::atomic::{AtomicU64, Ordering};
 use frames::BootFrameAllocator;
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -16,9 +15,6 @@ use x86_64::structures::paging::{OffsetPageTable, PageTable};
 
 pub static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 pub static FRAME_ALLOCATOR: Mutex<Option<BootFrameAllocator>> = Mutex::new(None);
-/// The bootloader's physical-memory mapping offset, stored so the page-table
-/// audit can walk the live tables without re-deriving it.
-static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 /// Initialises paging and the frame allocator, then maps the kernel heap.
 /// `physical_memory_offset` must be the bootloader's all-of-physical-memory
@@ -31,7 +27,6 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     // this only adds NXE, which every x86_64 CPU supports.
     unsafe { Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE)) };
 
-    PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset, Ordering::Relaxed);
     let offset = VirtAddr::new(physical_memory_offset);
     // SAFETY: the bootloader maps all physical memory at `offset`, and this
     // is the only mapper ever constructed over the active page table.
@@ -51,8 +46,8 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
 /// Maps one user-accessible page at `virt`. The `USER_ACCESSIBLE` flag must be
 /// on the intermediate tables too, not just the leaf — the classic mistake is
 /// setting it only on the leaf and getting a fault from ring 3 anyway — so
-/// this uses `map_to_with_table_flags`. Returns the mapped page's frame so the
-/// caller can later tighten permissions (W^X).
+/// this uses `map_to_with_table_flags`. Permissions can be tightened later
+/// with [`make_read_only`] (W^X once a program has been copied in).
 pub fn map_user_page(virt: u64, writable: bool, executable: bool) {
     use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
     let mut mapper = MAPPER.lock();
@@ -81,19 +76,25 @@ pub fn map_user_page(virt: u64, writable: bool, executable: bool) {
     }
 }
 
-/// Drops the WRITABLE flag on an already-mapped page (W^X for user code, once
-/// the kernel has finished copying the program in).
+/// Drops the WRITABLE flag on an already-mapped page, leaving every other
+/// flag — NO_EXECUTE included — exactly as it was. (An earlier version
+/// rewrote the flags wholesale, which silently cleared NX; harmless for the
+/// executable code page it was written for, and a W^X hole for any non-
+/// executable page a later caller tightens.)
 pub fn make_read_only(virt: u64) {
-    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
+    use x86_64::structures::paging::mapper::TranslateResult;
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB, Translate};
     let mut mapper = MAPPER.lock();
     let mapper = mapper.as_mut().expect("memory not initialised");
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    // SAFETY: `page` is already mapped by map_user_page; this only narrows its
-    // permissions, and the TLB is flushed.
+    let TranslateResult::Mapped { flags, .. } = mapper.translate(page.start_address()) else {
+        panic!("make_read_only on an unmapped page");
+    };
+    // SAFETY: `page` is already mapped; this only clears WRITABLE, and the
+    // TLB is flushed.
     unsafe {
         mapper
-            .update_flags(page, flags)
+            .update_flags(page, flags & !PageTableFlags::WRITABLE)
             .expect("tightening user code flags failed")
             .flush();
     }
@@ -128,46 +129,87 @@ unsafe fn active_level_4_table(offset: VirtAddr) -> &'static mut PageTable {
     unsafe { &mut *virt.as_mut_ptr() }
 }
 
-/// Walks the live page tables and returns true if NO present mapping, at any
-/// level, is user-accessible. In v1 there is no ring 3, so the honest
-/// invariant is that nothing is reachable from user mode; M6 tightens this to
-/// "only the declared user range". The battery asserts it, and mapping the
-/// probe page `USER_ACCESSIBLE` makes it fail.
+/// Audits the live page tables for user-accessible entries. True iff NO leaf
+/// mapping anywhere is user-accessible AND every user-accessible intermediate
+/// entry covers the declared user window (the two fixed pages ring 3 runs
+/// on). Order-independent by construction: it holds before ring 3 has ever
+/// run (no USER bit exists at all) and after any `run_user` teardown — the
+/// leaf unmap clears the leaves, and parent tables legitimately keep USER
+/// only for the window they exist to reach. A stray user leaf ANYWHERE, at
+/// any point the battery looks, fails it; so does a user-accessible
+/// intermediate reaching outside the window.
+///
+/// The walk holds the MAPPER lock for its whole duration and reaches the
+/// root through the mapper (a shared reborrow, not a second CR3 read), so it
+/// cannot race a mapping operation or alias the mapper's exclusive borrow.
+/// Virtual addresses are tracked without canonical sign-extension: high-half
+/// entries get raw bases >= 2^47, which can never intersect the low user
+/// window — the comparison stays correct.
 #[cfg(feature = "selftest")]
-pub fn no_user_accessible_mappings() -> bool {
+pub fn no_stray_user_mappings() -> bool {
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
-    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::Relaxed);
-    fn walk(table_phys: u64, offset: u64, level: u8) -> bool {
-        let virt = offset + table_phys;
-        // SAFETY: `table_phys` is a present page-table frame and `offset` maps
-        // all physical memory, so this reference is valid and read-only;
-        // recursion is bounded by the four paging levels.
-        let table = unsafe { &*(virt as *const PageTable) };
-        for entry in table.iter() {
+    fn covers_user_window(base: u64, span: u64) -> bool {
+        let contains = |addr: u64| addr >= base && addr < base.saturating_add(span);
+        contains(crate::usermode::USER_CODE_ADDR) || contains(crate::usermode::USER_STACK_ADDR)
+    }
+
+    fn walk(table: &PageTable, offset: u64, level: u8, base: u64) -> bool {
+        // VA span per entry: L4 512 GiB, L3 1 GiB, L2 2 MiB, L1 4 KiB.
+        let span = 1u64 << (12 + 9 * (u64::from(level) - 1));
+        for (i, entry) in table.iter().enumerate() {
             if entry.is_unused() {
                 continue;
             }
-            if entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-                return false;
-            }
+            let entry_base = base + i as u64 * span;
+            let user = entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
             let leaf = level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE);
-            if !leaf && !walk(entry.addr().as_u64(), offset, level - 1) {
-                return false;
+            if leaf {
+                if user {
+                    return false;
+                }
+            } else {
+                if user && !covers_user_window(entry_base, span) {
+                    return false;
+                }
+                let virt = offset + entry.addr().as_u64();
+                // SAFETY: the entry is present and points at a page-table
+                // frame; `offset` maps all physical memory, the reference is
+                // read-only, and recursion is bounded by the four levels.
+                let child = unsafe { &*(virt as *const PageTable) };
+                if !walk(child, offset, level - 1, entry_base) {
+                    return false;
+                }
             }
         }
         true
     }
 
-    let (l4, _) = Cr3::read();
-    walk(l4.start_address().as_u64(), offset, 4)
+    let mapper = MAPPER.lock();
+    let mapper = mapper.as_ref().expect("memory not initialised");
+    let offset = mapper.phys_offset().as_u64();
+    walk(mapper.level_4_table(), offset, 4, 0)
+}
+
+/// The lowest-level page-table entry flags for `virt`, if mapped. Selftest
+/// plumbing for the NX assertions.
+#[cfg(feature = "selftest")]
+pub fn translate_flags(virt: u64) -> Option<x86_64::structures::paging::PageTableFlags> {
+    use x86_64::structures::paging::Translate;
+    use x86_64::structures::paging::mapper::TranslateResult;
+    let mapper = MAPPER.lock();
+    let mapper = mapper.as_ref().expect("memory not initialised");
+    match mapper.translate(VirtAddr::new(virt)) {
+        TranslateResult::Mapped { flags, .. } => Some(flags),
+        _ => None,
+    }
 }
 
 /// Maps one fresh page at a fixed probe address and returns it; the self-test
 /// battery uses it to prove mapping works and frames arrive zeroed. The
 /// `user_accessible` argument is normally `false`; flipping it to `true` is
-/// the mutation that proves [`no_user_accessible_mappings`] catches a
-/// user-visible mapping.
+/// the mutation that proves [`no_stray_user_mappings`] catches a
+/// user-visible leaf outside the declared window.
 #[cfg(feature = "selftest")]
 pub fn map_probe_page() -> VirtAddr {
     map_probe_page_inner(false)

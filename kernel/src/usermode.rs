@@ -9,7 +9,9 @@
 //!
 //! Privacy carries over: the frame the user runs on is zeroed on hand-out like
 //! every other, so no previous owner's bytes are visible to the program, and
-//! the self-test proves no kernel mapping is user-accessible.
+//! the self-tests audit the page tables both before ring 3 has run and again
+//! after teardown — no kernel mapping is ever user-accessible, and no user
+//! leaf survives a run.
 //!
 //! M6 boundaries, stated so they are not mistaken for isolation guarantees:
 //! - **A misbehaving user program is fatal.** Every exception handler panics,
@@ -41,8 +43,11 @@ static KERNEL_CONTINUATION_RSP: AtomicU64 = AtomicU64::new(0);
 /// The exit code the user program passed to `SYS_EXIT`.
 static USER_EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 
-const USER_CODE_ADDR: u64 = 0x40_0000;
-const USER_STACK_ADDR: u64 = 0x80_0000;
+/// The fixed user window: one code page and one stack page. The page-table
+/// audit (`memory::no_stray_user_mappings`) allows user-accessible
+/// intermediate entries only where they reach these two addresses.
+pub(crate) const USER_CODE_ADDR: u64 = 0x40_0000;
+pub(crate) const USER_STACK_ADDR: u64 = 0x80_0000;
 
 /// The `int 0x80` entry, as a raw address for the IDT gate (installed at DPL 3
 /// in `interrupts.rs` so ring 3 may issue the instruction).
