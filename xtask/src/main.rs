@@ -34,6 +34,9 @@ struct Opts {
     selftest: bool,
     shipped: bool,
     mem_override: Option<u32>,
+    /// Boot this exact image file instead of building one; used by the release
+    /// workflow to prove the very bytes it uploads.
+    image_override: Option<PathBuf>,
 }
 
 impl Opts {
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
         selftest: false,
         shipped: false,
         mem_override: None,
+        image_override: None,
     };
     for arg in args {
         match arg.as_str() {
@@ -61,12 +65,15 @@ fn main() -> Result<()> {
             "--bios" => opts.uefi = false,
             "--selftest" => opts.selftest = true,
             "--shipped" => opts.shipped = true,
-            other => match other.strip_prefix("--mem=") {
-                Some(mb) => {
+            other => {
+                if let Some(mb) = other.strip_prefix("--mem=") {
                     opts.mem_override = Some(mb.parse().context("--mem=<MB> takes a number")?);
+                } else if let Some(path) = other.strip_prefix("--image=") {
+                    opts.image_override = Some(PathBuf::from(path));
+                } else {
+                    bail!("unknown argument: {other}");
                 }
-                None => bail!("unknown argument: {other}"),
-            },
+            }
         }
     }
     match cmd.as_str() {
@@ -401,7 +408,16 @@ fn test(opts: &Opts) -> Result<()> {
     if opts.mem_override == Some(0) {
         bail!("--mem=0 is not a machine; QEMU would silently fall back to its default");
     }
-    let images = build_images(!opts.shipped)?;
+    // --image boots an exact prebuilt file (release provenance); otherwise
+    // build fresh. Both fields of Images point at the same file since --image
+    // supplies one firmware's image and `--bios`/`--uefi` selects it.
+    let images = match &opts.image_override {
+        Some(path) => Images {
+            bios: path.clone(),
+            uefi: path.clone(),
+        },
+        None => build_images(!opts.shipped)?,
+    };
     let mut cmd = qemu_command(&images, opts, true)?;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::inherit())

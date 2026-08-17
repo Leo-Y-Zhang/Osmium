@@ -136,10 +136,29 @@ Ring 3 + syscalls, ELF loading, a RAM-disk filesystem, preemptive scheduling,
 APIC/HPET, SMP. Networking is on no roadmap; if it ever lands, it ships off by
 default.
 
+## Try it without building
+
+Tagged releases carry prebuilt BIOS and UEFI images that were **boot-proven in
+CI as the exact uploaded bytes**, with `SHA256SUMS` to verify them. Download
+`osmium-bios.img` from the [releases page](https://github.com/Leo-Y-Zhang/Osmium/releases)
+and:
+
+```
+qemu-system-x86_64 -drive format=raw,file=osmium-bios.img -m 24M
+```
+
 ## Documents
 
-The PRD, TDD, App Flow and Design Brief live in [docs/](docs/) — including the
-TDD's inventory of every `unsafe` block and the invariant that makes it sound.
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — a code-anchored walk from firmware
+  to the shell prompt, with the keystroke dataflow diagram.
+- [PRD.md](docs/PRD.md) — scope, success criteria, and the deliberate non-goals.
+- [TDD.md](docs/TDD.md) — the memory map, global-state table, and the inventory
+  of every `unsafe` block with the invariant that makes it sound.
+- [APP_FLOW.md](docs/APP_FLOW.md) — the command surface and every screen state.
+- [DESIGN_BRIEF.md](docs/DESIGN_BRIEF.md) — the visual intent and colour roles.
+
+Third-party licenses (including the embedded Noto font's OFL notice) are in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## License
 

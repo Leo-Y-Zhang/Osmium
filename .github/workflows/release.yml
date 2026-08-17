@@ -1,0 +1,44 @@
+name: Release
+
+# Tagging v* builds the shipped images, boots the EXACT bytes on both firmwares,
+# checksums them, and publishes them so anyone can boot Osmium without a Rust
+# toolchain. The release fails if the uploaded images do not boot.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: Build shipped images
+        run: cargo xtask build
+      - name: Boot-prove the exact BIOS image
+        shell: bash
+        run: cargo xtask test --shipped --bios --image=target/img/osmium-bios.img | tee serial-bios.log
+      - name: Boot-prove the exact UEFI image
+        shell: bash
+        run: cargo xtask test --shipped --uefi --image=target/img/osmium-uefi.img | tee serial-uefi.log
+      - name: Checksums
+        working-directory: target/img
+        run: sha256sum osmium-bios.img osmium-uefi.img | tee SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            target/img/osmium-bios.img \
+            target/img/osmium-uefi.img \
+            target/img/SHA256SUMS \
+            THIRD_PARTY_LICENSES.md \
+            serial-bios.log serial-uefi.log \
+            --title "Osmium ${{ github.ref_name }}" \
+            --notes "Bootable BIOS and UEFI images, boot-proven in this CI run (see the attached serial logs). Verify with SHA256SUMS. Try it: \`qemu-system-x86_64 -drive format=raw,file=osmium-bios.img -m 24M\`."
