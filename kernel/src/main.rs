@@ -18,6 +18,7 @@ mod qemu;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;
+mod task;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
@@ -96,8 +97,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "selftest"))]
     {
-        log::info!("boot complete; halting (the shell arrives in a later milestone)");
-        halt_loop()
+        log::info!("boot complete; keyboard echo running (the shell arrives at M5)");
+        let mut executor = task::executor::Executor::new();
+        executor.spawn(task::Task::new(task::keyboard::echo_keypresses()));
+        executor.run()
     }
 }
 

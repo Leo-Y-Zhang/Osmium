@@ -101,8 +101,9 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
     // The controller only delivers the next IRQ once the buffer is read.
     let mut port: Port<u8> = Port::new(0x60);
     // SAFETY: reading the PS/2 data port inside its own interrupt handler.
-    let _scancode = unsafe { port.read() };
+    let scancode = unsafe { port.read() };
     SCANCODES_SEEN.fetch_add(1, Ordering::Relaxed);
+    crate::task::keyboard::enqueue_scancode(scancode);
     end_of_interrupt(InterruptIndex::Keyboard);
 }
 

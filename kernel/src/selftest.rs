@@ -12,6 +12,7 @@ pub fn run() -> ! {
     heap_allocations_work();
     freed_heap_memory_is_zeroed();
     fresh_page_is_mapped_zeroed_writable();
+    async_task_with_waker_runs();
     report_memory_stats();
     serial_println!("SELFTEST PASSED");
     crate::qemu::exit(crate::qemu::ExitCode::Success)
@@ -67,6 +68,42 @@ fn fresh_page_is_mapped_zeroed_writable() {
         assert_eq!(addr.as_ptr::<u64>().read_volatile(), 0x1234_5678_9abc_def0);
     }
     serial_println!("[selftest] paging: fresh page mapped, zeroed, writable ... ok");
+}
+
+fn async_task_with_waker_runs() {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll};
+
+    /// Returns Pending once, waking itself — so completing exercises the
+    /// waker → ready-queue → re-poll path, not just a straight-through poll.
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+    let mut executor = crate::task::executor::Executor::new();
+    executor.spawn(crate::task::Task::new(async {
+        YieldOnce(false).await;
+        RAN.store(true, Ordering::SeqCst);
+    }));
+    executor.run_ready_tasks();
+    assert!(
+        RAN.load(Ordering::SeqCst),
+        "spawned async task did not run to completion via its waker"
+    );
+    serial_println!("[selftest] executor: task yielded, woke itself, completed ... ok");
 }
 
 fn report_memory_stats() {
