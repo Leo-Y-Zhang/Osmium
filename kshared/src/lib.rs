@@ -30,13 +30,15 @@ pub fn frame_starts(start: u64, end: u64) -> impl Iterator<Item = u64> {
 /// Capacity of one command line, in bytes (ASCII only).
 pub const LINE_CAP: usize = 256;
 
-/// What a fed character did to the line buffer — the caller renders exactly
-/// this, so display and buffer can never disagree.
+/// What a fed character did to the line buffer. The shell re-renders the whole
+/// line from [`LineEditor::line`] and [`LineEditor::cursor`] after every key,
+/// so display and buffer cannot disagree; this enum only tells the caller
+/// whether the line was submitted and whether anything changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditAction {
-    /// The char was appended; echo it.
+    /// A printable character was inserted at the cursor.
     Echoed(char),
-    /// The last char was removed; erase one display cell.
+    /// A character was removed at or before the cursor.
     Erased,
     /// Enter was pressed; read the line with `line()`, then `clear()`.
     Submitted,
@@ -44,10 +46,14 @@ pub enum EditAction {
     Ignored,
 }
 
-/// Fixed-capacity ASCII line editor: no allocator, host-testable.
+/// Fixed-capacity ASCII line editor with an insertion cursor: no allocator,
+/// host-testable. The cursor is a byte index in `0..=len`; insertion and
+/// deletion happen at the cursor, so mid-line editing keeps buffer and cursor
+/// consistent.
 pub struct LineEditor {
     buf: [u8; LINE_CAP],
     len: usize,
+    cursor: usize,
 }
 
 impl LineEditor {
@@ -55,6 +61,7 @@ impl LineEditor {
         Self {
             buf: [0; LINE_CAP],
             len: 0,
+            cursor: 0,
         }
     }
 
@@ -62,8 +69,11 @@ impl LineEditor {
         match c {
             '\n' | '\r' => EditAction::Submitted,
             '\u{8}' | '\u{7f}' => {
-                if self.len > 0 {
+                if self.cursor > 0 {
+                    // Delete the char before the cursor, closing the gap.
+                    self.buf.copy_within(self.cursor..self.len, self.cursor - 1);
                     self.len -= 1;
+                    self.cursor -= 1;
                     EditAction::Erased
                 } else {
                     EditAction::Ignored
@@ -71,8 +81,11 @@ impl LineEditor {
             }
             c if c.is_ascii() && !c.is_ascii_control() => {
                 if self.len < LINE_CAP {
-                    self.buf[self.len] = c as u8;
+                    // Insert at the cursor, shifting the tail right.
+                    self.buf.copy_within(self.cursor..self.len, self.cursor + 1);
+                    self.buf[self.cursor] = c as u8;
                     self.len += 1;
+                    self.cursor += 1;
                     EditAction::Echoed(c)
                 } else {
                     EditAction::Ignored
@@ -82,12 +95,45 @@ impl LineEditor {
         }
     }
 
+    /// Moves the cursor one cell left; returns whether it moved.
+    pub fn move_left(&mut self) -> bool {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Moves the cursor one cell right; returns whether it moved.
+    pub fn move_right(&mut self) -> bool {
+        if self.cursor < self.len {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.len;
+    }
+
     pub fn line(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn clear(&mut self) {
         self.len = 0;
+        self.cursor = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -98,9 +144,10 @@ impl LineEditor {
         self.len == 0
     }
 
-    /// Replaces the contents (history recall). Truncates at capacity;
-    /// control and non-ASCII characters are skipped rather than interpreted
-    /// (a backspace in `s` must not delete characters already set).
+    /// Replaces the contents (history recall), cursor left at the end.
+    /// Truncates at capacity; control and non-ASCII characters are skipped
+    /// rather than interpreted (a backspace in `s` must not delete characters
+    /// already set).
     pub fn set_line(&mut self, s: &str) {
         self.clear();
         for c in s.chars() {
@@ -247,6 +294,51 @@ mod tests {
         );
         assert_eq!(parse_command(""), None);
         assert_eq!(parse_command("   "), None);
+    }
+
+    #[test]
+    fn cursor_inserts_and_deletes_mid_line() {
+        let mut ed = LineEditor::new();
+        ed.set_line("helo"); // cursor at end (4)
+        assert_eq!(ed.cursor(), 4);
+        assert!(ed.move_left()); // between l and o -> cursor 3
+        ed.feed('l'); // insert -> "hello", cursor 4
+        assert_eq!(ed.line(), "hello");
+        assert_eq!(ed.cursor(), 4);
+    }
+
+    #[test]
+    fn backspace_deletes_the_char_before_the_cursor_not_the_last() {
+        let mut ed = LineEditor::new();
+        ed.set_line("axbc");
+        ed.move_home();
+        assert!(ed.move_right()); // cursor after 'a' (1)
+        assert!(ed.move_right()); // cursor after 'x' (2)
+        assert_eq!(ed.feed('\u{8}'), EditAction::Erased); // deletes 'x'
+        assert_eq!(ed.line(), "abc");
+        assert_eq!(ed.cursor(), 1);
+    }
+
+    #[test]
+    fn cursor_movement_saturates_at_both_ends() {
+        let mut ed = LineEditor::new();
+        ed.set_line("hi");
+        assert!(!ed.move_right()); // already at end
+        ed.move_home();
+        assert!(!ed.move_left()); // already at start
+        assert!(ed.move_right());
+        ed.move_end();
+        assert_eq!(ed.cursor(), 2);
+    }
+
+    #[test]
+    fn insert_at_home_prepends() {
+        let mut ed = LineEditor::new();
+        ed.set_line("bc");
+        ed.move_home();
+        ed.feed('a');
+        assert_eq!(ed.line(), "abc");
+        assert_eq!(ed.cursor(), 1);
     }
 
     /// The `EditAction` contract: an action tells the caller exactly what

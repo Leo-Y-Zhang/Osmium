@@ -16,6 +16,7 @@ pub fn run() -> ! {
     kernel_mappings_are_supervisor_only();
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
+    shell_processes_a_scripted_session();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
     // double-fault handler, which prints the battery's final verdict.
@@ -180,6 +181,31 @@ fn heap_refuses_oversized_allocation() {
         dealloc(p, ok);
     }
     serial_println!("[selftest] heap: oversized request refused, allocator intact ... ok");
+}
+
+fn shell_processes_a_scripted_session() {
+    if !crate::console::is_initialised() {
+        serial_println!("[selftest] shell: skipped, no framebuffer on this boot");
+        return;
+    }
+    use pc_keyboard::ScancodeSet1;
+    let mut shell = crate::shell::Shell::new();
+    let mut scancodes = ScancodeSet1::new();
+    let before = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    // Scancode-set-1 make codes for "hel" + 'x' + Backspace + 'p' + Enter,
+    // i.e. a typed-and-corrected `help`. This drives the real input path:
+    // decode -> editor insert/erase -> submit -> execute -> console output.
+    // The typed text is asserted structurally and never echoed to serial
+    // (privacy rule): only the pass line below reaches the log.
+    for &code in &[0x23u8, 0x12, 0x26, 0x2d, 0x0e, 0x19, 0x1c] {
+        shell.feed_scancode(&mut scancodes, code);
+    }
+    let after = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    assert!(
+        after > before,
+        "the shell produced no output for a typed command"
+    );
+    serial_println!("[selftest] shell: scripted 'help' via injected scancodes ... ok");
 }
 
 fn report_memory_stats() {

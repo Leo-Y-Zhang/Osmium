@@ -6,7 +6,7 @@
 //! an output channel an observer could be attached to.
 
 use crate::console::with_console;
-use crate::framebuffer::{ACCENT, DANGER, FOREGROUND};
+use crate::framebuffer::{ACCENT, DANGER, FOREGROUND, MUTED, OK};
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -20,92 +20,159 @@ use pc_keyboard::{DecodedKey, EventDecoder, HandleControl, KeyCode, ScancodeSet,
 const HISTORY_CAP: usize = 32;
 const PROMPT: &str = "osmium> ";
 
-pub async fn run() {
-    let mut stream = crate::task::keyboard::ScancodeStream::new();
-    let mut scancodes = ScancodeSet1::new();
-    let mut layout_name: &'static str = "us";
-    let mut decoder = EventDecoder::new(AnyLayout::Us104Key(Us104Key), HandleControl::Ignore);
-    let mut editor = LineEditor::new();
-    let mut history: VecDeque<String> = VecDeque::new();
-    let mut recall: Option<usize> = None;
+/// One editing session, factored out so the E2E self-test can drive the same
+/// key handling the interactive loop uses.
+pub struct Shell {
+    layout_name: &'static str,
+    decoder: EventDecoder<AnyLayout>,
+    editor: LineEditor,
+    history: VecDeque<String>,
+    recall: Option<usize>,
+}
 
-    banner();
-    prompt();
+impl Shell {
+    pub fn new() -> Self {
+        Self {
+            layout_name: "us",
+            // MapLettersToUnicode so Ctrl-U/Ctrl-L/Ctrl-C reach the shell.
+            decoder: EventDecoder::new(
+                AnyLayout::Us104Key(Us104Key),
+                HandleControl::MapLettersToUnicode,
+            ),
+            editor: LineEditor::new(),
+            history: VecDeque::new(),
+            recall: None,
+        }
+    }
 
-    while let Some(scancode) = stream.next().await {
-        let Ok(Some(event)) = scancodes.advance_state(scancode) else {
-            continue;
-        };
-        let Some(key) = decoder.process_keyevent(event) else {
-            continue;
-        };
+    fn render(&self) {
+        with_console(|con| con.render_input(self.editor.line(), self.editor.cursor()));
+    }
+
+    /// Decodes one scancode-set-1 byte and applies it. Public so the battery
+    /// can drive a scripted session through the same path as live input.
+    pub fn feed_scancode(&mut self, scancodes: &mut ScancodeSet1, byte: u8) {
+        if let Ok(Some(event)) = scancodes.advance_state(byte)
+            && let Some(key) = self.decoder.process_keyevent(event)
+        {
+            self.handle_key(key);
+        }
+    }
+
+    fn handle_key(&mut self, key: DecodedKey) {
         match key {
-            DecodedKey::Unicode(c) => match editor.feed(c) {
-                EditAction::Echoed(ch) => {
-                    recall = None;
-                    with_console(|con| con.write_char(ch));
-                }
-                EditAction::Erased => {
-                    recall = None;
-                    with_console(|con| con.erase_last_char());
-                }
+            // Ctrl-C: abandon the line, fresh prompt.
+            DecodedKey::Unicode('\u{3}') => {
+                let shown = format!("{}^C", self.editor.line());
+                with_console(|con| con.commit_input(&shown));
+                self.editor.clear();
+                self.recall = None;
+                prompt();
+                self.render();
+            }
+            // Ctrl-U: clear the line in place.
+            DecodedKey::Unicode('\u{15}') => {
+                self.editor.clear();
+                self.recall = None;
+                self.render();
+            }
+            // Ctrl-L: clear the screen, keep the in-progress line.
+            DecodedKey::Unicode('\u{c}') => {
+                with_console(|con| con.clear_screen());
+                prompt();
+                self.render();
+            }
+            DecodedKey::Unicode(c) => match self.editor.feed(c) {
                 EditAction::Submitted => {
-                    with_console(|con| con.write_char('\n'));
-                    let line = editor.line().to_string();
-                    execute(&line, &mut layout_name, &mut decoder);
+                    let line = self.editor.line().to_string();
+                    with_console(|con| con.commit_input(&line));
+                    execute(&line, &mut self.layout_name, &mut self.decoder);
                     if !line.trim().is_empty()
-                        && history.front().map(String::as_str) != Some(line.as_str())
+                        && self.history.front().map(String::as_str) != Some(line.as_str())
                     {
-                        history.push_front(line);
-                        history.truncate(HISTORY_CAP);
+                        self.history.push_front(line);
+                        self.history.truncate(HISTORY_CAP);
                     }
-                    editor.clear();
-                    recall = None;
+                    self.editor.clear();
+                    self.recall = None;
                     prompt();
+                    self.render();
+                }
+                EditAction::Echoed(_) | EditAction::Erased => {
+                    self.recall = None;
+                    self.render();
                 }
                 EditAction::Ignored => {}
             },
+            DecodedKey::RawKey(KeyCode::ArrowLeft) => {
+                self.editor.move_left();
+                self.render();
+            }
+            DecodedKey::RawKey(KeyCode::ArrowRight) => {
+                self.editor.move_right();
+                self.render();
+            }
+            DecodedKey::RawKey(KeyCode::Home) => {
+                self.editor.move_home();
+                self.render();
+            }
+            DecodedKey::RawKey(KeyCode::End) => {
+                self.editor.move_end();
+                self.render();
+            }
             DecodedKey::RawKey(KeyCode::ArrowUp) => {
-                let target = match recall {
-                    None if !history.is_empty() => Some(0),
-                    Some(i) if i + 1 < history.len() => Some(i + 1),
+                let target = match self.recall {
+                    None if !self.history.is_empty() => Some(0),
+                    Some(i) if i + 1 < self.history.len() => Some(i + 1),
                     other => other,
                 };
                 if let Some(i) = target
-                    && recall != Some(i)
+                    && self.recall != Some(i)
                 {
-                    recall = Some(i);
-                    replace_line(&mut editor, &history[i]);
+                    self.recall = Some(i);
+                    let entry = self.history[i].clone();
+                    self.editor.set_line(&entry);
+                    self.render();
                 }
             }
-            DecodedKey::RawKey(KeyCode::ArrowDown) => match recall {
-                Some(0) => {
-                    recall = None;
-                    replace_line(&mut editor, "");
+            DecodedKey::RawKey(KeyCode::ArrowDown) => {
+                match self.recall {
+                    Some(0) => {
+                        self.recall = None;
+                        self.editor.set_line("");
+                    }
+                    Some(i) => {
+                        self.recall = Some(i - 1);
+                        let entry = self.history[i - 1].clone();
+                        self.editor.set_line(&entry);
+                    }
+                    None => return,
                 }
-                Some(i) => {
-                    recall = Some(i - 1);
-                    replace_line(&mut editor, &history[i - 1]);
-                }
-                None => {}
-            },
+                self.render();
+            }
             DecodedKey::RawKey(_) => {}
         }
     }
 }
 
-/// Erases the rendered line and re-renders `new` (history recall).
-fn replace_line(editor: &mut LineEditor, new: &str) {
-    let old_len = editor.len();
-    editor.set_line(new);
-    with_console(|con| {
-        for _ in 0..old_len {
-            con.erase_last_char();
-        }
-        for c in editor.line().chars() {
-            con.write_char(c);
-        }
-    });
+impl Default for Shell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub async fn run() {
+    let mut stream = crate::task::keyboard::ScancodeStream::new();
+    let mut scancodes = ScancodeSet1::new();
+    let mut shell = Shell::new();
+
+    banner();
+    prompt();
+    shell.render();
+
+    while let Some(scancode) = stream.next().await {
+        shell.feed_scancode(&mut scancodes, scancode);
+    }
 }
 
 fn banner() {
@@ -134,6 +201,7 @@ fn prompt() {
             con.write_char(c);
         }
         con.set_color(FOREGROUND);
+        con.begin_input();
     });
 }
 
@@ -186,14 +254,20 @@ fn help() {
 fn mem() {
     let (heap_used, heap_free) = crate::memory::heap::stats();
     let (frames_used, frames_total) = crate::memory::frame_stats();
-    println_con(&format!(
-        "heap:   {heap_used} B used, {heap_free} B free of {} KiB",
-        crate::memory::heap::HEAP_SIZE / 1024
-    ));
-    println_con(&format!(
-        "frames: {frames_used} handed out of {frames_total} usable ({} MiB usable RAM)",
-        frames_total as u64 * kshared::FRAME_SIZE / (1024 * 1024)
-    ));
+    field(
+        "heap:   ",
+        &format!(
+            "{heap_used} B used, {heap_free} B free of {} KiB",
+            crate::memory::heap::HEAP_SIZE / 1024
+        ),
+    );
+    field(
+        "frames: ",
+        &format!(
+            "{frames_used} handed out of {frames_total} usable ({} MiB usable RAM)",
+            frames_total as u64 * kshared::FRAME_SIZE / (1024 * 1024)
+        ),
+    );
 }
 
 fn uptime() {
@@ -207,20 +281,29 @@ fn uptime() {
 }
 
 fn sysinfo(layout_name: &str) {
-    println_con(&format!("Osmium v{} (x86_64)", env!("CARGO_PKG_VERSION")));
+    field(
+        "system:  ",
+        &format!("Osmium v{} (x86_64)", env!("CARGO_PKG_VERSION")),
+    );
     if let Some(info) = with_console(|con| con.info()) {
-        println_con(&format!(
-            "display: {}x{} px, {:?}, {} B/px",
-            info.width, info.height, info.pixel_format, info.bytes_per_pixel
-        ));
+        field(
+            "display: ",
+            &format!(
+                "{}x{} px, {:?}, {} B/px",
+                info.width, info.height, info.pixel_format, info.bytes_per_pixel
+            ),
+        );
     }
     let (_, frames_total) = crate::memory::frame_stats();
-    println_con(&format!(
-        "memory:  {} MiB usable RAM, {} KiB kernel heap",
-        frames_total as u64 * kshared::FRAME_SIZE / (1024 * 1024),
-        crate::memory::heap::HEAP_SIZE / 1024
-    ));
-    println_con(&format!("keymap:  {layout_name}"));
+    field(
+        "memory:  ",
+        &format!(
+            "{} MiB usable RAM, {} KiB kernel heap",
+            frames_total as u64 * kshared::FRAME_SIZE / (1024 * 1024),
+            crate::memory::heap::HEAP_SIZE / 1024
+        ),
+    );
+    field("keymap:  ", layout_name);
     uptime();
 }
 
@@ -237,12 +320,18 @@ fn privacy() {
 fn keymap(args: &str, layout_name: &mut &'static str, decoder: &mut EventDecoder<AnyLayout>) {
     match args {
         "us" => {
-            *decoder = EventDecoder::new(AnyLayout::Us104Key(Us104Key), HandleControl::Ignore);
+            *decoder = EventDecoder::new(
+                AnyLayout::Us104Key(Us104Key),
+                HandleControl::MapLettersToUnicode,
+            );
             *layout_name = "us";
             println_con("keymap: us");
         }
         "uk" => {
-            *decoder = EventDecoder::new(AnyLayout::Uk105Key(Uk105Key), HandleControl::Ignore);
+            *decoder = EventDecoder::new(
+                AnyLayout::Uk105Key(Uk105Key),
+                HandleControl::MapLettersToUnicode,
+            );
             *layout_name = "uk";
             println_con("keymap: uk");
         }
@@ -315,13 +404,20 @@ fn freed_memory_is_zeroed() -> bool {
 
 fn report(name: &str, ok: bool) {
     with_console(|con| {
-        if ok {
-            let _ = write!(con, "  [ ok ] ");
-        } else {
-            con.set_color(DANGER);
-            let _ = write!(con, "  [FAIL] ");
-            con.set_color(FOREGROUND);
-        }
+        con.set_color(if ok { OK } else { DANGER });
+        let _ = write!(con, "{}", if ok { "  [ ok ] " } else { "  [FAIL] " });
+        con.set_color(FOREGROUND);
         let _ = writeln!(con, "{name}");
+    });
+}
+
+/// Prints a `label: value` line with the label dimmed, so the eye lands on the
+/// value. Colour is decoration only — the label text still carries the meaning.
+fn field(label: &str, value: &str) {
+    with_console(|con| {
+        con.set_color(MUTED);
+        let _ = write!(con, "{label}");
+        con.set_color(FOREGROUND);
+        let _ = writeln!(con, "{value}");
     });
 }

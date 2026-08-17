@@ -37,6 +37,20 @@ pub const DANGER: Rgb = Rgb {
     g: 0x4f,
     b: 0x4f,
 };
+/// Dimmed text for labels and units — present against BACKGROUND above the
+/// 4.5:1 floor, but clearly secondary to FOREGROUND.
+pub const MUTED: Rgb = Rgb {
+    r: 0x8a,
+    g: 0x8a,
+    b: 0x95,
+};
+/// Success green for the shell's `[ ok ]` markers; distinct from ACCENT so a
+/// pass never reads as ordinary output.
+pub const OK: Rgb = Rgb {
+    r: 0x7b,
+    g: 0xc4,
+    b: 0x7f,
+};
 
 impl Rgb {
     pub fn luminance(self) -> u8 {

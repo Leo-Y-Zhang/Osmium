@@ -21,7 +21,9 @@ mod qemu;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;
-#[cfg(not(feature = "selftest"))]
+// Compiled in both builds: the selftest battery drives the shell's input path
+// end-to-end, so most of this module is only exercised by the shipped build.
+#[cfg_attr(feature = "selftest", allow(dead_code))]
 mod shell;
 mod task;
 mod time;
