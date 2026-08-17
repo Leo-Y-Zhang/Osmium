@@ -14,19 +14,22 @@ in-kernel self-test battery; `main` is never un-bootable.
 
 ## Privacy by construction
 
-Claims the code cannot violate, each enforced by a boot-time self-test rather
-than by policy:
+Claims the code cannot violate, each with a named enforcement mechanism rather
+than a policy:
 
 - **No network stack exists.** Nothing can phone home — the capability is
-  absent, not disabled.
+  absent, not disabled. Enforced by CI's `no-network-no-storage` gate, which
+  greps the kernel tree and manifest on every push so it cannot creep back.
 - **No persistence.** RAM-only live system: no disk writes, no filesystem; a
-  cold boot is a clean slate.
+  cold boot is a clean slate. The same CI gate covers storage drivers.
 - **Freed memory is zeroed.** Heap blocks are scrubbed before they re-enter the
   free list, and physical frames are scrubbed as they are handed out — verified
-  by sentinel tests that were each observed failing when the scrubbing was
-  deliberately removed.
+  by two boot-time sentinel self-tests that were each observed failing when the
+  scrubbing was deliberately removed.
 - **Keystrokes stay on-screen.** Input renders to the local console only; it
-  never reaches the serial port.
+  never reaches the serial port. This one holds by construction — the input
+  path contains no serial writes, and the `panic` command's message is fixed in
+  the source precisely so typed text has no route there.
 
 The `privacy` command reports these live.
 
@@ -38,7 +41,7 @@ The `privacy` command reports these live.
   headroom for QEMU-version variance — so a real RAM-hunger regression fails
   the build. The boot test also cross-checks the kernel's own memory-map
   report against the configured size, so the figure is measured, not quoted.
-- Disk images are ~**2.5 MiB**, asserted under a 4 MiB budget on every build.
+- Disk images are **2.1–2.5 MiB**, asserted under a 4 MiB budget on every build.
 - The shell is up about **20 ms after interrupts enable** (PIT-measured, shown
   in the banner — the timer cannot see the boot stages before it starts, so
   that is the honest span).

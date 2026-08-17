@@ -230,7 +230,8 @@ fn privacy() {
     println_con("  persistence: none - RAM-only, a cold boot is a clean slate");
     println_con("  memory:      freed heap blocks and handed-out frames are zeroed");
     println_con("  keystrokes:  rendered on this screen only, never on the serial port");
-    println_con("each claim is enforced by the CI self-test battery, not by policy");
+    println_con("memory claims are self-tested at every boot; network and persistence");
+    println_con("are CI-gated; keystroke privacy holds by construction, not by policy");
 }
 
 fn keymap(args: &str, layout_name: &mut &'static str, decoder: &mut EventDecoder<AnyLayout>) {

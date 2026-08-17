@@ -1,6 +1,7 @@
 [toolchain]
 # Pinned: the bootloader crate's image builder needs nightly cargo (-Zbuild-std).
-# The kernel itself stays stable-clean — CI enforces that with a stable build job.
+# The kernel itself carries exactly one unstable feature (abi_x86_interrupt);
+# CI's feature-allowlist job enforces that nothing else joins it.
 # Bump this pin only in a dedicated PR.
 channel = "nightly-2026-08-01"
 components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
