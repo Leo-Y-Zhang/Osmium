@@ -167,20 +167,34 @@ fn privacy() -> Result<()> {
             status.code()
         );
     }
-    // Strip whitespace before matching: the realistic leak is a per-keystroke
-    // serial print, which would scatter the sentinel across newlines and slip
-    // past a naive `contains` (this exact gap was found by mutation).
+    // The strongest form of the claim: once the boot-complete line ends, a
+    // healthy shipped kernel emits NOTHING further on serial — keystrokes,
+    // echoes and command output all render to the framebuffer only. So the
+    // gate is an allowlist (post-boot serial must be EMPTY), not a sentinel
+    // blocklist: a leak of any shape fails it — a per-scancode hex dump in
+    // the IRQ handler defeated the sentinel version (observed by mutation:
+    // hex bytes never spell the sentinel) and fails this one.
     let after_marker = log.rsplit(SHIPPED_MARKER).next().unwrap_or(&log);
-    let compacted: String = after_marker
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if compacted.contains(SENTINEL) {
-        bail!("the typed sentinel reached the serial log — keystroke privacy is BROKEN");
+    // The marker is a prefix of its line ("...shell ready (NN ms...)"), so
+    // skip the rest of that line before demanding silence.
+    let post_boot = match after_marker.find('\n') {
+        Some(i) => &after_marker[i + 1..],
+        None => "",
+    };
+    if !post_boot.trim().is_empty() {
+        let compacted: String = post_boot.chars().filter(|c| !c.is_whitespace()).collect();
+        if compacted.contains(SENTINEL) {
+            bail!("the typed sentinel reached the serial log — keystroke privacy is BROKEN");
+        }
+        bail!(
+            "serial was not silent after boot — something on the input or output path \
+             writes to the serial port. Post-boot serial bytes: {:?}",
+            post_boot.trim()
+        );
     }
     println!(
         "\nkeystroke-privacy OK: the shell executed typed input (clean exit) and the \
-         sentinel \"{SENTINEL}\" never reached serial"
+         serial port stayed silent after boot (sentinel \"{SENTINEL}\" typed)"
     );
     Ok(())
 }
