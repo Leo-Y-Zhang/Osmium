@@ -64,9 +64,13 @@ The `privacy` command reports these live.
   1 MiB kernel heap
 - A cooperative async executor (waker-based); the keyboard stream and the shell
   are async tasks, and an idle Osmium sits in `hlt`
+- **Ring 3 and a system-call path**: the kernel drops to CPL 3 to run a
+  user-only code blob on a W^X page, which returns through an `int 0x80`
+  syscall (`SYS_WRITE`/`SYS_EXIT`); a self-test proves it executed in ring 3
+  and that no kernel mapping is user-accessible
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
-  `keymap` (us/uk), `selftest`, `panic`, `shutdown` — with line editing and
-  arrow-key history
+  `keymap` (us/uk), `user`, `selftest`, `panic`, `shutdown` — with an insertion
+  cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
 - Panic screens that report the failure on both the console and the serial
   port; never a silent hang
 
@@ -130,11 +134,12 @@ device) and boot it in legacy/CSM mode. Known caveats before anyone does:
 If you boot Osmium on a real machine, record the make, firmware and what
 happened — that observation is worth more than any amount of emulator CI.
 
-## Roadmap (deliberately not in v1)
+## Roadmap
 
-Ring 3 + syscalls, ELF loading, a RAM-disk filesystem, preemptive scheduling,
-APIC/HPET, SMP. Networking is on no roadmap; if it ever lands, it ships off by
-default.
+Ring 3 + syscalls landed as M6 (see above). Still ahead: ELF loading (the user
+program is a flat blob today), a RAM-disk filesystem, preemptive scheduling,
+APIC/HPET, and SMP. Networking is on no roadmap; if it ever lands, it ships off
+by default.
 
 ## Try it without building
 

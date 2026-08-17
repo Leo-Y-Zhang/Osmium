@@ -305,6 +305,18 @@ static, and the handler still allocates nothing and blocks on nothing.
 | **Insufficient physical memory at boot** — the machine has less RAM than the boot needs. | CI at the pinned floor; a person on a small machine | Measured at 0.25 MB granularity around the floor: the **bootloader** runs out first, panicking with `FrameAllocationFailed` while mapping the kernel, and the kernel never runs — there is no observed window where the kernel-side `mapping the kernel heap failed` panic fires instead (that path exists but is shadowed by the earlier failure). The bootloader's panic reaches serial; `xtask` recognises it in the captured log and reports a bootloader OOM rather than calling the timeout a kernel hang. | Boot with more memory, or lower `HEAP_SIZE`. The pinned CI RAM floor, measured per firmware, is the regression test for this. |
 | **No framebuffer from firmware** | A person seeing a blank screen | `boot_info.framebuffer` is `None`. Handled, not a fault: the console falls back to serial-only, logs the fallback, and the shell and battery still run. | None needed; this is a supported configuration. |
 | **Firmware-specific pixel format assumption** — code that works on BIOS VBE and corrupts under UEFI GOP, or vice versa. | Whoever boots the other firmware | The renderer reads `pixel_format`, `stride` and `bytes_per_pixel` from the negotiated `FrameBufferInfo`, and **both firmwares are boot-tested in the CI matrix**. A hard-coded assumption fails one leg of the matrix. | `git revert`; the matrix names which firmware broke. |
+
+## Deferred, with measurement — write-only console scroll
+
+`console::scroll_region_up` scrolls by `copy_within` on the live framebuffer,
+which **reads** framebuffer memory. On a real, write-combining or uncached
+framebuffer that read is slow; under QEMU's software renderer it is invisible.
+Rather than guess, the battery measures it (`[selftest] perf:` line, archived in
+CI). The rework — a small character-cell shadow grid scrolled in RAM and
+repainted forward-only, so the framebuffer is never read — is deferred until
+either the measured number or a real-hardware boot shows it matters. Recording
+the decision here, with the number, is the point; a silent rewrite for an
+unmeasured cost is exactly what this repo's culture rejects.
 | **Scancode queue overflow** — typing faster than the executor drains. | Nobody, in practice | The handler drops the byte it has just read — the newest — and nothing counts the loss, so there is no signal to watch. That is acceptable only because the case is unreachable in interactive use: the queue holds 128 scancodes, and the executor drains it on every wake, so filling it would need something on the order of a hundred keystrokes between two polls of a task that is woken by each one. Lossy by design, and never blocking, is the property that matters in an interrupt handler. | Not a fault. If it ever does happen the visible symptom is a swallowed keystroke, and the bug to fix is whatever is keeping the executor from being scheduled — not the queue. |
 | **Pinned nightly stops resolving or changes behaviour** | The first CI run after the pin moves | Every job fails at toolchain install or at build. | The pin is bumped only in a dedicated pull request that changes nothing else, so reverting that one commit restores a known-good toolchain. |
 | **Bootloader build stages fail to fetch** | First build on a cold cache | `bootloader` is pinned with `=0.11.17`, `Cargo.lock` is committed, and the CI cache is keyed on it. A fetch failure fails the `image-build` job loudly. | Re-run; if persistent, the pin is the thing to investigate, not the kernel. |

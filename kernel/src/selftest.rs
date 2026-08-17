@@ -18,6 +18,7 @@ pub fn run() -> ! {
     async_task_with_waker_runs();
     shell_processes_a_scripted_session();
     user_program_runs_in_ring3();
+    measure_console_scroll();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
     // double-fault handler, which prints the battery's final verdict.
@@ -222,6 +223,30 @@ fn user_program_runs_in_ring3() {
     serial_println!(
         "[selftest] usermode: program ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
     );
+}
+
+/// Measures the current scroll implementation (framebuffer `copy_within`) so
+/// the cost is recorded, not guessed. Under QEMU's software renderer this is
+/// dominated by emulation overhead; the number exists to decide whether the
+/// write-only cell-grid rework is worth it (see the TDD's roadmap note).
+fn measure_console_scroll() {
+    if !crate::console::is_initialised() {
+        return;
+    }
+    const SCROLLS: u64 = 100;
+    let start = crate::time::rdtsc();
+    crate::console::with_console(|con| {
+        for _ in 0..SCROLLS {
+            con.write_char('\n');
+        }
+    });
+    let cycles = crate::time::rdtsc().wrapping_sub(start);
+    match crate::time::cycles_to_us(cycles) {
+        Some(us) => serial_println!(
+            "[selftest] perf: {SCROLLS} newlines (scroll-heavy) in {cycles} cyc (~{us} us) ... ok"
+        ),
+        None => serial_println!("[selftest] perf: {SCROLLS} newlines in {cycles} cyc ... ok"),
+    }
 }
 
 fn report_memory_stats() {

@@ -62,7 +62,7 @@ pub fn calibrate() {
 }
 
 #[cfg(feature = "selftest")]
-fn cycles_to_us(cycles: u64) -> Option<u64> {
+pub fn cycles_to_us(cycles: u64) -> Option<u64> {
     let cpm = CYCLES_PER_MS.load(Ordering::Relaxed);
     (cpm > 0).then(|| cycles * 1000 / cpm)
 }
