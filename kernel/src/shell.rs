@@ -6,7 +6,7 @@
 //! an output channel an observer could be attached to.
 
 use crate::console::with_console;
-use crate::framebuffer::{ACCENT, DANGER, FOREGROUND, MUTED, OK};
+use crate::framebuffer::{ACCENT, AMBER, DANGER, FOREGROUND, MUTED, OK};
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -251,6 +251,24 @@ fn help() {
     println_con("  selftest      run the runtime test subset");
     println_con("  panic         demonstrate the panic screen");
     println_con("  shutdown      power off (QEMU) or halt");
+    keys_help();
+}
+
+/// The editing chords and history keys — implemented since the first shell,
+/// and until now discoverable nowhere on screen.
+fn keys_help() {
+    with_console(|con| {
+        con.set_color(MUTED);
+        let _ = writeln!(con, "keys:");
+        let _ = writeln!(con, "  up/down       recall history");
+        let _ = writeln!(con, "  left/right    move within the line");
+        let _ = writeln!(con, "  home/end      jump to start/end of line");
+        let _ = writeln!(con, "  ctrl-a/ctrl-e start/end of line");
+        let _ = writeln!(con, "  ctrl-u        clear the line");
+        let _ = writeln!(con, "  ctrl-l        clear the screen");
+        let _ = writeln!(con, "  ctrl-c        abandon the line");
+        con.set_color(FOREGROUND);
+    });
 }
 
 fn mem() {
@@ -391,6 +409,24 @@ fn runtime_selftest() {
             x86_64::instructions::hlt();
         }
         ok
+    });
+    skip(
+        "paging probe",
+        "maps a fixed address that cannot be mapped twice",
+    );
+    skip("stack-overflow guard", "cannot return; boot battery only");
+}
+
+/// Names a boot-only battery check this runtime subset deliberately omits, in
+/// the warning colour the design brief assigns to a skipped phase — so the
+/// output states what it does NOT cover rather than quietly leaving it out.
+fn skip(name: &str, why: &str) {
+    with_console(|con| {
+        con.set_color(AMBER);
+        let _ = write!(con, "  [skip] ");
+        con.set_color(MUTED);
+        let _ = writeln!(con, "{name} ({why})");
+        con.set_color(FOREGROUND);
     });
 }
 

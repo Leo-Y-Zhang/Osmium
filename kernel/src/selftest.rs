@@ -317,6 +317,14 @@ fn shell_processes_a_scripted_session() {
     use pc_keyboard::ScancodeSet1;
     let mut shell = crate::shell::Shell::new();
     let mut scancodes = ScancodeSet1::new();
+    // Clear first so the row count is a deterministic baseline, not whatever
+    // the boot log left on screen (which could be near the bottom and scroll,
+    // hiding the delta). `help` prints its command list plus the keys block —
+    // well over ten rows — so a broken `help` arm (which would fall through to
+    // the two-row "unknown command" path) fails the delta below. That is the
+    // discrimination the old `after > before` lacked: an unknown command also
+    // advances the cursor, so the old check passed with `help` broken.
+    crate::console::with_console(|c| c.clear_screen());
     let before = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
     // Scancode-set-1 make codes for "hel" + 'x' + Backspace + 'p' + Enter,
     // i.e. a typed-and-corrected `help`. This drives the real input path:
@@ -328,10 +336,11 @@ fn shell_processes_a_scripted_session() {
     }
     let after = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
     assert!(
-        after > before,
-        "the shell produced no output for a typed command"
+        after.saturating_sub(before) >= 10,
+        "the scripted 'help' advanced only {} rows; the help output is missing",
+        after.saturating_sub(before)
     );
-    serial_println!("[selftest] shell: scripted 'help' via injected scancodes ... ok");
+    serial_println!("[selftest] shell: scripted 'help' renders its full output ... ok");
 }
 
 fn user_program_runs_in_ring3() {
