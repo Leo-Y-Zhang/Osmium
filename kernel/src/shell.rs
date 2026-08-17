@@ -292,13 +292,19 @@ fn freed_memory_is_zeroed() -> bool {
         if p1.is_null() {
             return false;
         }
-        core::ptr::write_bytes(p1, 0xA5, layout.size());
+        // Volatile for the same reason as the battery's twin: a fill before
+        // an immediate free is a dead store that LLVM otherwise deletes.
+        for i in 0..layout.size() {
+            p1.add(i).write_volatile(0xA5);
+        }
         dealloc(p1, layout);
         let p2 = alloc(layout);
         if p2.is_null() {
             return false;
         }
-        let clean = p1 == p2 && (0..layout.size()).all(|i| *p2.add(i) != 0xA5);
+        // Volatile: a plain read of fresh-alloc memory is undef and LLVM
+        // folds the check away (see the battery's twin of this test).
+        let clean = p1 == p2 && (0..layout.size()).all(|i| p2.add(i).read_volatile() != 0xA5);
         dealloc(p2, layout);
         clean
     }

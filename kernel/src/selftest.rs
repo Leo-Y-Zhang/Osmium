@@ -59,7 +59,12 @@ fn freed_heap_memory_is_zeroed() {
     unsafe {
         let p1 = alloc(layout);
         assert!(!p1.is_null(), "allocation failed");
-        core::ptr::write_bytes(p1, 0xA5, layout.size());
+        // Volatile: a non-volatile fill of a block that is freed on the next
+        // line is a dead store, and LLVM deletes it (observed) — the
+        // sentinel must actually reach RAM for this test to mean anything.
+        for i in 0..layout.size() {
+            p1.add(i).write_volatile(0xA5);
+        }
         dealloc(p1, layout);
         let p2 = alloc(layout);
         assert!(!p2.is_null(), "reallocation failed");
@@ -67,7 +72,12 @@ fn freed_heap_memory_is_zeroed() {
         // allocator ever changes strategy this fails loudly and the test
         // gets reworked rather than silently proving nothing.
         assert_eq!(p1, p2, "allocator did not reuse the freed block");
-        let stale = (0..layout.size()).filter(|&i| *p2.add(i) == 0xA5).count();
+        // read_volatile is load-bearing: a plain read of freshly-allocated
+        // memory is undef to LLVM, which constant-folds the comparison away
+        // and turns this test into decoration (observed doing exactly that).
+        let stale = (0..layout.size())
+            .filter(|&i| p2.add(i).read_volatile() == 0xA5)
+            .count();
         assert_eq!(stale, 0, "freed memory still holds {stale} sentinel bytes");
         dealloc(p2, layout);
     }
