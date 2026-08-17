@@ -26,12 +26,16 @@ Two non-human entry points exist and matter as much:
 1. **Firmware hands over.** The bootloader has already set up long mode, paging and
    the framebuffer. The screen is whatever the firmware left; nothing of Osmium is
    visible yet. This lasts milliseconds and has no UI of its own.
-2. **Boot banner.** The console clears to the surface colour and prints the banner:
-   name, version, the firmware in use, the framebuffer resolution and pixel format,
-   total usable memory, and — once M5 lands — the boot-to-shell time. Below it, one
-   line per subsystem as it initialises, in the same order the kernel brings them up.
-   The same lines go to the serial port.
-3. **Prompt.** The banner is followed by a blank line and the prompt, `osmium> `,
+2. **Boot banner.** The console clears to the surface colour and the initialisation
+   lines appear, one per subsystem in the order the kernel brings them up: version,
+   framebuffer geometry and pixel format, GDT/TSS and interrupts with the PIT rate,
+   heap and frame counts. The same lines go to the serial port — they are kernel log
+   content, not typed input. Then the shell prints its own two-line banner on the
+   console: name, version and tagline in the accent colour, and
+   `shell ready N ms after interrupts-on` — the PIT starts at `interrupts::init`, so
+   earlier boot stages are outside its sight and the label says exactly what is
+   measured — ending with `Type 'help' to begin.`
+3. **Prompt.** The banner is followed by the prompt, `osmium> `,
    with a visible caret. The kernel is idle in a halt loop between keystrokes.
 4. **The person types.** Each keystroke raises an interrupt, is decoded, and is
    echoed at the caret. Backspace deletes leftwards, and Up and Down recall history.
@@ -50,7 +54,7 @@ Two non-human entry points exist and matter as much:
 
 ## The command surface
 
-Eleven commands. Each prints something; none is silent on success unless its whole
+Twelve commands. Each prints something; none is silent on success unless its whole
 purpose is to clear the screen.
 
 | Command | Does | Error case |
@@ -60,12 +64,13 @@ purpose is to clear the screen.
 | `clear` | Clears the screen and homes the cursor; the next prompt is at the top. | None. |
 | `mem` | Heap used and free against its 1 MiB size; frames handed out of the usable total, with usable RAM in MiB. | None. Reads atomics and the heap's own counters. |
 | `uptime` | Time since interrupts came up, from the 100 Hz tick counter, as `up X.YY s (N ticks @ 100 Hz)`. | None. A broken timer shows a frozen count; proving the timer is the battery's job, not this command's. |
-| `keymap` | Prints the active keyboard layout. `keymap uk` and `keymap us` switch it and confirm the change. | `keymap fr` → `usage: keymap [us|uk]`. |
-| `sysinfo` | Version and architecture; the framebuffer's geometry, pixel format and depth; usable RAM and the size of the kernel heap; the active keymap; then the `uptime` line, tick rate included. Nothing about the CPU: reading vendor and brand strings means `cpuid`, and no part of Osmium needs to know, so it does not ask. | None. On a serial-only boot the display line is omitted rather than invented. |
+| `keymap` | Prints the active keyboard layout. `keymap uk` and `keymap us` switch it and confirm the change. | `keymap fr` → `usage: keymap [us\|uk]`. |
+| `sysinfo` | Version and architecture; the framebuffer's geometry, pixel format and depth; usable RAM and the size of the kernel heap; the active keymap; then the `uptime` line, tick rate included. Nothing about the CPU: reading vendor and brand strings means `cpuid`, and no part of Osmium needs to know, so it does not ask. | None. If the firmware provided no framebuffer the display line is omitted rather than invented. |
 | `privacy` | Reports the four claims **as facts the build can support**, not as slogans: no network stack exists, nothing persists, freed heap blocks and handed-out frames are zeroed, and keystrokes render on this screen only, never on the serial port. Ends by stating that each claim is enforced by the CI self-test battery, not by policy. | None. |
+| `user` | Runs the embedded `hello` ELF in ring 3: parse, per-segment W^X mapping, the `int 0x80` syscall path, teardown. Success prints the value the program passed to `SYS_EXIT` — its own CS, whose low two bits are the CPL. | A refused image is a diagnosis, not a crash: `user: the embedded ELF was refused:` plus the named `ElfError` variant, and nothing was mapped before the refusal. |
 | `panic` | Deliberately panics, to demonstrate the panic screen. Documented as a demonstration, not a defect. **It takes no message argument, and that is a privacy decision rather than a missing feature:** a panic is reported on the serial port as well as the screen, so a message argument would be the one path by which something typed at this keyboard could reach serial. The message is fixed in the source instead. | None — it always succeeds by failing. Any text after the verb is ignored. |
 | `shutdown` | Prints `shutting down`, then exits the VM through the `isa-debug-exit` port under QEMU. On real hardware that port write is a no-op and the machine halts — safe to switch off, since nothing was ever written to disk. | The hardware fallback is not an error; it is the honest outcome. |
-| `selftest` | Re-runs the four checks that are safe to repeat — heap allocation, the zero-on-free sentinel, `int3`, and the PIT — printing one `[ ok ]` line each. It is the shell's own copy of them, not the boot battery itself: the battery is compiled in only under the `selftest` feature, and that build has no shell. **The paging probe and the stack overflow are left out**, because the probe maps a fixed address that cannot be mapped twice and the overflow cannot return. The screen does not currently name the two it leaves out, which is a gap in the output rather than in the tests. | A failing check prints `[FAIL]` in the danger colour instead of `[ ok ]`, and the shell returns to the prompt. |
+| `selftest` | Re-runs the four checks that are safe to repeat — heap allocation, the zero-on-free sentinel, `int3`, and the PIT — printing one `[ ok ]` line each. It is the shell's own copy of them, not the boot battery itself: the battery is compiled in only under the `selftest` feature, and that build has no shell. **Everything else in the boot battery is left out** — the paging probe (a fixed address that cannot be mapped twice), the stack overflow (it cannot return), and the ring-3 round trip with its page-table audits, which the `user` command exercises on demand instead. The screen does not name what it leaves out, which is a gap in the output rather than in the tests. | A failing check prints `[FAIL]` in the danger colour instead of `[ ok ]`, and the shell returns to the prompt. |
 
 ## Every state of every screen
 
@@ -76,17 +81,21 @@ recorded rather than left blank.
 |---|---|---|---|---|---|---|
 | **Boot banner** | This screen *is* the loading state. Subsystem lines appear as each initialises, so a stall shows which subsystem it stalled in. | n/a — never empty; the banner is written before anything can be. | Banner plus initialisation lines plus the first prompt. | Init failure panics to the panic screen with the subsystem named. | **n/a — no accounts exist.** Whoever is at the keyboard is the operator. | **n/a — there is no network.** Every operation is local and completes in microseconds. |
 | **Shell prompt** | n/a — no waiting; the kernel halts between keystrokes and wakes on interrupt. | The first-run state: banner, then `osmium> `. It is explained, not blank: the banner directly above it says `Type 'help' to begin.` | The prompt with a partially typed line; typed characters appear at the insertion point. | A keystroke that produces no character (an unmapped key) is ignored silently; a full input buffer beeps nothing and simply refuses the character. | n/a | n/a |
-| **Command output** | n/a — every command completes in well under a frame. | Commands with nothing to report still print their headline line rather than a blank. | Output beneath the command line, then a new prompt. | Errors are stated in words with the remedy inline — `unknown command: xyz (try 'help')`, `usage: keymap [us|uk]` — so text alone carries the signal and colour is never the only cue. The shell returns to the prompt; nothing is lost. | n/a | n/a |
+| **Command output** | n/a — every command completes in well under a frame. | Commands with nothing to report still print their headline line rather than a blank. | Output beneath the command line, then a new prompt. | Errors are stated in words with the remedy inline — `unknown command: xyz (try 'help')`, `usage: keymap [us\|uk]` — so text alone carries the signal and colour is never the only cue. The shell returns to the prompt; nothing is lost. | n/a | n/a |
 | **Panic screen** | n/a | n/a | n/a | **This screen is only ever the error state.** A danger-coloured `*** KERNEL PANIC ***` heading, then the panic message with its source file and line — for CPU exceptions the message includes the interrupt stack frame, and a page fault names the faulting address. Danger-coloured text, not a flooded background; see the [Design Brief](DESIGN_BRIEF.md) for why. The same text goes to serial. It ends with what to do: `The system is halted; reset the machine or close QEMU.` | n/a | n/a |
 
 Two entries above deserve to be stated outright rather than inferred from a table
-cell. **Unauthorised is not applicable because Osmium has no accounts, sessions or
-privilege levels in v1**. Everything runs in ring 0, and physical access is total
-access. That is a deliberate scope decision recorded in the PRD, not an oversight.
-**Offline is not applicable because there is no network stack**. A state that
-depends on a remote response cannot occur where no remote call can be made. Both
-cells stay "n/a" until ring 3 or networking exists, at which point this document is
-rewritten before that code is written.
+cell. **Unauthorised is not applicable because Osmium has no accounts or sessions**
+— though no longer because there is no privilege boundary. Since M6 there are two
+rings: the kernel drops to ring 3 to run the embedded user program (the `user`
+command), which can touch nothing of the kernel's — no kernel mapping is
+user-accessible, audited by the battery before ring 3 has ever run and again after
+teardown — and returns through `int 0x80`. One privilege boundary, one program at a
+time, and still nothing to authenticate against: whoever is at the keyboard is the
+operator, and physical access is total access. **Offline is not applicable because
+there is no network stack**. A state that depends on a remote response cannot occur
+where no remote call can be made. Both cells stay "n/a" until accounts or networking
+exist, at which point this document is rewritten before that code is written.
 
 ## Transitions
 
@@ -119,7 +128,9 @@ to `Battery`, and `Battery` exits QEMU with 33 or 35 without ever reaching `Prom
 
 ## Permissions per state
 
-There is one privilege level and one operator, so this section is short and its
+There is one operator, and the only privilege boundary is the ring 3 the kernel
+itself drops into for the `user` command — nothing a person can log into or be
+locked out of — so this section is short and its
 brevity is the design. Anyone who can reach the keyboard can reach every state,
 including `panic` and `shutdown`. There is no state a person can be locked out of and
 no state they can be ejected from, because there is nothing to authenticate against.
@@ -172,11 +183,13 @@ claimed is claimed, and the design choices that follow are made because of it.
   screen is headed `KERNEL PANIC` in words. Every one of these reads correctly in
   monochrome, and it has to, because the serial log is monochrome and the serial log
   is what CI reads.
-- **The serial console carries the same content as the screen**, which makes it the
-  practical accessibility route: a person who cannot read the framebuffer can read
-  the serial stream in a terminal on the host, where their own assistive technology
-  works. This is a real benefit of the design rather than a consolation, and it costs
-  nothing extra because the serial path exists for CI regardless.
+- **The serial stream carries the kernel's side of the story, not the shell's.**
+  Boot lines, self-test verdicts and panics all reach serial in plain text, where a
+  person's own assistive technology works — so bringing the machine up and
+  diagnosing it does not require reading the framebuffer. The shell itself renders
+  to the local console only; that is the keystroke-privacy rule, and it makes serial
+  a diagnostic route, not an interactive one. Claiming more would trade a privacy
+  guarantee for an accessibility claim the code deliberately does not honour.
 - **Nothing blinks, nothing animates, nothing is time-limited.** There is no
   animation to reduce and no prompt that expires while someone reads it.
 - **Legibility is a fixed constraint**, not a preference: see the

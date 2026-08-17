@@ -55,11 +55,14 @@ The `privacy` command reports these live.
 - A framebuffer glyph console (Noto Sans Mono bitmap) that honours the
   negotiated pixel format; CI boots both firmwares, which negotiate different
   layouts, so format assumptions cannot survive
-- GDT/TSS with a dedicated IST stack: a kernel stack overflow lands in the
+- GDT/TSS with dedicated IST stacks (double fault, NMI, machine check): a kernel
+  stack overflow lands in the
   double-fault handler and says so instead of triple-faulting — and a self-test
   proves it on every push
 - IDT, remapped PIC, 100 Hz PIT, PS/2 keyboard IRQ feeding a lock-free scancode
-  queue (interrupt handlers never take a lock or allocate)
+  queue (interrupt handlers never allocate, and take exactly one lock — the PIC's,
+  for the end-of-interrupt write, which the main thread never holds once
+  interrupts are enabled)
 - Physical frame allocator over the boot memory map, offset page table, and a
   1 MiB kernel heap
 - A cooperative async executor (waker-based); the keyboard stream and the shell
@@ -82,15 +85,21 @@ The `privacy` command reports these live.
 Three layers, all run by CI on every push:
 
 - **In-QEMU battery** (`cargo xtask test`): boot, console rendering, `int3`
-  handling, PIT ticks, heap allocation, the zero-on-free sentinel, the
+  handling, IDT-vector presence, PIT ticks, heap allocation and an
+  oversized-allocation refusal, the zero-on-free sentinel, the
   fresh-page scrub (the frame is deliberately soiled first, so the test proves
-  the kernel's zeroing rather than the emulator's), the executor waker path,
+  the kernel's zeroing rather than the emulator's), a page-table audit that no
+  mapping is user-accessible — run again after the ring-3 teardown — kernel-heap
+  NX, the executor waker path, a scripted shell session via injected scancodes,
+  a W+X ELF image refused, the embedded `hello` ELF run at CPL 3, per-page W^X
+  flag plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
 - **Shipped-image boot** (`cargo xtask test --shipped`): the exact image a user
   would boot must reach the shell.
-- **Host tests** (`cargo test -p kshared`): the line editor, command parser and
-  frame-range arithmetic are pure logic and are tested natively.
+- **Host tests** (`cargo test -p kshared`): the line editor, command parser,
+  frame-range arithmetic and the ELF parser are pure logic and are tested
+  natively.
 
 Every battery test has been observed failing at least once via deliberate
 mutation — delete the heap scrub, delete the frame scrub, break the waker,
@@ -160,7 +169,8 @@ qemu-system-x86_64 -drive format=raw,file=osmium-bios.img -m 24M
 ## Documents
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — a code-anchored walk from firmware
-  to the shell prompt, with the keystroke dataflow diagram.
+  to the shell prompt, with the keystroke dataflow diagram and the ring-3
+  round trip.
 - [PRD.md](docs/PRD.md) — scope, success criteria, and the deliberate non-goals.
 - [TDD.md](docs/TDD.md) — the memory map, global-state table, and the inventory
   of every `unsafe` block with the invariant that makes it sound.
