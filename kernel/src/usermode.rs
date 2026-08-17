@@ -10,6 +10,19 @@
 //! Privacy carries over: the frame the user runs on is zeroed on hand-out like
 //! every other, so no previous owner's bytes are visible to the program, and
 //! the self-test proves no kernel mapping is user-accessible.
+//!
+//! M6 boundaries, stated so they are not mistaken for isolation guarantees:
+//! - **A misbehaving user program is fatal.** Every exception handler panics,
+//!   so a ring-3 fault (bad memory access, `#DE`, a privileged instruction,
+//!   `int n` for any vector but 0x80) takes the whole kernel down. There is no
+//!   process model yet to terminate just the program; that is a later
+//!   milestone.
+//! - **One program at a time.** `run_user` uses fixed addresses and a single
+//!   continuation slot; it is not reentrant, which the cooperative single-core
+//!   model guarantees today.
+//! - **Frames are not reclaimed.** The bump allocator never frees, so each
+//!   `run_user` leaks two leaf frames (8 KiB); many manual `user` invocations
+//!   would eventually exhaust RAM and panic.
 
 use crate::gdt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +34,9 @@ const SYS_WRITE: u64 = 1;
 
 /// The kernel stack pointer saved by `jump_to_user`, so `SYS_EXIT` can return
 /// to the launcher instead of `iretq`-ing back to a finished program.
+/// Invariant: `SYS_EXIT` reads this blindly, sound only because ring 3 is
+/// reachable *only* through `run_user`, which always writes it before any
+/// ring-3 instruction can execute.
 static KERNEL_CONTINUATION_RSP: AtomicU64 = AtomicU64::new(0);
 /// The exit code the user program passed to `SYS_EXIT`.
 static USER_EXIT_CODE: AtomicU64 = AtomicU64::new(0);
@@ -54,13 +70,18 @@ pub fn run_user(code: &[u8]) -> u64 {
     let user_ss = u64::from(sel.user_data.0);
     let stack_top = USER_STACK_ADDR + 4096;
 
+    // The int 0x80 gate clears IF on the way in, so control returns here with
+    // interrupts disabled; restore them only if the caller had them enabled.
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+
     // SAFETY: entering ring 3 at a mapped user code page with a mapped user
-    // stack and the ring-3 selectors; SYS_EXIT returns control here.
+    // stack and the ring-3 selectors; SYS_EXIT returns control here with the
+    // callee-saved registers restored by the entry stub.
     unsafe { jump_to_user(USER_CODE_ADDR, stack_top, user_cs, user_ss) };
     let code = USER_EXIT_CODE.load(Ordering::SeqCst);
-    // The int 0x80 gate cleared IF on the way in; restore it now that we are
-    // back in ordinary kernel context.
-    x86_64::instructions::interrupts::enable();
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
     // Tear the user mappings down so run_user can be called again (the frames
     // are not reclaimed — bump allocator — only the mappings).
     crate::memory::unmap_user_page(USER_CODE_ADDR);
@@ -68,18 +89,53 @@ pub fn run_user(code: &[u8]) -> u64 {
     code
 }
 
-/// Drops to ring 3. Saves the kernel stack (so `SYS_EXIT` can return to the
-/// caller), then builds an `iretq` frame targeting the user selectors.
+/// The exit code from the most recent `run_user` (also its return value; this
+/// getter lets a caller that reached `run_user` through an asm trampoline read
+/// it without threading the return through the trampoline).
+#[cfg_attr(not(feature = "selftest"), allow(dead_code))]
+pub fn last_exit_code() -> u64 {
+    USER_EXIT_CODE.load(Ordering::SeqCst)
+}
+
+/// Drops to ring 3. The SysV callee-saved registers are pushed first and the
+/// saved stack pointer points at them, so `SYS_EXIT` can restore them and hand
+/// the launcher's caller back the register file the compiler expects —
+/// otherwise ring 3 could return arbitrary `rbx/rbp/r12-r15` into the kernel.
+/// The general-purpose registers are then scrubbed before entering ring 3, so
+/// the program never sees kernel register contents.
 #[unsafe(naked)]
 unsafe extern "C" fn jump_to_user(user_rip: u64, user_rsp: u64, user_cs: u64, user_ss: u64) {
     // args: rdi=rip, rsi=rsp, rdx=cs, rcx=ss
     core::arch::naked_asm!(
-        "mov [rip + {cont}], rsp", // save the launcher's stack
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rip + {cont}], rsp", // save the stack just above the saved regs
         "push rcx",                // SS
         "push rsi",                // RSP
-        "push 0x202",              // RFLAGS: IF set, reserved bit 1 set
+        "push 0x202",              // RFLAGS: IF set, reserved bit 1 set, IOPL 0
         "push rdx",                // CS
         "push rdi",                // RIP
+        // Scrub GP registers so ring 3 sees no kernel state (the iretq frame is
+        // already built, so consuming rcx/rdx/rsi/rdi now is fine).
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
         cont = sym KERNEL_CONTINUATION_RSP,
     )
@@ -91,11 +147,21 @@ unsafe extern "C" fn jump_to_user(user_rip: u64, user_rsp: u64, user_cs: u64, us
 #[unsafe(naked)]
 unsafe extern "C" fn int80_entry() {
     core::arch::naked_asm!(
+        // The interrupt gate clears IF but NOT DF; SysV requires DF=0 at a call
+        // boundary, so clear it before any Rust code runs.
+        "cld",
         "cmp rax, {sys_exit}",
         "jne 2f",
-        // SYS_EXIT: record the code, restore the launcher's stack, return.
+        // SYS_EXIT: record the code, restore the launcher's stack AND its
+        // callee-saved registers, then return into run_user.
         "mov [rip + {exit_code}], rdi",
         "mov rsp, [rip + {cont}]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
         "ret",
         "2:",
         // Other syscalls: marshal (nr,a0,a1) into the SysV ABI, align, call.
@@ -105,6 +171,16 @@ unsafe extern "C" fn int80_entry() {
         "sub rsp, 8",
         "call {dispatch}",
         "add rsp, 8",
+        // Scrub caller-saved registers (keep rax, the return value) so no
+        // kernel pointer left by the dispatcher leaks back to ring 3.
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
         "iretq",
         sys_exit = const SYS_EXIT,
         exit_code = sym USER_EXIT_CODE,
@@ -127,9 +203,13 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, _a1: u64) -> u64 {
     }
 }
 
-/// A tiny ring-3 program: report a byte via `SYS_WRITE`, then exit with its own
-/// code segment (so the kernel can prove it ran in CPL 3). Hand-assembled flat
-/// x86-64 machine code.
+/// A tiny ring-3 program: report a byte via `SYS_WRITE`, then **deliberately
+/// set every callee-saved register to -1** before exiting with its own code
+/// segment. The clobbering makes the register-preservation guarantee testable:
+/// the battery pins a sentinel in `r15` across `run_user`, and if the entry
+/// stub failed to save and restore the callee-saved set, this `-1` would reach
+/// the caller. The exit code is CS, whose low two bits are the CPL.
+/// Hand-assembled flat x86-64.
 #[rustfmt::skip]
 pub const DEMO_PROGRAM: &[u8] = &[
     // mov eax, 1 (SYS_WRITE)
@@ -138,11 +218,18 @@ pub const DEMO_PROGRAM: &[u8] = &[
     0xbf, 0x55, 0x00, 0x00, 0x00,
     // int 0x80
     0xcd, 0x80,
+    // clobber every callee-saved register with -1
+    0x48, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff, // mov rbx, -1
+    0x48, 0xc7, 0xc5, 0xff, 0xff, 0xff, 0xff, // mov rbp, -1
+    0x49, 0xc7, 0xc4, 0xff, 0xff, 0xff, 0xff, // mov r12, -1
+    0x49, 0xc7, 0xc5, 0xff, 0xff, 0xff, 0xff, // mov r13, -1
+    0x49, 0xc7, 0xc6, 0xff, 0xff, 0xff, 0xff, // mov r14, -1
+    0x49, 0xc7, 0xc7, 0xff, 0xff, 0xff, 0xff, // mov r15, -1
     // mov ax, cs
     0x8c, 0xc8,
     // and eax, 0xffff
     0x25, 0xff, 0xff, 0x00, 0x00,
-    // mov edi, eax  (exit code = CS, whose low 2 bits are the CPL)
+    // mov edi, eax  (exit code = CS)
     0x89, 0xc7,
     // xor eax, eax  (SYS_EXIT)
     0x31, 0xc0,

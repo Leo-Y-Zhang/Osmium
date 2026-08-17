@@ -210,10 +210,45 @@ fn shell_processes_a_scripted_session() {
     serial_println!("[selftest] shell: scripted 'help' via injected scancodes ... ok");
 }
 
+/// Reaches `run_user` through a `call` with a sentinel pinned in the
+/// callee-saved register `r15`. SysV says the call must return r15 unchanged;
+/// the ring-3 program sets r15 = -1, so if the entry/exit stub failed to save
+/// and restore the callee-saved set, `recovered` comes back as -1.
+/// `clobber_abi("C")` declares exactly the contract under test.
+fn callee_saved_survives_ring3() -> u64 {
+    const SENTINEL: u64 = 0x0bad_c0de;
+    let recovered: u64;
+    // SAFETY: the trampoline is a valid extern "C" fn; r15 is written and read
+    // in-block and declared clobbered, and clobber_abi("C") covers the
+    // caller-saved registers the call touches.
+    unsafe {
+        core::arch::asm!(
+            "mov r15, {sentinel}",
+            "call {run}",
+            "mov rax, r15",
+            sentinel = const SENTINEL,
+            run = sym run_demo_trampoline,
+            out("rax") recovered,
+            out("r15") _,
+            clobber_abi("C"),
+        );
+    }
+    recovered
+}
+
+extern "C" fn run_demo_trampoline() {
+    crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
+}
+
 fn user_program_runs_in_ring3() {
-    let exit = crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
+    let recovered = callee_saved_survives_ring3();
+    assert_eq!(
+        recovered, 0x0bad_c0de,
+        "ring 3 corrupted the callee-saved r15 across the syscall boundary"
+    );
     // The program exited with its own CS; its low two bits are the CPL, which
     // must be 3 — proof it executed in ring 3 and returned through the syscall.
+    let exit = crate::usermode::last_exit_code();
     assert_eq!(
         exit & 3,
         3,
@@ -221,7 +256,7 @@ fn user_program_runs_in_ring3() {
         exit & 3
     );
     serial_println!(
-        "[selftest] usermode: program ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
+        "[selftest] usermode: ring 3 (CS={exit:#x}), syscall return, callee-saved preserved ... ok"
     );
 }
 
