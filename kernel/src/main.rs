@@ -5,11 +5,14 @@
 // feature-allowlist job fails if anything else joins it.
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod console;
 mod framebuffer;
 mod gdt;
 mod interrupts;
 mod logger;
+mod memory;
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 mod qemu;
 #[cfg(feature = "selftest")]
@@ -34,8 +37,13 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Osmium v{}: serial up", env!("CARGO_PKG_VERSION"));
 
-    // Split the borrow once; later milestones take the memory map from here.
-    let BootInfo { framebuffer, .. } = boot_info;
+    // Split the borrow once so each subsystem takes only its own field.
+    let BootInfo {
+        framebuffer,
+        memory_regions,
+        physical_memory_offset,
+        ..
+    } = boot_info;
     // No framebuffer is a degraded boot, not a dead one: run serial-only.
     let fb_info = match framebuffer.as_mut() {
         Some(fb) => {
@@ -65,6 +73,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     log::info!(
         "gdt+tss loaded, interrupts enabled (PIT {} Hz)",
         interrupts::TICK_HZ
+    );
+
+    // Fail closed: without the physical-memory mapping there is no safe way
+    // to manage frames or page tables (TDD).
+    let phys_offset = match *physical_memory_offset {
+        bootloader_api::info::Optional::Some(offset) => offset,
+        bootloader_api::info::Optional::None => {
+            panic!("bootloader did not map physical memory; cannot continue")
+        }
+    };
+    memory::init(phys_offset, memory_regions);
+    let (heap_used, heap_free) = memory::heap::stats();
+    let (frames_used, frames_total) = memory::frame_stats();
+    log::info!(
+        "memory: heap {} KiB ({heap_used} B used, {heap_free} B free), {frames_used}/{frames_total} frames",
+        memory::heap::HEAP_SIZE / 1024
     );
 
     #[cfg(feature = "selftest")]

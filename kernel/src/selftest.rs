@@ -9,8 +9,72 @@ pub fn run() -> ! {
     console_renders_and_advances();
     breakpoint_handled_and_returns();
     timer_ticks_advance();
+    heap_allocations_work();
+    freed_heap_memory_is_zeroed();
+    fresh_page_is_mapped_zeroed_writable();
+    report_memory_stats();
     serial_println!("SELFTEST PASSED");
     crate::qemu::exit(crate::qemu::ExitCode::Success)
+}
+
+fn heap_allocations_work() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    let boxed = Box::new(0xdead_beef_u64);
+    assert_eq!(*boxed, 0xdead_beef);
+    let mut vec: Vec<u64> = Vec::with_capacity(50_000);
+    vec.extend(0..50_000);
+    let sum: u64 = vec.iter().sum();
+    assert_eq!(sum, 50_000 * 49_999 / 2);
+    serial_println!("[selftest] heap: Box + 50k-element Vec ... ok");
+}
+
+fn freed_heap_memory_is_zeroed() {
+    use alloc::alloc::{alloc, dealloc};
+    use core::alloc::Layout;
+    let layout = Layout::from_size_align(256, 8).unwrap();
+    // SAFETY: matched alloc/dealloc pairs with a valid non-zero-size layout;
+    // p1 is only read through p2 after the allocator hands the block back.
+    unsafe {
+        let p1 = alloc(layout);
+        assert!(!p1.is_null(), "allocation failed");
+        core::ptr::write_bytes(p1, 0xA5, layout.size());
+        dealloc(p1, layout);
+        let p2 = alloc(layout);
+        assert!(!p2.is_null(), "reallocation failed");
+        // First-fit with hole merging reuses the same block; if the
+        // allocator ever changes strategy this fails loudly and the test
+        // gets reworked rather than silently proving nothing.
+        assert_eq!(p1, p2, "allocator did not reuse the freed block");
+        let stale = (0..layout.size()).filter(|&i| *p2.add(i) == 0xA5).count();
+        assert_eq!(stale, 0, "freed memory still holds {stale} sentinel bytes");
+        dealloc(p2, layout);
+    }
+    serial_println!("[selftest] privacy: freed heap memory is zeroed ... ok");
+}
+
+fn fresh_page_is_mapped_zeroed_writable() {
+    let addr = crate::memory::map_probe_page();
+    // SAFETY: map_probe_page just mapped this page PRESENT|WRITABLE.
+    unsafe {
+        let bytes = core::slice::from_raw_parts(addr.as_ptr::<u8>(), 4096);
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "freshly mapped page contains stale bytes"
+        );
+        addr.as_mut_ptr::<u64>()
+            .write_volatile(0x1234_5678_9abc_def0);
+        assert_eq!(addr.as_ptr::<u64>().read_volatile(), 0x1234_5678_9abc_def0);
+    }
+    serial_println!("[selftest] paging: fresh page mapped, zeroed, writable ... ok");
+}
+
+fn report_memory_stats() {
+    let (heap_used, heap_free) = crate::memory::heap::stats();
+    let (frames_used, frames_total) = crate::memory::frame_stats();
+    serial_println!(
+        "[selftest] mem: heap {heap_used} B used / {heap_free} B free, {frames_used}/{frames_total} frames handed out"
+    );
 }
 
 fn breakpoint_handled_and_returns() {
