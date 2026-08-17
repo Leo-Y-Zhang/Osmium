@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["kernel", "kshared", "xtask"]
+# Plain `cargo build`/`cargo test` operate on the host-side tooling; the kernel
+# is always built for x86_64-unknown-none through `cargo xtask`.
+default-members = ["xtask"]

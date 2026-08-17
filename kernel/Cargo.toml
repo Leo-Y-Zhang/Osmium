@@ -1,0 +1,13 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bootloader_api = "0.11.17"
+kshared = { path = "../kshared" }
+
+[features]
+# Runs the in-kernel self-test battery at boot and exits QEMU with a verdict.
+selftest = []
