@@ -4,6 +4,7 @@
 //! deadlock-free.
 
 use crate::framebuffer::{BACKGROUND, Display, FOREGROUND, Rgb};
+use bootloader_api::info::FrameBufferInfo;
 use core::fmt;
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
 use spin::Mutex;
@@ -45,8 +46,45 @@ impl Console {
     }
 
     /// (row, column) of the cursor; used by the self-test battery.
+    #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
     pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.col)
+    }
+
+    // The next three are the shell's surface; the selftest build has no shell.
+    #[cfg_attr(feature = "selftest", allow(dead_code))]
+    pub fn info(&self) -> FrameBufferInfo {
+        self.display.info
+    }
+
+    /// Clears the whole screen and homes the cursor.
+    #[cfg_attr(feature = "selftest", allow(dead_code))]
+    pub fn clear_screen(&mut self) {
+        self.display.clear(BACKGROUND);
+        self.row = 0;
+        self.col = 0;
+    }
+
+    /// Steps the cursor back one cell (wrapping to the previous row) and
+    /// blanks that cell; the shell's backspace.
+    #[cfg_attr(feature = "selftest", allow(dead_code))]
+    pub fn erase_last_char(&mut self) {
+        if self.col == 0 {
+            if self.row == 0 {
+                return;
+            }
+            self.row -= 1;
+            self.col = self.cols - 1;
+        } else {
+            self.col -= 1;
+        }
+        let x0 = BORDER + self.col * self.char_width;
+        let y0 = BORDER + self.row * RASTER_HEIGHT.val();
+        for dy in 0..RASTER_HEIGHT.val() {
+            for dx in 0..self.char_width {
+                self.display.set_pixel(x0 + dx, y0 + dy, BACKGROUND);
+            }
+        }
     }
 
     pub fn write_char(&mut self, c: char) {
@@ -106,6 +144,7 @@ pub fn init(display: Display) {
     *CONSOLE.lock() = Some(Console::new(display));
 }
 
+#[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 pub fn is_initialised() -> bool {
     CONSOLE.lock().is_some()
 }

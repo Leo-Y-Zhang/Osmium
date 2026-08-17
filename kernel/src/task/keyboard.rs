@@ -8,7 +8,7 @@
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use crossbeam_queue::ArrayQueue;
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::Stream;
 use futures_util::task::AtomicWaker;
 use spin::Once;
 
@@ -26,8 +26,11 @@ pub(crate) fn enqueue_scancode(scancode: u8) {
     }
 }
 
+// Only the shell constructs the stream, and the selftest build has no shell.
+#[cfg_attr(feature = "selftest", allow(dead_code))]
 pub struct ScancodeStream(());
 
+#[cfg_attr(feature = "selftest", allow(dead_code))]
 impl ScancodeStream {
     pub fn new() -> Self {
         SCANCODE_QUEUE.call_once(|| ArrayQueue::new(128));
@@ -58,24 +61,6 @@ impl Stream for ScancodeStream {
                 Poll::Ready(Some(scancode))
             }
             None => Poll::Pending,
-        }
-    }
-}
-
-/// Echoes decoded keys to the console. The M5 shell replaces this task.
-#[cfg_attr(feature = "selftest", allow(dead_code))]
-pub async fn echo_keypresses() {
-    use pc_keyboard::layouts::{AnyLayout, Us104Key};
-    use pc_keyboard::{DecodedKey, EventDecoder, HandleControl, ScancodeSet, ScancodeSet1};
-
-    let mut stream = ScancodeStream::new();
-    let mut scancodes = ScancodeSet1::new();
-    let mut decoder = EventDecoder::new(AnyLayout::Us104Key(Us104Key), HandleControl::Ignore);
-    while let Some(scancode) = stream.next().await {
-        if let Ok(Some(event)) = scancodes.advance_state(scancode)
-            && let Some(DecodedKey::Unicode(c)) = decoder.process_keyevent(event)
-        {
-            crate::console::with_console(|console| console.write_char(c));
         }
     }
 }

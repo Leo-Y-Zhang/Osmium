@@ -57,3 +57,20 @@ jobs:
         with:
           name: serial-${{ matrix.firmware }}
           path: serial-*.log
+
+  # The battery proves the selftest build; this proves the image users
+  # actually boot reaches the shell.
+  boot-shipped:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - run: cargo xtask test --shipped | tee serial-shipped.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-shipped
+          path: serial-shipped.log

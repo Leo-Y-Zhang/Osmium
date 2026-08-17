@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
@@ -14,17 +15,33 @@ use std::{env, fs, io, thread};
 const QEMU_EXIT_SUCCESS: i32 = 33; // kernel wrote 0x10
 const QEMU_EXIT_FAILURE: i32 = 35; // kernel wrote 0x11
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
-/// Lightness gate: boot + selftest must fit in this much RAM.
-/// Placeholder until the real floor is measured at M5, then pinned just above it.
-const DEFAULT_TEST_MEM_MB: u32 = 128;
+/// Lightness gates: boot + selftest must fit in this much RAM.
+/// Measured 2026-08-17 (QEMU 11.1): BIOS passes at 24 MB and fails at 20;
+/// UEFI passes at 48 MB and fails at 40 — the difference is OVMF's own
+/// footprint, not the kernel's. Pinned at the measured floors so RAM-hunger
+/// regressions fail the gate.
+const BIOS_TEST_MEM_MB: u32 = 24;
+const UEFI_TEST_MEM_MB: u32 = 48;
 /// Lightness gate: disk images must stay under this ceiling; growth is a
-/// deliberate decision, never drift.
-const IMAGE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+/// deliberate decision, never drift. Both images currently sit around
+/// 2.1-2.5 MiB; 4 MiB leaves headroom without hiding a regression.
+const IMAGE_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 
 struct Opts {
     uefi: bool,
     selftest: bool,
-    mem_mb: u32,
+    shipped: bool,
+    mem_override: Option<u32>,
+}
+
+impl Opts {
+    fn mem_mb(&self) -> u32 {
+        self.mem_override.unwrap_or(if self.uefi {
+            UEFI_TEST_MEM_MB
+        } else {
+            BIOS_TEST_MEM_MB
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -33,15 +50,19 @@ fn main() -> Result<()> {
     let mut opts = Opts {
         uefi: false,
         selftest: false,
-        mem_mb: DEFAULT_TEST_MEM_MB,
+        shipped: false,
+        mem_override: None,
     };
     for arg in args {
         match arg.as_str() {
             "--uefi" => opts.uefi = true,
             "--bios" => opts.uefi = false,
             "--selftest" => opts.selftest = true,
+            "--shipped" => opts.shipped = true,
             other => match other.strip_prefix("--mem=") {
-                Some(mb) => opts.mem_mb = mb.parse().context("--mem=<MB> takes a number")?,
+                Some(mb) => {
+                    opts.mem_override = Some(mb.parse().context("--mem=<MB> takes a number")?);
+                }
                 None => bail!("unknown argument: {other}"),
             },
         }
@@ -50,7 +71,9 @@ fn main() -> Result<()> {
         "build" => build_images(opts.selftest).map(|_| ()),
         "run" => run(&opts),
         "test" => test(&opts),
-        _ => bail!("usage: cargo xtask <build|run|test> [--bios|--uefi] [--selftest] [--mem=MB]"),
+        _ => bail!(
+            "usage: cargo xtask <build|run|test> [--bios|--uefi] [--selftest] [--shipped] [--mem=MB]"
+        ),
     }
 }
 
@@ -196,7 +219,7 @@ fn qemu_command(images: &Images, opts: &Opts, headless: bool) -> Result<Command>
         .args(["-serial", "stdio"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-no-reboot")
-        .args(["-m", &format!("{}M", opts.mem_mb)]);
+        .args(["-m", &format!("{}M", opts.mem_mb())]);
     if headless {
         cmd.args(["-display", "none"]);
     }
@@ -225,17 +248,22 @@ fn run(opts: &Opts) -> Result<()> {
     println!(
         "starting QEMU ({}, {} MiB RAM)...",
         if opts.uefi { "UEFI" } else { "BIOS" },
-        opts.mem_mb
+        opts.mem_mb()
     );
     let status = cmd.status().context(QEMU_MISSING_HINT)?;
     println!("QEMU exited: {status}");
     Ok(())
 }
 
-/// Headless boot of the selftest build; asserts the QEMU exit code AND the
-/// serial log. This is the bootability proof CI runs on every push.
+/// The serial line the shipped (non-selftest) image logs once it reaches the
+/// shell; `test --shipped` waits for it instead of an exit code.
+const SHIPPED_MARKER: &str = "boot complete; shell ready";
+
+/// Headless boot proof, run by CI on every push. Default mode boots the
+/// selftest build and asserts the QEMU exit code AND the serial log;
+/// `--shipped` boots the real image and asserts it reaches the shell.
 fn test(opts: &Opts) -> Result<()> {
-    let images = build_images(true)?;
+    let images = build_images(!opts.shipped)?;
     let mut cmd = qemu_command(&images, opts, true)?;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -244,9 +272,10 @@ fn test(opts: &Opts) -> Result<()> {
     let mut child = cmd.spawn().context(QEMU_MISSING_HINT)?;
     let mut stdout = child.stdout.take().expect("stdout was piped");
 
-    // Stream serial output through while also capturing it for the assertion.
-    let reader = thread::spawn(move || -> String {
-        let mut captured = String::new();
+    // Stream serial output through while also capturing it for assertions.
+    let captured = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&captured);
+    let reader = thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match stdout.read(&mut buf) {
@@ -255,14 +284,25 @@ fn test(opts: &Opts) -> Result<()> {
                     let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
                     print!("{chunk}");
                     io::stdout().flush().ok();
-                    captured.push_str(&chunk);
+                    sink.lock().unwrap().push_str(&chunk);
                 }
             }
         }
-        captured
     });
 
     let status = loop {
+        if opts.shipped && captured.lock().unwrap().contains(SHIPPED_MARKER) {
+            child.kill().ok();
+            child.wait().ok();
+            reader.join().ok();
+            println!(
+                "\nshipped-image boot OK ({}, {} MiB RAM, {:.1}s): reached \"{SHIPPED_MARKER}\"",
+                if opts.uefi { "UEFI" } else { "BIOS" },
+                opts.mem_mb(),
+                start.elapsed().as_secs_f32()
+            );
+            return Ok(());
+        }
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -271,14 +311,18 @@ fn test(opts: &Opts) -> Result<()> {
             child.wait().ok();
             reader.join().ok();
             bail!(
-                "boot test timed out after {}s — the kernel hung instead of exiting",
+                "boot test timed out after {}s — the kernel hung",
                 BOOT_TIMEOUT.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let serial_log = reader.join().unwrap_or_default();
+    reader.join().ok();
+    let serial_log = captured.lock().unwrap().clone();
 
+    if opts.shipped {
+        bail!("shipped image exited ({status}) before logging \"{SHIPPED_MARKER}\"");
+    }
     match status.code() {
         Some(QEMU_EXIT_SUCCESS) => {}
         Some(QEMU_EXIT_FAILURE) => bail!("selftest battery FAILED (qemu exit {QEMU_EXIT_FAILURE})"),
@@ -290,7 +334,7 @@ fn test(opts: &Opts) -> Result<()> {
     println!(
         "\nboot test OK ({}, {} MiB RAM, {:.1}s)",
         if opts.uefi { "UEFI" } else { "BIOS" },
-        opts.mem_mb,
+        opts.mem_mb(),
         start.elapsed().as_secs_f32()
     );
     Ok(())

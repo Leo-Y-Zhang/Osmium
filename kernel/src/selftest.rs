@@ -14,8 +14,28 @@ pub fn run() -> ! {
     fresh_page_is_mapped_zeroed_writable();
     async_task_with_waker_runs();
     report_memory_stats();
-    serial_println!("SELFTEST PASSED");
-    crate::qemu::exit(crate::qemu::ExitCode::Success)
+    // Must run LAST: the only acceptable exit from here is through the
+    // double-fault handler, which prints the battery's final verdict.
+    stack_overflow_is_survivable()
+}
+
+fn stack_overflow_is_survivable() -> ! {
+    use core::sync::atomic::Ordering;
+    serial_println!(
+        "[selftest] resilience: overflowing the kernel stack, double fault expected ..."
+    );
+    crate::interrupts::EXPECTING_DOUBLE_FAULT.store(true, Ordering::SeqCst);
+
+    #[allow(unconditional_recursion)]
+    fn overflow() {
+        overflow();
+        // The volatile read stops the recursion being tail-call optimised
+        // into a loop that never grows the stack.
+        // SAFETY: reading a promoted constant.
+        unsafe { core::ptr::read_volatile(&0u8) };
+    }
+    overflow();
+    panic!("the stack overflow did not double fault; the IST guard is not working")
 }
 
 fn heap_allocations_work() {

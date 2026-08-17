@@ -18,6 +18,8 @@ mod qemu;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;
+#[cfg(not(feature = "selftest"))]
+mod shell;
 mod task;
 
 use bootloader_api::config::Mapping;
@@ -97,9 +99,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(feature = "selftest"))]
     {
-        log::info!("boot complete; keyboard echo running (the shell arrives at M5)");
+        // xtask's shipped-image boot proof greps the serial log for this line.
+        log::info!("boot complete; shell ready");
         let mut executor = task::executor::Executor::new();
-        executor.spawn(task::Task::new(task::keyboard::echo_keypresses()));
+        executor.spawn(task::Task::new(shell::run()));
         executor.run()
     }
 }

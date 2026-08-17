@@ -39,6 +39,13 @@ pub static BREAKPOINT_HITS: AtomicUsize = AtomicUsize::new(0);
 /// Raw scancodes received (M4 replaces this counter with a waker-backed queue).
 pub static SCANCODES_SEEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Set by the self-test battery immediately before it deliberately overflows
+/// the kernel stack. Only THAT double fault converts into the battery's
+/// success verdict; an unexpected one is still a fatal bug.
+#[cfg(feature = "selftest")]
+pub static EXPECTING_DOUBLE_FAULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
@@ -137,5 +144,16 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _error_code: u64) -> ! {
+    #[cfg(feature = "selftest")]
+    if EXPECTING_DOUBLE_FAULT.load(Ordering::SeqCst) {
+        x86_64::instructions::interrupts::disable();
+        // SAFETY: terminal path — the interrupted lock holder never resumes.
+        unsafe { crate::serial::force_unlock_for_panic() };
+        crate::serial_println!(
+            "[selftest] resilience: stack overflow caught on the IST double-fault stack ... ok"
+        );
+        crate::serial_println!("SELFTEST PASSED");
+        crate::qemu::exit(crate::qemu::ExitCode::Success);
+    }
     panic!("double fault\n{frame:#?}");
 }
