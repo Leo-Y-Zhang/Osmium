@@ -11,6 +11,7 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install # reads rust-toolchain.toml
@@ -24,6 +25,7 @@ jobs:
   # nightly feature creeps into kernel or kshared source.
   feature-allowlist:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - run: |
@@ -31,8 +33,25 @@ jobs:
           echo "unstable features found: ${found:-none}"
           test "$found" = '#![feature(abi_x86_interrupt)]'
 
+  # Privacy pillar, enforced structurally: no network or storage code may
+  # enter the kernel. Greps sources and the kernel manifest for driver and
+  # protocol tokens; a hit fails the build and forces a deliberate decision.
+  no-network-no-storage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          ! grep -riE 'smoltcp|\btcp\b|\budp\b|socket|ethernet|e1000|virtio|dhcp|\bdns\b|\bhttp\b' \
+              kernel/src kshared/src kernel/Cargo.toml
+          ! grep -riE 'fatfs|ext[234]|nvme|ahci|\bata\b|\bide\b|\bsata\b' \
+              kernel/src kshared/src kernel/Cargo.toml
+          echo "no network or storage tokens in the kernel"
+
   host-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
@@ -51,6 +70,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: Boot selftest (${{ matrix.firmware }})
+        # shell: bash is load-bearing: it turns on pipefail, without which a
+        # failed boot would be masked by tee's exit status and go green.
+        shell: bash
         run: cargo xtask test --${{ matrix.firmware }} | tee serial-${{ matrix.firmware }}.log
       - uses: actions/upload-artifact@v4
         if: always()
@@ -68,7 +90,10 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
-      - run: cargo xtask test --shipped | tee serial-shipped.log
+      - name: Boot the shipped image
+        # shell: bash for pipefail — see the boot-test note.
+        shell: bash
+        run: cargo xtask test --shipped | tee serial-shipped.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

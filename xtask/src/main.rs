@@ -146,6 +146,9 @@ fn build_images(selftest: bool) -> Result<Images> {
 
 /// Pinned OVMF firmware build for UEFI boots, fetched on demand.
 const OVMF_RELEASE: &str = "edk2-stable202411-r1";
+/// sha256 of the release tarball above; a re-pointed release fails loudly
+/// instead of silently substituting guest firmware.
+const OVMF_SHA256: &str = "963fc6cef6a0560cec97381ed22a7d5c76f440c8212529a034cb465466cd57cc";
 
 fn fetch_ovmf() -> Result<(PathBuf, PathBuf)> {
     let root = workspace_root();
@@ -167,6 +170,15 @@ fn fetch_ovmf() -> Result<(PathBuf, PathBuf)> {
             .context("running curl to fetch OVMF (is curl on PATH?)")?;
         if !status.success() {
             bail!("OVMF download failed: {url}");
+        }
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(fs::read(&archive).context("reading the OVMF archive")?);
+            format!("{:x}", hasher.finalize())
+        };
+        if digest != OVMF_SHA256 {
+            bail!("OVMF checksum mismatch: got {digest}, expected {OVMF_SHA256}");
         }
         let status = Command::new("tar")
             .arg("-xf")

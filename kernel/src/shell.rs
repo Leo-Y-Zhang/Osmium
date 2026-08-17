@@ -153,13 +153,10 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "sysinfo" => sysinfo(layout_name),
         "privacy" => privacy(),
         "keymap" => keymap(args, layout_name, decoder),
-        "panic" => {
-            if args.is_empty() {
-                panic!("user-requested panic (the 'panic' command)")
-            } else {
-                panic!("user-requested panic: {args}")
-            }
-        }
+        // Fixed message on purpose: the argument would be typed input, and
+        // panics are reported on the serial port — which typed input must
+        // never reach (privacy rule).
+        "panic" => panic!("user-requested panic (the 'panic' command)"),
         "shutdown" => shutdown(),
         "selftest" => runtime_selftest(),
         other => println_con(&format!("unknown command: {other} (try 'help')")),
@@ -177,7 +174,7 @@ fn help() {
     println_con("  privacy       what this OS can and cannot leak");
     println_con("  keymap [us|uk] show or switch keyboard layout");
     println_con("  selftest      run the runtime test subset");
-    println_con("  panic [msg]   demonstrate the panic screen");
+    println_con("  panic         demonstrate the panic screen");
     println_con("  shutdown      power off (QEMU) or halt");
 }
 

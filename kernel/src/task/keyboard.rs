@@ -22,6 +22,10 @@ pub(crate) fn enqueue_scancode(scancode: u8) {
     if let Some(queue) = SCANCODE_QUEUE.get()
         && queue.push(scancode).is_ok()
     {
+        // This wake can never be the LAST drop of the task's Arc'd waker
+        // (which would deallocate in interrupt context): the executor's
+        // waker_cache holds a reference for as long as the task lives, and
+        // the shell task never completes. Recorded in the TDD's state table.
         WAKER.wake();
     }
 }

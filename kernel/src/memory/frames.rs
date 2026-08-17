@@ -51,6 +51,8 @@ impl BootFrameAllocator {
     }
 }
 
+// SAFETY: every frame is returned at most once — `next` only ever grows and
+// indexes a deterministic iterator over the fixed boot memory map.
 unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
         // O(n) walk per allocation; acceptable at boot-time allocation

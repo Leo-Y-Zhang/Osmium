@@ -16,8 +16,11 @@ pub const HEAP_SIZE: u64 = 1024 * 1024;
 /// would corrupt the free list.
 struct ZeroOnFree(LockedHeap);
 
+// SAFETY: defers entirely to LockedHeap's GlobalAlloc contract; the wrapper
+// only adds a scrub of memory its caller has already relinquished.
 unsafe impl GlobalAlloc for ZeroOnFree {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: same contract as the caller's; passed straight through.
         unsafe { self.0.alloc(layout) }
     }
 

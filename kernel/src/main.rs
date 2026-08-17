@@ -4,6 +4,9 @@
 // convention for IDT handlers (still feature-gated on stable rustc). CI's
 // feature-allowlist job fails if anything else joins it.
 #![feature(abi_x86_interrupt)]
+// TDD rule, machine-checked: every unsafe block carries its SAFETY argument.
+// CI's -D warnings turns this into a hard failure.
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 
