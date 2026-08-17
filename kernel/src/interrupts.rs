@@ -38,8 +38,6 @@ impl InterruptIndex {
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Breakpoint exceptions handled; the self-test battery asserts this moves.
 pub static BREAKPOINT_HITS: AtomicUsize = AtomicUsize::new(0);
-/// Raw scancodes received (M4 replaces this counter with a waker-backed queue).
-pub static SCANCODES_SEEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Set by the self-test battery immediately before it deliberately overflows
 /// the kernel stack. Only THAT double fault converts into the battery's
@@ -197,7 +195,6 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
     let mut port: Port<u8> = Port::new(0x60);
     // SAFETY: reading the PS/2 data port inside its own interrupt handler.
     let scancode = unsafe { port.read() };
-    SCANCODES_SEEN.fetch_add(1, Ordering::Relaxed);
     crate::task::keyboard::enqueue_scancode(scancode);
     end_of_interrupt(InterruptIndex::Keyboard);
 }

@@ -135,8 +135,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 pub(crate) fn halt_loop() -> ! {
     loop {
-        // SAFETY: `hlt` idles the CPU until the next interrupt; it touches no state.
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+        x86_64::instructions::hlt();
     }
 }
 
@@ -149,6 +148,10 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!();
     serial_println!("*** KERNEL PANIC ***");
     serial_println!("{info}");
+    // The strongest privacy line at the worst moment, and greppable in a
+    // shipped-panic serial log: a panic destroys nothing, because nothing was
+    // ever written to disk.
+    serial_println!("nothing was written to disk.");
 
     // SAFETY: same argument as the serial lock — this path never returns, so
     // a previous holder can never resume; reclaiming keeps the panic screen
@@ -160,7 +163,7 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(console, "\n*** KERNEL PANIC ***\n{info}");
         let _ = writeln!(
             console,
-            "The system is halted; reset the machine or close QEMU."
+            "The system is halted; nothing was written to disk. Reset the machine or close QEMU."
         );
     }
 
