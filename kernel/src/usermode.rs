@@ -89,20 +89,20 @@ pub fn run_user(code: &[u8]) -> u64 {
     code
 }
 
-/// The exit code from the most recent `run_user` (also its return value; this
-/// getter lets a caller that reached `run_user` through an asm trampoline read
-/// it without threading the return through the trampoline).
-#[cfg_attr(not(feature = "selftest"), allow(dead_code))]
-pub fn last_exit_code() -> u64 {
-    USER_EXIT_CODE.load(Ordering::SeqCst)
-}
-
 /// Drops to ring 3. The SysV callee-saved registers are pushed first and the
-/// saved stack pointer points at them, so `SYS_EXIT` can restore them and hand
-/// the launcher's caller back the register file the compiler expects —
-/// otherwise ring 3 could return arbitrary `rbx/rbp/r12-r15` into the kernel.
-/// The general-purpose registers are then scrubbed before entering ring 3, so
-/// the program never sees kernel register contents.
+/// saved stack pointer points at them, so `SYS_EXIT` restores them and hands
+/// the launcher's caller back the register file the compiler expects.
+///
+/// This is ABI hygiene closing a latent hole a security review found: because
+/// `jump_to_user` is `extern "C"` and appears to return normally, a caller
+/// that held a live value in a callee-saved register across the call would
+/// otherwise get back whatever ring 3 left there. It is not reproducible by a
+/// Rust-level test — the intervening function epilogues re-establish the
+/// callee-saved invariant themselves, and the one currently-live value happens
+/// to corrupt benignly — so it is kept as defense-in-depth, the way every real
+/// syscall stub does. The GP registers are also scrubbed before entering ring
+/// 3, and the caller-saved set scrubbed on the syscall return, so the program
+/// never sees kernel register contents.
 #[unsafe(naked)]
 unsafe extern "C" fn jump_to_user(user_rip: u64, user_rsp: u64, user_cs: u64, user_ss: u64) {
     // args: rdi=rip, rsi=rsp, rdx=cs, rcx=ss
@@ -203,13 +203,11 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, _a1: u64) -> u64 {
     }
 }
 
-/// A tiny ring-3 program: report a byte via `SYS_WRITE`, then **deliberately
-/// set every callee-saved register to -1** before exiting with its own code
-/// segment. The clobbering makes the register-preservation guarantee testable:
-/// the battery pins a sentinel in `r15` across `run_user`, and if the entry
-/// stub failed to save and restore the callee-saved set, this `-1` would reach
-/// the caller. The exit code is CS, whose low two bits are the CPL.
-/// Hand-assembled flat x86-64.
+/// A tiny ring-3 program: report a byte via `SYS_WRITE`, then set every
+/// callee-saved register to -1 before exiting with its own code segment. The
+/// register trashing makes the program hostile to the kernel's register state;
+/// a clean return shows the boundary tolerates it. The exit code is CS, whose
+/// low two bits are the CPL. Hand-assembled flat x86-64.
 #[rustfmt::skip]
 pub const DEMO_PROGRAM: &[u8] = &[
     // mov eax, 1 (SYS_WRITE)
