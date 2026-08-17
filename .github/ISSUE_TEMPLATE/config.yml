@@ -1,0 +1,3 @@
+# The hardware form is a funnel, not a gate: bugs, questions and anything the
+# form does not fit still go through a blank issue.
+blank_issues_enabled: true

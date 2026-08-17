@@ -1,0 +1,87 @@
+name: Real-hardware boot report
+description: Report what happened when you booted Osmium on a physical machine.
+title: "[hardware] "
+labels: ["hardware-report"]
+body:
+  - type: input
+    id: machine
+    attributes:
+      label: Machine make and model
+      description: As specific as you can be; the chipset often decides the outcome.
+      placeholder: ThinkPad X220, i5-2520M
+    validations:
+      required: true
+
+  - type: dropdown
+    id: firmware
+    attributes:
+      label: Firmware mode
+      description: How the machine was set to boot, not what Osmium reported.
+      options:
+        - BIOS/CSM
+        - pure UEFI
+        - UEFI with CSM enabled
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: RAM in MiB
+      description: The memory installed in the machine. Osmium's measured floor is 21 MiB on BIOS and 46 MiB on UEFI.
+      placeholder: "4096"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: image
+    attributes:
+      label: Image used
+      options:
+        - osmium-bios.img from a release
+        - osmium-uefi.img from a release
+        - built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Boot outcome
+      description: The nearest match. The detail goes in the next box.
+      options:
+        - reached the shell
+        - booted but the keyboard is dead
+        - panic screen
+        - black screen or hang
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        How far it got and what the screen said. If it reached the shell, the
+        banner lines - firmware, resolution, pixel format, usable memory, boot
+        time - are the useful part, along with anything `sysinfo` and `mem`
+        printed. If it stopped, say what was on screen when it stopped.
+    validations:
+      required: true
+
+  - type: textarea
+    id: photo
+    attributes:
+      label: Photo of the screen
+      description: >-
+        Optional, and often faster than transcribing. Drag an image file into
+        this box to attach it; a phone photo of the banner or the panic screen
+        is enough.
+
+  - type: input
+    id: version
+    attributes:
+      label: Osmium version or commit
+      description: Optional. The release tag you downloaded, or the commit you built from.
+      placeholder: v0.1.0
