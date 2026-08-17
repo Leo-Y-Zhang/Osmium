@@ -105,10 +105,14 @@ Three readers, in order of how often they are inconvenienced.
 these is a coherent next project; none of them is in v1, and none of them should
 appear in a v1 pull request.
 
-- **Ring 3 and system calls.** Everything in v1 runs in ring 0. There is no user
-  mode, no privilege transition, no `syscall` entry point.
-- **ELF loading.** No program loader; there are no programs to load. The shell is
-  compiled into the kernel.
+- ~~**Ring 3 and system calls.**~~ **Delivered as M6 (2026-08-17).** The kernel now
+  drops to ring 3 to run a user program on a user-only page, which returns to the
+  kernel through a software-interrupt (`int 0x80`) system-call path; the battery
+  proves the program executed in CPL 3 and that the kernel's mappings are not
+  user-accessible. Full ELF loading is still out of scope (see below); M6 runs a
+  flat code blob in an auto-zeroed page.
+- **ELF loading.** No program loader; the user program is a flat code blob, not a
+  parsed ELF. The shell is compiled into the kernel.
 - **Filesystems: no ramfs, no FAT32.** The bootloader's ramdisk facility is not
   used. Nothing is mounted.
 - **Preemptive scheduling.** The v1 executor is cooperative: tasks yield, and the

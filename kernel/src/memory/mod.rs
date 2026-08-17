@@ -25,6 +25,12 @@ static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// mapping (guaranteed by `BOOTLOADER_CONFIG`); the caller fails closed if
 /// the bootloader did not provide one.
 pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions) {
+    // Enable the NX bit so user pages can be marked non-executable (W^X).
+    use x86_64::registers::model_specific::{Efer, EferFlags};
+    // SAFETY: the CPU is in long mode (EFER.LME already set by the bootloader);
+    // this only adds NXE, which every x86_64 CPU supports.
+    unsafe { Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE)) };
+
     PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset, Ordering::Relaxed);
     let offset = VirtAddr::new(physical_memory_offset);
     // SAFETY: the bootloader maps all physical memory at `offset`, and this
@@ -40,6 +46,69 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
         allocator.as_mut().expect("allocator just stored"),
     )
     .expect("mapping the kernel heap failed");
+}
+
+/// Maps one user-accessible page at `virt`. The `USER_ACCESSIBLE` flag must be
+/// on the intermediate tables too, not just the leaf — the classic mistake is
+/// setting it only on the leaf and getting a fault from ring 3 anyway — so
+/// this uses `map_to_with_table_flags`. Returns the mapped page's frame so the
+/// caller can later tighten permissions (W^X).
+pub fn map_user_page(virt: u64, writable: bool, executable: bool) {
+    use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
+    let mut mapper = MAPPER.lock();
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    let mapper = mapper.as_mut().expect("memory not initialised");
+    let allocator = allocator.as_mut().expect("memory not initialised");
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let frame = allocator.allocate_frame().expect("out of physical frames");
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        flags |= PageTableFlags::WRITABLE;
+    }
+    if !executable {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+    let parent =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // SAFETY: a fresh, otherwise-unused user virtual page mapped to a frame the
+    // allocator just handed out exclusively; parent tables carry USER so ring 3
+    // can actually reach it.
+    unsafe {
+        mapper
+            .map_to_with_table_flags(page, frame, flags, parent, allocator)
+            .expect("mapping a user page failed")
+            .flush();
+    }
+}
+
+/// Drops the WRITABLE flag on an already-mapped page (W^X for user code, once
+/// the kernel has finished copying the program in).
+pub fn make_read_only(virt: u64) {
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
+    let mut mapper = MAPPER.lock();
+    let mapper = mapper.as_mut().expect("memory not initialised");
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // SAFETY: `page` is already mapped by map_user_page; this only narrows its
+    // permissions, and the TLB is flushed.
+    unsafe {
+        mapper
+            .update_flags(page, flags)
+            .expect("tightening user code flags failed")
+            .flush();
+    }
+}
+
+/// Tears down a user-page mapping. The frame is not reclaimed (bump
+/// allocator); only the mapping is cleared, so the address can be reused.
+pub fn unmap_user_page(virt: u64) {
+    use x86_64::structures::paging::{Mapper, Page, Size4KiB};
+    let mut mapper = MAPPER.lock();
+    let mapper = mapper.as_mut().expect("memory not initialised");
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+    if let Ok((_frame, flush)) = mapper.unmap(page) {
+        flush.flush();
+    }
 }
 
 /// (frames handed out, usable frames total).

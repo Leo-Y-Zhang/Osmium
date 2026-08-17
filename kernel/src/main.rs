@@ -27,6 +27,7 @@ mod serial;
 mod shell;
 mod task;
 mod time;
+mod usermode;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};

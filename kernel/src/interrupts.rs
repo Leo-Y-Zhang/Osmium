@@ -135,6 +135,15 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
     // A floating line can produce a spurious IRQ7 even with devices masked.
     idt[PIC_1_OFFSET + 7].set_handler_fn(spurious_handler);
+    // int 0x80 software system call, callable from ring 3.
+    // SAFETY: the address is a valid naked entry that ends in `iretq` (or, for
+    // SYS_EXIT, restores the saved kernel stack and returns); DPL 3 lets a
+    // ring-3 program issue `int 0x80` without a #GP.
+    unsafe {
+        idt[crate::usermode::SYSCALL_VECTOR]
+            .set_handler_addr(x86_64::VirtAddr::new(crate::usermode::syscall_entry_addr()))
+            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+    }
     idt
 });
 

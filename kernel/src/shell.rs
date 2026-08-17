@@ -225,6 +225,7 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "uptime" => uptime(),
         "sysinfo" => sysinfo(layout_name),
         "privacy" => privacy(),
+        "user" => user_command(),
         "keymap" => keymap(args, layout_name, decoder),
         // Fixed message on purpose: the argument would be typed input, and
         // panics are reported on the serial port — which typed input must
@@ -246,6 +247,7 @@ fn help() {
     println_con("  sysinfo       hardware and kernel summary");
     println_con("  privacy       what this OS can and cannot leak");
     println_con("  keymap [us|uk] show or switch keyboard layout");
+    println_con("  user          run a ring-3 program via the syscall path");
     println_con("  selftest      run the runtime test subset");
     println_con("  panic         demonstrate the panic screen");
     println_con("  shutdown      power off (QEMU) or halt");
@@ -338,6 +340,14 @@ fn keymap(args: &str, layout_name: &mut &'static str, decoder: &mut EventDecoder
         "" => println_con(&format!("keymap: {layout_name} (available: us, uk)")),
         _ => println_con("usage: keymap [us|uk]"),
     }
+}
+
+fn user_command() {
+    let exit = crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
+    field(
+        "user:    ",
+        &format!("ring-3 program exited with CS={exit:#x} (CPL {})", exit & 3),
+    );
 }
 
 fn shutdown() -> ! {

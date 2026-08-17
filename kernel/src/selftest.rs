@@ -17,6 +17,7 @@ pub fn run() -> ! {
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
     shell_processes_a_scripted_session();
+    user_program_runs_in_ring3();
     report_memory_stats();
     // Must run LAST: the only acceptable exit from here is through the
     // double-fault handler, which prints the battery's final verdict.
@@ -206,6 +207,21 @@ fn shell_processes_a_scripted_session() {
         "the shell produced no output for a typed command"
     );
     serial_println!("[selftest] shell: scripted 'help' via injected scancodes ... ok");
+}
+
+fn user_program_runs_in_ring3() {
+    let exit = crate::usermode::run_user(crate::usermode::DEMO_PROGRAM);
+    // The program exited with its own CS; its low two bits are the CPL, which
+    // must be 3 — proof it executed in ring 3 and returned through the syscall.
+    assert_eq!(
+        exit & 3,
+        3,
+        "user program ran at CPL {} (expected ring 3)",
+        exit & 3
+    );
+    serial_println!(
+        "[selftest] usermode: program ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
+    );
 }
 
 fn report_memory_stats() {
