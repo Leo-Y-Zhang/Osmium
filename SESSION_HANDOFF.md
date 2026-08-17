@@ -13,13 +13,20 @@ and the task list; continue from "Next action" below. Full local gate =
 `cargo xtask test --bios`, `--uefi`, `--shipped`. Every green increment is
 committed and pushed immediately; CI is the gate, not local success.
 
-- **State:** baseline `cc0da17` (M6 complete, CI green, tree clean).
-- **In flight:** Phase 1 — a nine-lens critique fleet + adversarial judge is
-  producing the ranked overnight work program (workflow `wf_bdc72a21-b6a`).
-- **Next action:** read the judge's ranked plan, then execute Wave 1
-  (correctness/security/CI fixes), Wave 2 (major milestone(s)), Wave 3
-  (hardening/polish/docs) in order, each item test-first with its killing
-  mutation observed, full local gates, commit+push, CI verify.
+- **State:** Wave 1 + Wave 2 landed and pushed, all CI-green:
+  ranks 1-4 (CI grep-gate hardening; keystroke-privacy allowlist; sentinel
+  16-byte skip; page-permission cluster incl. heap NX + order-independent
+  user-mapping audit) and rank 5 (M7 ELF loader: `user/hello` real Rust ELF,
+  host-tested `kshared::elf` parser, per-segment W^X). Every mutation observed
+  red then reverted.
+- **In flight:** three Wave-3 agents in worktrees off `5d7074f`:
+  wt-xtask (rank 8 no-persistence hash gate + rank 19 xtask host tests),
+  wt-docs (rank 9 docs reconciliation sweep), wt-funnel (rank 21 hardware
+  report funnel). Main clone: doing rank 6 (SMEP/SMAP/UMIP) directly.
+- **Next action:** finish rank 6; merge the three worktree branches in order
+  (funnel, xtask, docs — docs last as it is the widest), gate each merge,
+  push. Then remaining Wave-3 ranks 7/11/12/14 as time allows. Closure from
+  11:00: full gates, CI green, gh api notifications, memory update.
 - **Standing constraints:** networking on NO roadmap ever; console scroll rework
   stays DEFERRED (measured ~87 ms/100 scrolls under TCG, needs real-hardware or
   KVM data first); the four privacy properties are inviolable; exactly one

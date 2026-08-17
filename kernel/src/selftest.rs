@@ -14,6 +14,7 @@ pub fn run() -> ! {
     freed_heap_memory_is_zeroed();
     fresh_page_is_mapped_zeroed_writable();
     kernel_mappings_are_supervisor_only();
+    supervisor_hardening_is_active();
     heap_is_not_executable();
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
@@ -174,6 +175,57 @@ fn no_stray_user_mappings_after_ring3() {
         "a user-accessible mapping survived the ring-3 teardown"
     );
     serial_println!("[selftest] privacy: ring-3 teardown left no user-accessible leaf ... ok");
+}
+
+/// Every supervisor-hardening bit the CPU advertises must actually be set in
+/// CR4 — read back from the register, not from what we asked for. Under the
+/// `-cpu max` model CI boots, all three (SMEP, SMAP, UMIP) are advertised, so
+/// all three must be live. Removing the `Cr4::update` in `cpu::init` fails
+/// here. (The behavioural negative probe — a ring-0 read of a user page
+/// faulting under SMAP — is deferred: it needs page-fault-recovery plumbing
+/// that redirects a faulting RIP, and the positive controls below already
+/// prove SMAP is active without that risk. The ELF loader copies through the
+/// physical alias precisely because SMAP is on, and `hello` runs to
+/// completion under it — a broken SMAP configuration would fault that copy.)
+fn supervisor_hardening_is_active() {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    let cr4 = Cr4::read();
+    // CPUID leaf 7 is the source of truth for what the CPU supports; it
+    // exists on every x86_64 CPU and `__cpuid_count` is safe on x86_64.
+    let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let checks = [
+        (
+            leaf7.ebx & (1 << 7) != 0,
+            Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION,
+            "SMEP",
+        ),
+        (
+            leaf7.ebx & (1 << 20) != 0,
+            Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION,
+            "SMAP",
+        ),
+        (
+            leaf7.ecx & (1 << 2) != 0,
+            Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION,
+            "UMIP",
+        ),
+    ];
+    for (supported, flag, name) in checks {
+        if supported {
+            assert!(cr4.contains(flag), "{name} is supported but not set in CR4");
+        }
+    }
+    // Under `-cpu max` all three are advertised; if any is missing here the
+    // boot CPU model regressed and the hardening claim is not being tested.
+    assert!(
+        crate::cpu::smep_enabled() && crate::cpu::smap_enabled() && crate::cpu::umip_enabled(),
+        "expected SMEP+SMAP+UMIP under the test CPU model, got {}",
+        crate::cpu::summary()
+    );
+    serial_println!(
+        "[selftest] security: supervisor hardening active ({}) ... ok",
+        crate::cpu::summary()
+    );
 }
 
 fn heap_is_not_executable() {

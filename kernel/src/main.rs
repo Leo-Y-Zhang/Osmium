@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod console;
+mod cpu;
 mod framebuffer;
 mod gdt;
 mod interrupts;
@@ -98,12 +99,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     memory::init(phys_offset, memory_regions);
     time::stamp(time::Phase::MemoryReady);
+    // Supervisor-mode hardening (SMEP/SMAP/UMIP): after paging is up — the
+    // ELF loader already copies through the physical alias for SMAP — and
+    // before any ring-3 program runs.
+    cpu::init();
     let (heap_used, heap_free) = memory::heap::stats();
     let (frames_used, frames_total) = memory::frame_stats();
     log::info!(
         "memory: heap {} KiB ({heap_used} B used, {heap_free} B free), {frames_used}/{frames_total} frames",
         memory::heap::HEAP_SIZE / 1024
     );
+    log::info!("cpu hardening: {}", cpu::summary());
 
     #[cfg(feature = "selftest")]
     {

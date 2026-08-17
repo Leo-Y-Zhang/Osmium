@@ -119,6 +119,35 @@ pub fn unmap_user_page(virt: u64) {
     }
 }
 
+/// Copies `bytes` into an already-mapped user page at `virt`, writing through
+/// the kernel's physical-memory alias rather than the user virtual address.
+/// This is what makes the ELF loader's copy SMAP-safe: the destination is
+/// reached through a supervisor mapping, so a stray write to a genuine user
+/// pointer still faults, while the loader's own copy does not need `stac`.
+/// `virt..virt+bytes.len()` must lie within one mapped 4 KiB page.
+pub fn copy_into_user_page(virt: u64, bytes: &[u8]) {
+    use x86_64::structures::paging::Translate;
+    use x86_64::structures::paging::mapper::TranslateResult;
+    assert!(
+        (virt & 0xfff) as usize + bytes.len() <= 4096,
+        "copy_into_user_page crosses a page boundary"
+    );
+    let mapper = MAPPER.lock();
+    let mapper = mapper.as_ref().expect("memory not initialised");
+    let (phys, offset) = match mapper.translate(VirtAddr::new(virt)) {
+        TranslateResult::Mapped { frame, offset, .. } => (frame.start_address().as_u64(), offset),
+        _ => panic!("copy_into_user_page on an unmapped page"),
+    };
+    let phys_offset = mapper.phys_offset().as_u64();
+    let dst = (phys_offset + phys + offset) as *mut u8;
+    // SAFETY: `dst` is the kernel's supervisor alias of the just-translated
+    // user frame, valid for `bytes.len()` bytes (checked not to cross the
+    // page), and nothing else writes it during the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+}
+
 /// (frames handed out, usable frames total).
 pub fn frame_stats() -> (usize, usize) {
     FRAME_ALLOCATOR

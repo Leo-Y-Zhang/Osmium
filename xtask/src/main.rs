@@ -372,6 +372,10 @@ fn qemu_command(images: &Images, opts: &Opts, headless: bool) -> Result<Command>
         .args(["-serial", "stdio"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-no-reboot")
+        // `-cpu max` exposes SMEP/SMAP/UMIP under TCG; the qemu64 default
+        // hides them, which would silently no-op the kernel's CPUID-gated
+        // hardening and make its self-test vacuous.
+        .args(["-cpu", "max"])
         .args(["-m", &format!("{}M", opts.mem_mb())]);
     if headless {
         cmd.args(["-display", "none"]);

@@ -82,16 +82,21 @@ pub fn run_elf(image: &[u8]) -> Result<u64, ElfError> {
         for page in 0..seg.page_count() {
             crate::memory::map_user_page(seg.vaddr + page * 4096, true, false);
         }
-        // SAFETY: the pages were just mapped writable and cover `memsz`
-        // bytes; the parser bounds-checked `file_start..+filesz` against the
-        // image. The `memsz` tail past `filesz` is BSS, and frames arrive
-        // zeroed, so it is already correct.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                image.as_ptr().add(seg.file_start),
-                seg.vaddr as *mut u8,
-                seg.filesz as usize,
+        // Copy the file-backed bytes page by page through the kernel's
+        // physical alias (SMAP-safe: the loader never touches the user VA).
+        // The parser bounds-checked `file_start..+filesz` against the image.
+        // The `memsz` tail past `filesz` is BSS, and frames arrive zeroed, so
+        // it is already correct.
+        let src = &image[seg.file_start..seg.file_start + seg.filesz as usize];
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let page_off = (seg.vaddr as usize + copied) & 0xfff;
+            let chunk = (4096 - page_off).min(src.len() - copied);
+            crate::memory::copy_into_user_page(
+                seg.vaddr + copied as u64,
+                &src[copied..copied + chunk],
             );
+            copied += chunk;
         }
     }
     // Lock each page to its final W^X permissions (the parser refused any
