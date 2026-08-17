@@ -130,8 +130,11 @@ jobs:
         # shell: bash for pipefail — see the boot-test note.
         shell: bash
         run: cargo xtask test --shipped | tee serial-shipped.log
+      - name: Keystroke-privacy proof (typed input never reaches serial)
+        shell: bash
+        run: cargo xtask privacy | tee serial-privacy.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: serial-shipped
-          path: serial-shipped.log
+          path: serial-*.log

@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write as _};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -72,10 +73,126 @@ fn main() -> Result<()> {
         "build" => build_images(opts.selftest).map(|_| ()),
         "run" => run(&opts),
         "test" => test(&opts),
+        "privacy" => privacy(),
         _ => bail!(
-            "usage: cargo xtask <build|run|test> [--bios|--uefi] [--selftest] [--shipped] [--mem=MB]"
+            "usage: cargo xtask <build|run|test|privacy> [--bios|--uefi] [--selftest] [--shipped] [--mem=MB]"
         ),
     }
+}
+
+/// Behavioural proof of the keystroke-privacy claim: boot the shipped image,
+/// type a sentinel through QEMU's monitor, and drive `shutdown` from the
+/// keyboard. The clean exit is the positive control — it proves the keystrokes
+/// were decoded and the shell ran them — and the serial log containing no
+/// sentinel is the negative one: typed input never reached the serial port.
+fn privacy() -> Result<()> {
+    const SENTINEL: &str = "osmiumsecretzqxj";
+    const MONITOR_PORT: u16 = 55532;
+    let images = build_images(false)?;
+    let mut cmd = Command::new(qemu_program());
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", images.bios.display()))
+        .args(["-serial", "stdio"])
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .arg("-no-reboot")
+        .args(["-m", &format!("{BIOS_TEST_MEM_MB}M")])
+        .args(["-display", "none"])
+        .arg("-monitor")
+        .arg(format!("tcp:127.0.0.1:{MONITOR_PORT},server,nowait"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::null());
+    let start = Instant::now();
+    let mut child = cmd.spawn().context(QEMU_MISSING_HINT)?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&captured);
+    let reader = thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+            print!("{chunk}");
+            io::stdout().flush().ok();
+            sink.lock().unwrap().push_str(&chunk);
+        }
+    });
+
+    // Wait for the shell to come up.
+    while !captured.lock().unwrap().contains(SHIPPED_MARKER) {
+        if child.try_wait()?.is_some() {
+            reader.join().ok();
+            bail!("QEMU exited before the shell was ready");
+        }
+        if start.elapsed() > BOOT_TIMEOUT {
+            child.kill().ok();
+            reader.join().ok();
+            bail!("timed out waiting for the shell");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Drive the keyboard through the monitor: echo the sentinel, then quit.
+    let mut monitor = TcpStream::connect(("127.0.0.1", MONITOR_PORT))
+        .context("connecting to the QEMU monitor")?;
+    send_line_as_keys(&mut monitor, &format!("echo {SENTINEL}"))?;
+    send_line_as_keys(&mut monitor, "shutdown")?;
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() > BOOT_TIMEOUT {
+            child.kill().ok();
+            reader.join().ok();
+            bail!("the shell did not act on the typed 'shutdown' — were the keystrokes delivered?");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    reader.join().ok();
+    let log = captured.lock().unwrap().clone();
+
+    if status.code() != Some(QEMU_EXIT_SUCCESS) {
+        bail!(
+            "typed 'shutdown' did not exit cleanly (code {:?}); the positive control failed",
+            status.code()
+        );
+    }
+    // Strip whitespace before matching: the realistic leak is a per-keystroke
+    // serial print, which would scatter the sentinel across newlines and slip
+    // past a naive `contains` (this exact gap was found by mutation).
+    let after_marker = log.rsplit(SHIPPED_MARKER).next().unwrap_or(&log);
+    let compacted: String = after_marker
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if compacted.contains(SENTINEL) {
+        bail!("the typed sentinel reached the serial log — keystroke privacy is BROKEN");
+    }
+    println!(
+        "\nkeystroke-privacy OK: the shell executed typed input (clean exit) and the \
+         sentinel \"{SENTINEL}\" never reached serial"
+    );
+    Ok(())
+}
+
+/// Maps a lowercase/digit/space line to QEMU `sendkey` tokens and presses it,
+/// leaving time between keys for the keyboard IRQ and the async shell to drain.
+fn send_line_as_keys(monitor: &mut TcpStream, line: &str) -> Result<()> {
+    for c in line.chars() {
+        let token = match c {
+            'a'..='z' | '0'..='9' => c.to_string(),
+            ' ' => "spc".to_string(),
+            other => bail!("sendkey helper only handles lowercase/digit/space, got {other:?}"),
+        };
+        writeln!(monitor, "sendkey {token}")?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    writeln!(monitor, "sendkey ret")?;
+    thread::sleep(Duration::from_millis(100));
+    Ok(())
 }
 
 fn workspace_root() -> PathBuf {
