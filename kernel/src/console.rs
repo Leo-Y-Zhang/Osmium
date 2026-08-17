@@ -106,6 +106,19 @@ pub fn init(display: Display) {
     *CONSOLE.lock() = Some(Console::new(display));
 }
 
+pub fn is_initialised() -> bool {
+    CONSOLE.lock().is_some()
+}
+
+/// Reclaims the console lock on the panic path. The caller must have disabled
+/// interrupts; the previous holder never resumes, so this cannot race.
+pub unsafe fn force_unlock_for_panic() {
+    if CONSOLE.is_locked() {
+        // SAFETY: guaranteed by the caller as documented above.
+        unsafe { CONSOLE.force_unlock() };
+    }
+}
+
 /// Runs `f` with the console if it is initialised. Never called from
 /// interrupt context; do not log inside `f` (the logger takes this lock).
 pub fn with_console<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {

@@ -19,17 +19,17 @@ jobs:
       - run: cargo clippy -p kernel -p kshared --target x86_64-unknown-none --features selftest -- -D warnings
       - run: cargo clippy -p xtask -- -D warnings
 
-  # The kernel must stay free of nightly features; only the image-builder
-  # tooling is allowed to need the pinned nightly.
-  stable-compat:
+  # The kernel is allowed exactly ONE unstable feature: abi_x86_interrupt,
+  # which IDT handlers require. This gate fails the build if any other
+  # nightly feature creeps into kernel or kshared source.
+  feature-allowlist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-none
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo +stable build -p kernel --target x86_64-unknown-none --features selftest
+      - run: |
+          found="$(grep -rho '#!\[feature([^)]*)\]' kernel/src kshared/src | sort -u || true)"
+          echo "unstable features found: ${found:-none}"
+          test "$found" = '#![feature(abi_x86_interrupt)]'
 
   host-tests:
     runs-on: ubuntu-latest

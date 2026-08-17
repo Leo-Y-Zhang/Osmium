@@ -1,8 +1,14 @@
 #![no_std]
 #![no_main]
+// The kernel's ONE allowed unstable feature: the x86-interrupt calling
+// convention for IDT handlers (still feature-gated on stable rustc). CI's
+// feature-allowlist job fails if anything else joins it.
+#![feature(abi_x86_interrupt)]
 
 mod console;
 mod framebuffer;
+mod gdt;
+mod interrupts;
 mod logger;
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 mod qemu;
@@ -30,21 +36,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Split the borrow once; later milestones take the memory map from here.
     let BootInfo { framebuffer, .. } = boot_info;
-    let framebuffer = framebuffer
-        .as_mut()
-        .expect("bootloader provided no framebuffer");
-    let info = framebuffer.info();
-    console::init(framebuffer::Display::new(framebuffer));
+    // No framebuffer is a degraded boot, not a dead one: run serial-only.
+    let fb_info = match framebuffer.as_mut() {
+        Some(fb) => {
+            let info = fb.info();
+            console::init(framebuffer::Display::new(fb));
+            Some(info)
+        }
+        None => None,
+    };
     logger::init();
 
     log::info!("Osmium v{}", env!("CARGO_PKG_VERSION"));
+    match fb_info {
+        Some(info) => log::info!(
+            "framebuffer: {}x{} px, {:?}, stride {}, {} B/px",
+            info.width,
+            info.height,
+            info.pixel_format,
+            info.stride,
+            info.bytes_per_pixel
+        ),
+        None => log::warn!("bootloader provided no framebuffer; running serial-only"),
+    }
+
+    gdt::init();
+    interrupts::init();
     log::info!(
-        "framebuffer: {}x{} px, {:?}, stride {}, {} B/px",
-        info.width,
-        info.height,
-        info.pixel_format,
-        info.stride,
-        info.bytes_per_pixel
+        "gdt+tss loaded, interrupts enabled (PIT {} Hz)",
+        interrupts::TICK_HZ
     );
 
     #[cfg(feature = "selftest")]
@@ -74,11 +94,11 @@ fn panic(info: &PanicInfo) -> ! {
     serial_println!("*** KERNEL PANIC ***");
     serial_println!("{info}");
 
-    // try_lock: if the console lock is held we lose the on-screen report but
-    // keep the serial one, instead of deadlocking.
-    if let Some(mut guard) = console::CONSOLE.try_lock()
-        && let Some(console) = guard.as_mut()
-    {
+    // SAFETY: same argument as the serial lock — this path never returns, so
+    // a previous holder can never resume; reclaiming keeps the panic screen
+    // from being silently lost (the App Flow's "never a silent hang" rule).
+    unsafe { console::force_unlock_for_panic() };
+    if let Some(console) = console::CONSOLE.lock().as_mut() {
         use core::fmt::Write;
         console.set_color(framebuffer::DANGER);
         let _ = writeln!(console, "\n*** KERNEL PANIC ***\n{info}");
