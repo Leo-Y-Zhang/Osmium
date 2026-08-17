@@ -7,6 +7,7 @@ use crate::serial_println;
 pub fn run() -> ! {
     serial_println!("[selftest] boot: reached kernel_main ... ok");
     console_renders_and_advances();
+    console_pixels_reach_the_framebuffer();
     breakpoint_handled_and_returns();
     idt_has_all_installed_vectors();
     timer_ticks_advance();
@@ -456,6 +457,24 @@ fn timer_ticks_advance() {
         x86_64::instructions::hlt();
     }
     panic!("PIT ticks did not advance; PIC/PIT wiring is broken");
+}
+
+/// The cursor test above proves the bookkeeping; this proves pixels. Without
+/// it the whole rendering path is mutation-blind — deleting the buffer write
+/// in `set_pixel` or swapping the Bgr channel arm passes every other check.
+fn console_pixels_reach_the_framebuffer() {
+    if !crate::console::is_initialised() {
+        serial_println!("[selftest] console: pixel probe skipped, no framebuffer");
+        return;
+    }
+    let ok = crate::console::with_console(|c| c.pixel_probe()).unwrap_or(false);
+    assert!(
+        ok,
+        "a drawn glyph did not reach the framebuffer, or a colour landed in the wrong channel"
+    );
+    serial_println!(
+        "[selftest] console: glyph pixels reach the framebuffer, correct channel ... ok"
+    );
 }
 
 fn console_renders_and_advances() {

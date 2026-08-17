@@ -76,6 +76,62 @@ impl Console {
         }
     }
 
+    /// Proves the rendering path actually touches the framebuffer, not just
+    /// the cursor bookkeeping (which advances whether or not a pixel is
+    /// written). Returns true iff: a dense glyph drawn at a cell changes some
+    /// pixel inside that cell; a pixel three cells away stays background (a
+    /// stride/column error would spill there); and an ACCENT pixel's first
+    /// framebuffer byte matches the negotiated format's channel order (a
+    /// swapped Rgb/Bgr arm writes the wrong byte). ACCENT has distinct R and
+    /// B, so the last check discriminates the swap that a grey glyph cannot.
+    #[cfg(feature = "selftest")]
+    pub fn pixel_probe(&mut self) -> bool {
+        use crate::framebuffer::{ACCENT, BACKGROUND, FOREGROUND};
+        use bootloader_api::info::PixelFormat;
+        self.display.clear(BACKGROUND);
+        let mut bg = [0u8; 8];
+        let bg_len = match self.display.pixel_bytes(BORDER, BORDER) {
+            Some(b) => {
+                bg[..b.len()].copy_from_slice(b);
+                b.len()
+            }
+            None => return false,
+        };
+        let bg = &bg[..bg_len];
+
+        // A dense glyph in cell (0,0): some pixel inside must differ from bg.
+        self.draw_cell(0, 0, '#', FOREGROUND, BACKGROUND);
+        let mut inside_differs = false;
+        for dy in 0..RASTER_HEIGHT.val() {
+            for dx in 0..self.char_width {
+                if self.display.pixel_bytes(BORDER + dx, BORDER + dy) != Some(bg) {
+                    inside_differs = true;
+                }
+            }
+        }
+        // Three cells to the right, nothing was drawn: still background.
+        let outside_bg = self
+            .display
+            .pixel_bytes(BORDER + self.char_width * 3, BORDER)
+            == Some(bg);
+
+        // Colour fidelity: an ACCENT pixel's first byte is R under Rgb, B
+        // under Bgr — a swapped arm fails exactly here.
+        self.display.set_pixel(BORDER, BORDER, ACCENT);
+        let first = self
+            .display
+            .pixel_bytes(BORDER, BORDER)
+            .and_then(|b| b.first().copied());
+        let colour_ok = match self.display.info.pixel_format {
+            PixelFormat::Rgb => first == Some(ACCENT.r),
+            PixelFormat::Bgr => first == Some(ACCENT.b),
+            // U8/Unknown/other layouts have no simple invariant here; the
+            // presence + placement checks above still apply, so pass this leg.
+            _ => true,
+        };
+        inside_differs && outside_bg && colour_ok
+    }
+
     /// Clears the whole screen and homes the cursor.
     pub fn clear_screen(&mut self) {
         self.display.clear(BACKGROUND);

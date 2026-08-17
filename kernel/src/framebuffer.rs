@@ -93,6 +93,20 @@ impl Display {
         }
     }
 
+    /// The raw framebuffer bytes of the pixel at `(x, y)`, in the negotiated
+    /// layout — selftest plumbing so the battery can prove a glyph actually
+    /// reached the framebuffer (cursor bookkeeping alone updates whether or
+    /// not any pixel was written). Returns `None` out of bounds.
+    #[cfg(feature = "selftest")]
+    pub fn pixel_bytes(&self, x: usize, y: usize) -> Option<&[u8]> {
+        if x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+        let bpp = self.info.bytes_per_pixel;
+        let offset = (y * self.info.stride + x) * bpp;
+        self.buffer.get(offset..offset + bpp)
+    }
+
     pub fn set_pixel(&mut self, x: usize, y: usize, color: Rgb) {
         if x >= self.info.width || y >= self.info.height {
             return;
