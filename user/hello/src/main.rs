@@ -43,6 +43,15 @@ fn syscall(nr: u64, a0: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
+    // Set EFLAGS.AC (bit 18) — a program hostile to the kernel's SMAP: if the
+    // kernel did not scrub AC at the syscall gate, SMAP would be inert for the
+    // whole kernel entry. Harmless in ring 3 (CR0.AM is clear, so no alignment
+    // faults), and the kernel's self-test asserts it observed AC already
+    // cleared. SAFETY: pushfq/popfq only toggle a flag; no memory effect.
+    unsafe {
+        core::arch::asm!("pushfq", "or dword ptr [rsp], 0x40000", "popfq");
+    }
+
     // Prove the data segment is real and writable: volatile read, then a
     // volatile write-back (a read-only .data mapping faults here).
     // SAFETY: raw-pointer access to our own static; no references are formed.

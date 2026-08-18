@@ -202,6 +202,22 @@ unsafe extern "C" fn jump_to_user(user_rip: u64, user_rsp: u64, user_cs: u64, us
 #[unsafe(naked)]
 unsafe extern "C" fn int80_entry() {
     core::arch::naked_asm!(
+        // Clear EFLAGS.AC first. An interrupt/trap gate clears IF, TF, NT, RF
+        // and VM — but NOT AC, which ring 3 can set with `popfq`. SMAP only
+        // suppresses supervisor accesses to user pages while AC == 0, so a
+        // ring-3 program that left AC set would turn SMAP off for the whole
+        // kernel entry (this handler and every IRQ/exception taken while it
+        // runs). We clear it in the portable form — `and` a sign-extended
+        // imm32 that zeroes bit 18 — rather than `clac`, which is #UD on a CPU
+        // without SMAP (the hardware funnel invites pre-Haswell machines).
+        // IF is already 0 from the gate, so popfq cannot re-enable interrupts.
+        "pushfq",
+        // AC is bit 18, in the low dword of the pushed RFLAGS; masking just the
+        // dword keeps the immediate within imm32 range (a qword AND would need
+        // a sign-extended imm32 that 0xFFFBFFFF is not). The high dword of
+        // RFLAGS is reserved zero, so leaving it untouched is correct.
+        "and dword ptr [rsp], 0xFFFBFFFF",
+        "popfq",
         // The interrupt gate clears IF but NOT DF; SysV requires DF=0 at a call
         // boundary, so clear it before any Rust code runs.
         "cld",
@@ -244,7 +260,21 @@ unsafe extern "C" fn int80_entry() {
     )
 }
 
+/// Records whether `EFLAGS.AC` was still set when the kernel reached the
+/// syscall dispatcher — proof that the AC scrub in `int80_entry` ran. The demo
+/// program sets AC before its `SYS_WRITE`; with the scrub this reads false,
+/// without it, true.
+#[cfg(feature = "selftest")]
+pub static SYSCALL_ENTRY_AC: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 extern "C" fn syscall_dispatch(nr: u64, a0: u64, _a1: u64) -> u64 {
+    #[cfg(feature = "selftest")]
+    {
+        use x86_64::registers::rflags::{self, RFlags};
+        let ac = rflags::read().contains(RFlags::ALIGNMENT_CHECK);
+        SYSCALL_ENTRY_AC.store(ac, Ordering::SeqCst);
+    }
     match nr {
         SYS_WRITE => {
             // Kernel-mediated output on behalf of the user program. This byte

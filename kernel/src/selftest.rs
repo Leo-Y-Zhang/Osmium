@@ -406,6 +406,15 @@ fn user_program_runs_in_ring3() {
     serial_println!(
         "[selftest] usermode: hello ELF ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
     );
+
+    // hello set EFLAGS.AC before its SYS_WRITE; the kernel must have scrubbed
+    // it at the int 0x80 gate, or SMAP was inert for the whole kernel entry.
+    use core::sync::atomic::Ordering;
+    assert!(
+        !crate::usermode::SYSCALL_ENTRY_AC.load(Ordering::SeqCst),
+        "EFLAGS.AC survived the syscall gate: ring 3 can turn SMAP off"
+    );
+    serial_println!("[selftest] security: syscall gate scrubs EFLAGS.AC (SMAP stays on) ... ok");
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both
