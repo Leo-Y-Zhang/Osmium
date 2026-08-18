@@ -83,13 +83,13 @@ interrupt-context deadlocks.
 | `SCANCODE_QUEUE` | `Once<ArrayQueue<u8>>`, capacity 128 | M4; the queue's storage is allocated on the first `ScancodeStream::new()`, in task context | Lock-free queue, `Once` for the one-time construction | **Yes** — the sole IRQ-to-task channel. The handler pushes and never blocks or allocates. A full queue drops the byte that has just arrived — the newest, not the oldest — and nothing counts the loss. Scancodes arriving before the queue exists are dropped for the same reason: nobody is typing during early boot. |
 | `WAKER` | `AtomicWaker` | M4 | Its own atomics | **Yes** — the keyboard handler wakes the shell task through it after a successful push. See the `ALLOCATOR` row for the one drop that entails. |
 | `SERIAL1` | `SerialPort` at `0x3F8` | M1 | `spin::Mutex`, taken with a plain `lock` | **No.** Handlers never write to serial at all. The single exception is the double-fault handler on its terminal path, which disables interrupts and reclaims the lock before printing, because the holder it interrupted can never resume. |
-| `CONSOLE` | `Option<Console>`: glyph renderer writing straight to the framebuffer | M1 | `spin::Mutex` | **Never from an asynchronous IRQ** — the hard rule below. The `int 0x80` syscall dispatcher writes `SYS_WRITE` output to the console, but that is a *synchronous* trap from the running task (IF=0 for its duration — the timer cannot preempt a syscall mid-write), not a preempting interrupt; `run_programs` `debug_assert`s the caller does not hold the lock across a run, so it cannot deadlock. |
+| `CONSOLE` | `Option<Console>`: glyph renderer writing straight to the framebuffer | M1 | `spin::Mutex` | **Never from an asynchronous IRQ** — the hard rule below. The `int 0x80` syscall dispatcher writes `SYS_WRITE` output to the console, but that is a *synchronous* trap from the running task (IF=0 for its duration — the timer cannot preempt a syscall mid-write), not a preempting interrupt; `run_programs` `assert`s (a real assert — see the note under the concurrency rule) the caller does not hold the lock across a run, so it cannot deadlock. |
 | `ALLOCATOR` | Zeroing wrapper over `LockedHeap` | M3 | `spin::Mutex` inside the heap | **Never allocates from IRQ, and frees from it only in a case that cannot arise.** The keyboard handler's `WAKER.wake()` consumes a cloned `Waker` and drops its `Arc<TaskWaker>`; a *last* drop would deallocate here, in interrupt context, against a lock the interrupted code may hold. It is never the last, and the condition is worth stating because the code depends on it: the executor's `waker_cache` holds a reference for as long as the task exists, and the shell task never completes. A woken task that can finish would break this row, so this row changes before that code does. |
 | `MAPPER`, `FRAME_ALLOCATOR` | `Option<OffsetPageTable>`, `Option<BootFrameAllocator>` | M3 | `spin::Mutex` | No |
 | `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
 | `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition taken outside a scheduler run (TSS RSP0's default target) | Yes, by hardware |
 | `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `sched::enter_tasks` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's run-complete path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_tasks`, which always writes it first |
-| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; `debug_assert`s pin the discipline. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
+| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; real `assert!`s pin the discipline in every build. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
 | `TIMER_ENTRY_AC` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M8 | Atomic, `SeqCst` | **Yes** — set by the timer's Rust half if `EFLAGS.AC` survived the naked entry's scrub; the battery asserts it never did while a hostile program held AC set |
 | `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
 | `CYCLES_PER_MS` | `AtomicU64`, `#[cfg(feature = "selftest")]` only | `time::calibrate`, battery builds only | Atomic, `Relaxed` | No |
@@ -115,6 +115,30 @@ contexts only when the interrupted CS's CPL is 3. Preempting kernel code would
 invalidate the paragraph above (any lock could then be interrupted mid-hold and
 re-entered), for no benefit a two-task round-robin needs — every kernel path here
 is short. If kernel preemption is ever wanted, this section is rewritten first.
+
+**The invariant checks are real `assert!`s, not `debug_assert!`s — a same-day
+adversarial-review finding.** The kernel is only ever built `--release`
+(`xtask::build_kernel` hard-codes it, and no `[profile.release]
+debug-assertions` override exists), so a `debug_assert` is dead code in every
+artifact CI boots or a person runs — the M8 commit initially shipped all seven
+discipline checks (RSP0-with-IF-off, install/collect/sys_exit state, the
+console-lock deadlock tripwire) in exactly that inert form, verified by string
+absence in the built binary. All seven are now real asserts, and the rule is
+general: **in this repository a `debug_assert` proves nothing, because no
+debug build exists.** The timer path additionally carries an always-on layout
+tripwire: the saved CS read at `SAVED_CS_OFFSET` must equal the kernel or user
+code selector on every tick, so a re-ordered save sequence or a wrong offset
+(SS also reads as CPL 3) panics on the first tick instead of silently
+mis-gating the switch.
+
+**One check that IS unreachable-as-false today, stated so nobody mistakes it
+for tested:** the CPL-3 gate in `timer_tick` cannot currently be observed
+failing, because while the scheduler is active every kernel path runs with
+IF=0 (gates clear it; the launcher holds a cli window), so no ring-0 tick can
+arrive to take the wrong branch. It is defense-in-depth for the day a kernel
+path re-enables interrupts mid-run, and the CS-selector tripwire above pins
+the offset it depends on. Deleting the gate changes no observable behaviour
+today; that is a property of the design, recorded rather than discovered.
 
 ### Correction to the original plan: three memory-design decisions
 
@@ -302,7 +326,13 @@ renders `help`'s full output; a crafted W+X ELF image is refused; the embedded
 launched first and `hello` second, asserting hello exits first, ≥1 preemptive
 switch and ≥2 ring-3 timer round-trips were taken, counter's exit checksum equals
 the kernel's independent recomputation (register integrity across every switch),
-and the timer entry's AC scrub was never seen defeated; two programs claiming the
+and the timer entry's AC scrub was never seen defeated; the sustained-rotation
+proof — the same counter linked at two bases and scheduled against itself, so
+both tasks outlive many quanta: task 0 (identical work, first quantum) must
+exit first, both checksums must be exact across dozens of
+descheduled-and-resumed cycles, and ≥4 preemptive switches must be counted (the
+counter+hello scenario inherently sees exactly one switch, which a
+rotate-once scheduler satisfied); two programs claiming the
 same pages are refused with nothing mapped; the page-table audit again, AFTER
 the ring-3 teardown (covering the concurrent run too); `update_user_page` narrows
 W and NX correctly (the W^X
@@ -523,6 +553,13 @@ must be seen to break it.
   fails); zero the preempted task's saved `rbx` at the moment of a switch (the
   checksum-equality assertion fails with "a context switch corrupted its
   registers" — one register, one switch, caught).
+- *Mutation, M8 adversarial-review round (all three observed failing
+  2026-08-18):* preempt once then pin forever (the two-counter exit-order
+  assertion fails with "rotation stopped" — the mutation the original battery
+  could not see); point `SAVED_CS_OFFSET` at the saved SS (the CS-selector
+  tripwire panics on the first tick, `saved CS 0x10`); degrade
+  `plans_overlap` to `ra.start == rb.start` (the host partial-overlap test
+  fails — the battery's identical-images case alone could not see it).
 
 **Build gates**
 

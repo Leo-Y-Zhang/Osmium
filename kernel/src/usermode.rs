@@ -72,9 +72,15 @@ pub(crate) const USER_STACK_ADDR: u64 = USER_STACK_ADDRS[0];
 pub const MAX_TASKS: usize = USER_STACK_ADDRS.len();
 
 /// The embedded user programs: real linker-scripted Rust ELFs built from
-/// `user/hello` and `user/counter` by the kernel's build script.
+/// `user/hello` and `user/counter` by the kernel's build script. The battery
+/// additionally embeds the SAME counter source linked at a second base
+/// (`link_alt.ld`), so two unyielding programs can be scheduled against each
+/// other — the sustained-round-robin proof needs two tasks that both outlive
+/// many quanta, and no pair of distinct programs here does that.
 static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("COUNTER_ELF"));
+#[cfg(feature = "selftest")]
+static COUNTER_ALT_ELF: &[u8] = include_bytes!(env!("COUNTER_ALT_ELF"));
 
 /// The `int 0x80` entry, as a raw address for the IDT gate (installed at DPL 3
 /// in `interrupts.rs` so ring 3 may issue the instruction).
@@ -104,6 +110,15 @@ pub fn run_hello_twice() -> Result<RunReport, ElfError> {
     run_programs(&[HELLO_ELF, HELLO_ELF])
 }
 
+/// Two unyielding compute programs — the same counter source at two disjoint
+/// bases — scheduled against each other for the battery's sustained
+/// round-robin proof: neither ever yields, so every quantum boundary for the
+/// whole run is a timer-driven switch to the other task.
+#[cfg(feature = "selftest")]
+pub fn run_two_counters() -> Result<RunReport, ElfError> {
+    run_programs(&[COUNTER_ELF, COUNTER_ALT_ELF])
+}
+
 /// Parses, maps, schedules and tears down up to [`MAX_TASKS`] static ELF64
 /// user programs. Refusal happens before anything is mapped: every image must
 /// parse (`kshared::elf`, refusal-by-default), and no two images may claim
@@ -119,7 +134,11 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
     // would deadlock against it. All callers (the `user`/`sched` shell
     // commands and the battery) call this outside any `with_console`; this
     // pins that.
-    debug_assert!(
+    // A real assert (the kernel is only ever built --release, where a
+    // debug_assert is dead code): with the lock held, a task's SYS_WRITE
+    // would spin forever behind an interrupt gate — an undiagnosable silent
+    // hang, which is exactly what this turns into a named panic.
+    assert!(
         !crate::console::CONSOLE.is_locked(),
         "run_programs called while the console lock is held; SYS_WRITE would deadlock"
     );
@@ -129,18 +148,13 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
         plans.push(kshared::elf::parse_elf64(image)?);
     }
     // Cross-image page overlap: the parser checks segments within one image;
-    // this is the same check across images, and it must pass before any page
-    // is mapped so a refused run leaves nothing behind.
+    // `kshared::elf::plans_overlap` is the same interval test across images
+    // (host-tested there, partial-overlap cases included), and it must pass
+    // before any page is mapped so a refused run leaves nothing behind.
     for (i, a) in plans.iter().enumerate() {
         for b in plans.iter().skip(i + 1) {
-            for sa in a.segments() {
-                let ra = sa.vaddr..sa.vaddr + sa.page_count() * 4096;
-                for sb in b.segments() {
-                    let rb = sb.vaddr..sb.vaddr + sb.page_count() * 4096;
-                    if ra.start < rb.end && rb.start < ra.end {
-                        return Err(ElfError::Overlap);
-                    }
-                }
+            if kshared::elf::plans_overlap(a, b) {
+                return Err(ElfError::Overlap);
             }
         }
     }

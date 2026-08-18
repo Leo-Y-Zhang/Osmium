@@ -132,6 +132,23 @@ fn le_u64(image: &[u8], off: usize) -> Result<u64, ElfError> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// True iff any page of `a`'s segments overlaps any page of `b`'s — the
+/// cross-image form of the parser's own per-image overlap check, used by the
+/// kernel before mapping two programs into one address space. Page-granular,
+/// like the mapping itself: two segments that avoid each other's bytes but
+/// share a page still collide. Kept here (pure, host-tested — including the
+/// partial-overlap cases an identity comparison would miss) rather than in
+/// the kernel, where no host test can reach it.
+pub fn plans_overlap(a: &LoadPlan, b: &LoadPlan) -> bool {
+    a.segments().iter().any(|sa| {
+        let ra = sa.vaddr..sa.vaddr + sa.page_count() * PAGE_SIZE;
+        b.segments().iter().any(|sb| {
+            let rb = sb.vaddr..sb.vaddr + sb.page_count() * PAGE_SIZE;
+            ra.start < rb.end && rb.start < ra.end
+        })
+    })
+}
+
 /// Parses and validates a static ELF64 executable for the user window.
 pub fn parse_elf64(image: &[u8]) -> Result<LoadPlan, ElfError> {
     if image.len() < 64 {
@@ -421,5 +438,36 @@ mod tests {
         // One huge BSS: 65 pages of memsz against the 64-page budget.
         let img = build_image(&[(USER_IMAGE_BASE, 0, 65 * 4096, PF_W | 4)]);
         assert!(matches!(parse_elf64(&img), Err(ElfError::TooManyPages)));
+    }
+
+    /// The cross-image overlap predicate must be an interval test, not an
+    /// identity test: the identical case is the easy one, and a degenerate
+    /// `a.start == b.start` comparison passes it while missing every partial
+    /// overlap. Each case here would catch that mutation.
+    #[test]
+    fn plans_overlap_is_an_interval_test_not_an_identity_test() {
+        let plan =
+            |segs: &[(u64, u64, u64, u32)]| parse_elf64(&build_image(segs)).expect("valid image");
+        let a = plan(&[(USER_IMAGE_BASE, 64, 2 * 4096, PF_X | 4)]); // pages 0-1
+        // Identical images overlap.
+        assert!(plans_overlap(&a, &a));
+        // Partial overlap at a DIFFERENT base: b starts inside a's last page.
+        let b = plan(&[(USER_IMAGE_BASE + 4096, 64, 2 * 4096, PF_X | 4)]); // pages 1-2
+        assert!(plans_overlap(&a, &b));
+        assert!(plans_overlap(&b, &a), "the predicate must be symmetric");
+        // b's memsz tail (not its filesz) rounds into a's first page.
+        let c = plan(&[
+            (USER_IMAGE_BASE + 2 * 4096, 64, 4096, PF_X | 4), // page 2 only
+            (USER_IMAGE_BASE + 3 * 4096, 8, 2 * 4096, PF_W | 4), // pages 3-4 via BSS
+        ]);
+        let d = plan(&[(USER_IMAGE_BASE + 4 * 4096, 64, 4096, PF_X | 4)]); // page 4
+        assert!(
+            plans_overlap(&c, &d),
+            "a BSS page-rounded tail still collides"
+        );
+        // Adjacent but disjoint pages do NOT overlap.
+        let e = plan(&[(USER_IMAGE_BASE + 5 * 4096, 64, 4096, PF_X | 4)]); // page 5
+        assert!(!plans_overlap(&d, &e));
+        assert!(!plans_overlap(&a, &d));
     }
 }

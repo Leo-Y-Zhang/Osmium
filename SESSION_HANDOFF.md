@@ -37,6 +37,21 @@ switch between ring-3 tasks. Nothing is in flight and nothing is owed.
   interleave); `cargo xtask privacy` types it, so the serial-silence allowlist
   covers the scheduler path; CI's input-path grep gate covers `sched.rs`.
 
+## Same-day adversarial review (15-agent fleet), 6 findings fixed
+
+Three lenses (security / concurrency / test-strength) + a skeptic per finding;
+6 of 12 findings survived and all are fixed, each fix observed failing first:
+every M8 `debug_assert!` was dead code (the kernel only ever builds
+`--release`; all seven are real `assert!`s now — repo rule: a `debug_assert`
+here proves nothing); the battery could not see a rotate-once scheduler (new
+sustained-rotation proof: the same counter linked at two bases scheduled
+against itself, exit order + ≥4-switch floor); `SAVED_CS_OFFSET` was asserted
+by comment (new always-on CS-selector tripwire on every tick); the cross-image
+overlap check was only ever shown identical images (predicate moved to
+`kshared::elf::plans_overlap` with partial-overlap host tests). The CPL-3
+gate remains deliberately untestable-as-false (documented in the TDD — while
+the scheduler is active no kernel path runs with IF=1).
+
 ## Roadmap (PRD Won't-list, unchanged)
 
 Per-task address spaces (tasks are isolated from the kernel, not yet from each

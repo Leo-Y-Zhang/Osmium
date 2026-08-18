@@ -24,6 +24,7 @@ pub fn run() -> ! {
     elf_loader_refuses_wx();
     user_program_runs_in_ring3();
     preemptive_scheduling_is_real();
+    round_robin_is_sustained();
     concurrent_overlap_is_refused();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
@@ -487,6 +488,56 @@ fn preemptive_scheduling_is_real() {
     );
     serial_println!(
         "[selftest] security: timer entry scrubs EFLAGS.AC (SMAP holds under preemption) ... ok"
+    );
+}
+
+/// The sustained-rotation proof an adversarial review demanded: the
+/// counter+hello scenario above inherently sees exactly ONE preemptive
+/// switch (hello exits at its first quantum), so a scheduler that rotates
+/// once and then pins — or that only ever preempts task 0 — passed it.
+/// Here the SAME counter program, linked at two disjoint bases, is scheduled
+/// against itself: two unyielding tasks alive for many quanta each.
+///
+/// - **Exit order pins sustained rotation.** The programs do identical work
+///   and task 0 runs its quantum first, so under genuine round-robin task 0
+///   stays strictly ahead and exits FIRST. A rotate-once (or task-0-only)
+///   scheduler parks task 1 with the CPU until it finishes, inverting the
+///   order. (Mutation observed: preempt-once-then-pin flipped it.)
+/// - **The switch floor proves rotation kept happening** — with both tasks
+///   compute-bound, nearly every ring-3 tick while both live is a switch to
+///   the other task; under TCG that is dozens, and 4 is the floor.
+/// - **Both checksums exact** extends the register-integrity proof to a task
+///   that is descheduled AND rescheduled dozens of times mid-computation
+///   (hello's single quantum never exercised a resume-after-preemption).
+fn round_robin_is_sustained() {
+    let report = crate::usermode::run_two_counters()
+        .expect("an embedded counter ELF was refused for the two-counter run");
+    let first = &report.exits[0];
+    let second = &report.exits[1];
+    assert_eq!(
+        (first.seq, second.seq),
+        (0, 1),
+        "task 0 (identical work, first quantum) did not exit first: rotation stopped"
+    );
+    let expected = expected_counter_checksum();
+    assert_eq!(
+        first.code, expected,
+        "counter A's checksum is wrong across sustained preemption"
+    );
+    assert_eq!(
+        second.code, expected,
+        "counter B's checksum is wrong across sustained preemption"
+    );
+    assert!(
+        report.preemptive_switches >= 4,
+        "only {} preemptive switches across two long-lived tasks: rotation is not sustained",
+        report.preemptive_switches
+    );
+    serial_println!(
+        "[selftest] sched: round-robin sustained across two unyielding tasks \
+         ({} switches, {} round-trips), both checksums exact ... ok",
+        report.preemptive_switches,
+        report.ring3_round_trips
     );
 }
 

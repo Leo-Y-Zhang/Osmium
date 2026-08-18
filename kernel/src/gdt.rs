@@ -118,7 +118,10 @@ pub fn selectors() -> &'static Selectors {
 /// ring 3 between the switch decision and this write would land on the wrong
 /// stack.
 pub fn set_privilege_stack(top: VirtAddr) {
-    debug_assert!(
+    // A real assert, not a debug_assert: the kernel is only ever built
+    // --release (xtask always passes it), where debug_asserts are dead code —
+    // and this is the check that keeps a ring-3 trap off the wrong stack.
+    assert!(
         !x86_64::instructions::interrupts::are_enabled(),
         "RSP0 rewritten with interrupts enabled"
     );

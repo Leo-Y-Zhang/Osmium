@@ -10,18 +10,23 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    build_user_program("hello", "HELLO_ELF");
-    build_user_program("counter", "COUNTER_ELF");
+    build_user_program("hello", "link.ld", "HELLO_ELF");
+    build_user_program("counter", "link.ld", "COUNTER_ELF");
+    // The same counter source at a second base (see link_alt.ld): the battery
+    // schedules two unyielding programs against each other, and linking one
+    // source twice is how it gets two of them. Built unconditionally (a few
+    // KiB); only the selftest build embeds it.
+    build_user_program("counter", "link_alt.ld", "COUNTER_ALT_ELF");
 }
 
-fn build_user_program(name: &str, env_var: &str) {
+fn build_user_program(name: &str, link_script_name: &str, env_var: &str) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let crate_dir = manifest_dir
         .parent()
         .expect("kernel lives one level below the workspace root")
         .join("user")
         .join(name);
-    for tracked in ["src/main.rs", "Cargo.toml", "link.ld"] {
+    for tracked in ["src/main.rs", "Cargo.toml", link_script_name] {
         println!(
             "cargo:rerun-if-changed={}",
             crate_dir.join(tracked).display()
@@ -29,9 +34,11 @@ fn build_user_program(name: &str, env_var: &str) {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target_dir = out_dir.join(format!("{name}-target"));
+    // The target dir is keyed on the env var, not just the crate: the same
+    // crate built under two linker scripts must not share build caches.
+    let target_dir = out_dir.join(format!("{}-target", env_var.to_lowercase()));
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let link_script = crate_dir.join("link.ld");
+    let link_script = crate_dir.join(link_script_name);
     let status = Command::new(&cargo)
         .arg("build")
         .arg("--release")

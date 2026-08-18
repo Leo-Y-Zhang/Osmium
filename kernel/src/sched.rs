@@ -30,8 +30,9 @@
 //!   spinlock touched from the timer handler and the `int 0x80` exit path
 //!   (both run with IF=0, interrupt gates) and from the launcher (which
 //!   disables interrupts around install/collect). On this single-core kernel
-//!   that makes contention impossible rather than merely handled; the
-//!   `debug_assert`s pin the discipline.
+//!   that makes contention impossible rather than merely handled; real
+//!   `assert!`s pin the discipline in every build (the kernel only ever
+//!   builds --release, where a `debug_assert` is dead code).
 //! - **`EFLAGS.AC` is scrubbed at every kernel entry ring 3 controls.** An
 //!   interrupt gate clears IF/TF/NT/RF/VM but NOT AC, and SMAP is inert while
 //!   AC is set. The syscall gate has scrubbed AC since M7; the timer entry
@@ -153,7 +154,10 @@ pub struct RunReport {
 /// is fine in the launcher's context and forbidden in the timer's — which is
 /// why the table is fully built here and only indexed there.
 pub fn install(entries: &[(u64, u64)]) -> u64 {
-    debug_assert!(
+    // Real asserts throughout this module, not debug_asserts: the kernel is
+    // only ever built --release, where a debug_assert is dead code — a lesson
+    // an adversarial review of M8 landed the same day the milestone did.
+    assert!(
         !x86_64::instructions::interrupts::are_enabled(),
         "scheduler installed with interrupts enabled"
     );
@@ -175,7 +179,7 @@ pub fn install(entries: &[(u64, u64)]) -> u64 {
     }
 
     let mut sched = SCHED.lock();
-    debug_assert!(!sched.active, "scheduler installed while already active");
+    assert!(!sched.active, "scheduler installed while already active");
     sched.tasks = tasks;
     sched.current = 0;
     sched.active = true;
@@ -192,12 +196,12 @@ pub fn install(entries: &[(u64, u64)]) -> u64 {
 /// task table frees each kernel stack, and the allocator's zero-on-free scrub
 /// means a dead task's saved registers do not linger in the heap.
 pub fn collect() -> RunReport {
-    debug_assert!(
+    assert!(
         !x86_64::instructions::interrupts::are_enabled(),
         "scheduler results collected with interrupts enabled"
     );
     let mut sched = SCHED.lock();
-    debug_assert!(!sched.active, "collect() while the scheduler is active");
+    assert!(!sched.active, "collect() while the scheduler is active");
     let tasks = core::mem::take(&mut sched.tasks);
     RunReport {
         exits: tasks
@@ -337,6 +341,19 @@ extern "C" fn timer_tick(rsp: u64) -> u64 {
     // SAFETY: `rsp` is the just-saved context timer_entry built; the CPU
     // frame sits at the documented fixed offset above the 15 saved registers.
     let saved_cs = unsafe { *((rsp + SAVED_CS_OFFSET) as *const u64) };
+    // Layout tripwire, live in every build on every tick: the only code
+    // selectors an interrupt frame can carry are the kernel's and the user's,
+    // so anything else here means SAVED_CS_OFFSET no longer points at CS —
+    // e.g. a re-ordered push sequence would land on a saved register or SS,
+    // some of which also read as CPL 3 and would silently mis-gate the
+    // switch. (An adversarial review found the offset was otherwise asserted
+    // by comment alone.)
+    let sel = crate::gdt::selectors();
+    assert!(
+        saved_cs == u64::from(sel.kernel_code.0) || saved_cs == u64::from(sel.user_code.0),
+        "saved CS {saved_cs:#x} is neither the kernel nor the user code selector: \
+         the saved-context layout is broken"
+    );
     if saved_cs & 3 != 3 {
         return rsp;
     }
@@ -369,7 +386,7 @@ extern "C" fn timer_tick(rsp: u64) -> u64 {
 /// launcher continuation.
 pub extern "C" fn sys_exit(code: u64) -> u64 {
     let mut sched = SCHED.lock();
-    debug_assert!(sched.active, "SYS_EXIT outside a scheduler run");
+    assert!(sched.active, "SYS_EXIT outside a scheduler run");
     let cur = sched.current;
     sched.tasks[cur].ready = false;
     sched.tasks[cur].exit_code = code;
