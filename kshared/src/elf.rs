@@ -97,9 +97,15 @@ pub enum ElfError {
     EntryNotExecutable,
 }
 
+// The `off.checked_add(N)` matters: `off` derives from a fully attacker-
+// controlled `e_phoff`, and `off + N` would wrap in a release build (overflow
+// checks off) — producing `start > end`, which `slice::get` rejects — but
+// PANIC in a debug/test build. checked_add makes the refusal profile-
+// independent so a future fuzz harness over `parse_elf64` cannot trip a panic.
 fn le_u16(image: &[u8], off: usize) -> Result<u16, ElfError> {
+    let end = off.checked_add(2).ok_or(ElfError::Truncated)?;
     let b = image
-        .get(off..off + 2)
+        .get(off..end)
         .ok_or(ElfError::Truncated)?
         .try_into()
         .map_err(|_| ElfError::Truncated)?;
@@ -107,8 +113,9 @@ fn le_u16(image: &[u8], off: usize) -> Result<u16, ElfError> {
 }
 
 fn le_u32(image: &[u8], off: usize) -> Result<u32, ElfError> {
+    let end = off.checked_add(4).ok_or(ElfError::Truncated)?;
     let b = image
-        .get(off..off + 4)
+        .get(off..end)
         .ok_or(ElfError::Truncated)?
         .try_into()
         .map_err(|_| ElfError::Truncated)?;
@@ -116,8 +123,9 @@ fn le_u32(image: &[u8], off: usize) -> Result<u32, ElfError> {
 }
 
 fn le_u64(image: &[u8], off: usize) -> Result<u64, ElfError> {
+    let end = off.checked_add(8).ok_or(ElfError::Truncated)?;
     let b = image
-        .get(off..off + 8)
+        .get(off..end)
         .ok_or(ElfError::Truncated)?
         .try_into()
         .map_err(|_| ElfError::Truncated)?;
@@ -171,13 +179,16 @@ pub fn parse_elf64(image: &[u8]) -> Result<LoadPlan, ElfError> {
         let filesz = le_u64(image, ph + 32)?;
         let memsz = le_u64(image, ph + 40)?;
 
-        if memsz == 0 {
-            continue; // nothing to map; some linkers emit empty PT_LOADs
-        }
+        // W+X is refused BEFORE the empty-segment skip: a hostile flag combo
+        // must not be able to hide inside a memsz==0 PT_LOAD (refusal is the
+        // default, even for a segment that would map nothing).
         let writable = flags & PF_W != 0;
         let executable = flags & PF_X != 0;
         if writable && executable {
             return Err(ElfError::WritableAndExecutable);
+        }
+        if memsz == 0 {
+            continue; // nothing to map; some linkers emit empty PT_LOADs
         }
         if vaddr % PAGE_SIZE != 0 {
             return Err(ElfError::Unaligned);
@@ -376,6 +387,32 @@ mod tests {
         assert!(matches!(
             parse_elf64(&img),
             Err(ElfError::EntryNotExecutable)
+        ));
+    }
+
+    #[test]
+    fn phoff_near_u64_max_is_refused_not_panicked() {
+        // A well-formed header whose e_phoff is at the top of the address
+        // space must return Err(Truncated), not overflow-panic in a debug
+        // build (the shipped kernel is --release, but the tests are not).
+        let mut img = valid_image();
+        for phoff in [u64::MAX, u64::MAX - 1, u64::MAX - 3] {
+            img[32..40].copy_from_slice(&phoff.to_le_bytes());
+            assert!(
+                matches!(parse_elf64(&img), Err(ElfError::Truncated)),
+                "phoff {phoff:#x} was not refused cleanly"
+            );
+        }
+    }
+
+    #[test]
+    fn wx_segment_is_refused_even_when_empty() {
+        // A W+X flag combo must be refused before the memsz==0 skip, so it
+        // cannot hide inside an empty segment.
+        let img = build_image(&[(USER_IMAGE_BASE, 0, 0, PF_X | PF_W | 4)]);
+        assert!(matches!(
+            parse_elf64(&img),
+            Err(ElfError::WritableAndExecutable)
         ));
     }
 
