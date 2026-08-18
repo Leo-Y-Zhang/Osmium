@@ -143,7 +143,12 @@ appear in a v1 pull request.
   exit report — and nothing else; a kernel-context fault still panics, and
   NMI/machine check/double fault stay panic-only at any CPL. The battery
   proves it by page-faulting one program beside a healthy one and asserting
-  the neighbour, the report and the kernel all survived.
+  the neighbour, the report and the kernel all survived. **Frame reclamation
+  followed as M11:** each address space records every frame it pulls and
+  returns exactly that set — scrubbed at free time — at teardown; the battery
+  asserts the in-use count lands back on its baseline, that warm runs
+  allocate no fresh frames at all, and that a freed frame's bytes are gone
+  the moment it is freed.
 - **APIC and HPET.** The legacy 8259 PIC and the 8254 timer are used instead. The
   APIC requires ACPI table parsing for no demonstrable v1 benefit; that cost is
   deferred until something needs it.

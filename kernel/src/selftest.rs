@@ -27,6 +27,8 @@ pub fn run() -> ! {
     round_robin_is_sustained();
     address_spaces_isolate_same_va();
     faulting_task_is_contained();
+    frames_are_reclaimed_and_reused();
+    freed_frame_is_scrubbed();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
     measure_console_scroll();
@@ -813,9 +815,65 @@ fn measure_console_scroll() {
 fn report_memory_stats() {
     let (heap_used, heap_free) = crate::memory::heap::stats();
     let (frames_used, frames_total) = crate::memory::frame_stats();
+    let (_, frames_reclaimed) = crate::memory::frame_gross_stats();
     serial_println!(
-        "[selftest] mem: heap {heap_used} B used / {heap_free} B free, {frames_used}/{frames_total} frames handed out"
+        "[selftest] mem: heap {heap_used} B used / {heap_free} B free, {frames_used}/{frames_total} frames in use ({frames_reclaimed} reclaimed)"
     );
+}
+
+/// The M11 reclamation proof, in two halves.
+///
+/// **Exactness**: the in-use frame count must land exactly back on its
+/// pre-run baseline after every ring-3 run — one frame short means the
+/// recording missed an allocation, one frame over means something freed
+/// what it did not own. The crasher+hello pair is the run under test
+/// because its teardown covers the fault-kill path too.
+///
+/// **Reuse**: after a warm-up run has stocked the free list, further runs
+/// must be served ENTIRELY from it — the gross bump-cursor count must not
+/// move. Without this half, an allocator that freed but never reused would
+/// pass the baseline check while still marching towards RAM exhaustion
+/// (in-use = gross minus freed stays flat even when gross grows).
+///
+/// (Mutations observed: Drop not deallocating fails the baseline half;
+/// allocate ignoring the free list fails the reuse half.)
+fn frames_are_reclaimed_and_reused() {
+    let (baseline, _) = crate::memory::frame_stats();
+    crate::usermode::run_crasher_and_hello().expect("an ELF was refused for the reclaim run");
+    let (after_warm, _) = crate::memory::frame_stats();
+    assert_eq!(
+        after_warm, baseline,
+        "a ring-3 run leaked frames: {baseline} in use before, {after_warm} after"
+    );
+    let (gross_warm, _) = crate::memory::frame_gross_stats();
+    for _ in 0..2 {
+        crate::usermode::run_crasher_and_hello().expect("an ELF was refused for the reuse run");
+        let (in_use, _) = crate::memory::frame_stats();
+        assert_eq!(in_use, baseline, "a warm ring-3 run leaked frames");
+    }
+    let (gross_after, _) = crate::memory::frame_gross_stats();
+    assert_eq!(
+        gross_after, gross_warm,
+        "warm runs allocated fresh frames instead of reusing the free list \
+         ({gross_warm} gross before, {gross_after} after)"
+    );
+    serial_println!(
+        "[selftest] mem: every frame of a ring-3 run reclaimed, warm runs served \
+         entirely from the free list ({baseline} in use) ... ok"
+    );
+}
+
+/// The M11 privacy half: a freed frame's contents must be gone the moment
+/// it is freed — not at some later reuse. The probe soils a frame through
+/// the physical alias, frees it, and re-reads the SAME alias before any
+/// reallocation. (Mutation observed: with the free-time scrub removed the
+/// sentinel survives into the free list and this fails.)
+fn freed_frame_is_scrubbed() {
+    assert!(
+        crate::memory::scrub_on_free_probe(),
+        "a freed frame kept its bytes — the free-time scrub is gone"
+    );
+    serial_println!("[selftest] mem: a freed frame is scrubbed at free time ... ok");
 }
 
 fn breakpoint_handled_and_returns() {

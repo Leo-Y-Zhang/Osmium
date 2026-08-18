@@ -1,6 +1,6 @@
 # TDD — Osmium v1 kernel
 
-**Status:** current — matches the shipped code through M10 (fault isolation, 2026-08-18; per-task address spaces M9 and preemptive multitasking M8 the same day); both open questions are resolved below
+**Status:** current — matches the shipped code through M11 (frame reclamation, 2026-08-18; fault isolation M10, per-task address spaces M9 and preemptive multitasking M8 the same day); both open questions are resolved below
 **Date:** 2026-08-18 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
 
 ## Approach
@@ -63,7 +63,7 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 | Per-task kernel stacks | Heap-allocated (`Box<[u8]>`) | 20 KiB each (M8) | One per scheduled task, created at `sched::install` and freed at `collect` (the allocator's zero-on-free scrub erases a dead task's saved registers). RSP0 is retargeted to the current task's stack on every context switch, so each task's trap frames land on its own memory — two tasks sharing one privilege stack would overwrite each other's saved context. |
 | User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy — **per address space** since M9. Two programs may claim the same pages; they land in different page tables. Mapped only in per-task spaces, never in the kernel's table. |
 | User stack page | `0x80_0000` | 4 KiB | `usermode::USER_STACK_ADDR` — the SAME virtual address in every task's space, which is itself a statement of the M9 isolation model: each space maps it to its own private frame. |
-| Per-task page tables | Allocated frames (M9) | ~5 frames per space | Each [`AddressSpace`]: a cloned PML4 sharing every kernel subtree, plus a deep-copied entry-0 chain (PDPT + first-GiB PD) privatising only the user window's and stack's 2 MiB PD slots. The bootloader's two measured low mappings (its handover region at `0x0..0x200000`, its early-GDT region at `0x1000000..0x1200000`) stay shared; `new_user` asserts the user slots are vacant kernel-side, pinning the measurement. Not reclaimed on drop (bump allocator). |
+| Per-task page tables | Allocated frames (M9) | ~5 frames per space | Each [`AddressSpace`]: a cloned PML4 sharing every kernel subtree, plus a deep-copied entry-0 chain (PDPT + first-GiB PD) privatising only the user window's and stack's 2 MiB PD slots. The bootloader's two measured low mappings (its handover region at `0x0..0x200000`, its early-GDT region at `0x1000000..0x1200000`) stay shared; `new_user` asserts the user slots are vacant kernel-side, pinning the measurement. Reclaimed on drop since M11: every frame the space pulls is recorded at the allocation choke point and returned — scrubbed — to the allocator's free list, with an assert that the space being dropped is not the active CR3. |
 | Physical memory window | Bootloader-chosen | All of RAM | Read via `boot_info.physical_memory_offset`; never hard-coded. |
 
 ### Global state table
@@ -159,13 +159,16 @@ be quietly re-litigated during implementation.
    memory back, which the grid was meant to avoid; and the console cannot
    reconstruct what is on screen, so there is no redraw and no scroll-back. Whichever
    of those is wanted first is what brings the 8 KiB grid with it.
-2. **Physical frames are zeroed when handed out, not when released.** The plan said
-   released frames are zeroed. The v1 frame allocator is a bump allocator over the
-   boot memory map and never releases a frame, so a zero-on-release claim would be
-   unfalsifiable: the code path could be deleted and no test would notice. Zeroing
-   on hand-out is the testable form of the same guarantee: a freshly mapped page
-   never exposes what the firmware or bootloader left in that frame. The self-test
-   asserts exactly that.
+2. **Physical frames are zeroed when handed out — and, since M11, when released
+   too.** The plan said released frames are zeroed; the v1 bump allocator never
+   released a frame, so only the hand-out half was testable then (a
+   zero-on-release claim over a code path that cannot run would have been
+   unfalsifiable). M11's reclamation made the release path real, and with it the
+   release-time scrub became falsifiable and is now asserted: the battery soils a
+   frame, frees it, and reads the SAME physical alias back before any
+   reallocation — observed failing with the scrub deleted. Both halves hold: a
+   freshly mapped page never exposes a previous owner's bytes, and a freed
+   frame's bytes are gone the moment it is let go.
 3. **The zero-on-free assertion is "the sentinel is gone", not "every byte is
    zero".** `linked_list_allocator` writes its free-list node — a size and a next
    pointer, 16 bytes — into the head of a block when that block is freed. The
@@ -265,9 +268,11 @@ mod logger;      // log::Log impl fanning out to console and serial, honouring t
 mod gdt;         // init(): GDT (kernel + user segments), TSS, three IST stacks, RSP0
 mod interrupts;  // init(): IDT (incl. the DPL-3 int 0x80 gate), PIC remap to 32..47,
                  //   timer at 100 Hz, keyboard IRQ
-mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 MiB, NX),
+mod memory;      // frames (bump allocator + M11 free list, scrub on free AND hand-out),
+                 //   paging (OffsetPageTable), heap (1 MiB, NX),
                  //   per-task AddressSpace (M9: clone + private user slots, per-space
-                 //   map/update/copy), the kernel-table audit
+                 //   map/update/copy; M11: frames recorded and reclaimed on drop),
+                 //   the kernel-table audit
 mod time;        // TSC boot-phase marks; battery-only PIT calibration to microseconds
 mod task;        // executor (cooperative), keyboard (ScancodeStream)
 mod sched;       // M8: preemptive round-robin of ring-3 tasks — TCBs, per-task
@@ -346,6 +351,10 @@ its exit record, the neighbour pristine, the kernel's CR3 restored), the
 pair run repeated up to 5× until the kill path is seen RESUMING the
 survivor rather than only returning to the launcher, and then the crasher
 run alone, which forces that launcher-return branch deterministically; the
+M11 reclamation proof — the in-use frame count returns exactly to its
+pre-run baseline, warm runs are served entirely from the free list, and a
+freed frame reads back zero through the physical alias before any
+reallocation; the
 kernel-table audit again, AFTER
 every ring-3 scenario, in its M9 total form — not one user-accessible entry,
 leaf or intermediate, ever; `update_user_page` narrows
@@ -432,6 +441,7 @@ Every green milestone is committed and pushed.
 | **M8** | Preemptive multitasking of ring-3 tasks: `sched` (TCBs, per-task heap-allocated kernel stacks, the naked timer entry with its AC scrub, round-robin switch, `SYS_EXIT` routing), TSS RSP0 made mutable and retargeted per switch, the multi-program loader with cross-image overlap refusal, `user/counter` (an unyielding register-heavy checksum program that holds AC hostile), and the `sched` shell command. Self-tests: exit-order preemption proof, exact checksum across every switch, timer-entry AC scrub, overlap refusal, the existing audits now covering the concurrent run. | Yes | `git revert`; M7's single-program cooperative kernel still boots and passes its battery. |
 | **M9** | Per-task address spaces: `memory::AddressSpace` (kernel PML4 cloned, entry-0 chain deep-copied against the MEASURED bootloader low mappings, user PD slots private), CR3 switched with RSP0 at every context switch and restored when the last task exits, hello's exit code widened to carry its data-segment read (the isolation witness), the M8 cross-image overlap refusal REMOVED (same-VA programs are now the point — `plans_overlap` and its host tests deleted with it), and the audit strengthened to its total form: the kernel table never carries any user-accessible entry. Self-tests: two instances of one image at one VA both run and both read pristine data; the W^X probe moved into a scratch space. | Yes | `git revert`; M8's shared-address-space scheduler still boots and passes its battery (its overlap refusal returns with it). |
 | **M10** | Fault isolation: every ring-3-reachable exception handler forks on the faulting CPL — ring 3 calls `sched::kill_current` (AC scrubbed, fault vector recorded in the exit report, RSP0+CR3 switched to the next ready task or the kernel's own world restored for the launcher return, via naked never-returning helpers); CPL 0 still panics, and NMI/#MC/#DF stay panic-only at any CPL. `user/crasher` (announces itself, then dereferences an unmapped address), the `crash` shell command, and `xtask privacy` typing `crash`. Self-tests: crasher terminated alone beside a surviving hello (repeated until the kill path is seen resuming the survivor), and a fault in the last task returning cleanly to the launcher. | Yes | `git revert`; M9's fault-fatal kernel still boots and passes its battery. |
+| **M11** | Frame reclamation: the allocator gains a free list (`deallocate_frame` scrubs at free time, asserts against double frees and foreign frames; `allocate_frame` prefers the list and still scrubs on hand-out), and each `AddressSpace` records every frame it pulls — the constructor's three table clones plus everything the mapping machinery allocates, captured by a recording adapter at the single allocation choke point — and returns exactly that set on drop, with an assert that the space is not the active CR3. `mem` and the battery's stats line report in-use and reclaimed counts. Self-tests: in-use frames land exactly on the pre-run baseline after ring-3 runs, warm runs are served entirely from the free list (the gross counter stops moving), and a freed frame reads back zero through the physical alias before any reallocation. | Yes | `git revert`; M10's leaking kernel still boots and passes its battery (its "frames are not reclaimed" boundary statement returns with it). |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
 port `0x60` — the controller delivers no further interrupts until it is read — but
@@ -608,6 +618,14 @@ must be seen to break it.
   repetition adds no flake risk), and widened the documented no-new-mappings
   invariant (the deep-copied entry-0 chain makes ANY new kernel mapping under
   PML4[0] unshared, not just new PML4-level entries).
+- *Mutation, M11 (all observed failing 2026-08-18):* make `AddressSpace::drop`
+  reclaim nothing (the baseline half fails: "a ring-3 run leaked frames: 370
+  in use before, 385 after"); make `allocate_frame` ignore the free list (the
+  reuse half fails: "warm runs allocated fresh frames instead of reusing the
+  free list — 385 gross before, 415 after"); remove the free-time scrub (the
+  probe fails: "a freed frame kept its bytes"). The three failures are three
+  different assertions, which is the point — leak, no-reuse and scrub-loss
+  are separately observable, so none can mask another.
 - *Mutation, M10 (all observed failing 2026-08-18):* remove the page-fault
   handler's ring-3 fork (the crasher's fault panics the whole kernel — the
   pre-M10 behaviour — and the battery reddens with the Ring3 frame in the

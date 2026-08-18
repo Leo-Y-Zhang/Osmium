@@ -21,8 +21,9 @@
 //! into whichever task made them.
 //!
 //! Privacy carries over: the frames a task runs on are zeroed on hand-out
-//! like every other (which is also what makes BSS correct for free), a dead
-//! task's kernel stack is zeroed when it is freed (the allocator scrubs on
+//! like every other (which is also what makes BSS correct for free) and
+//! zeroed again the moment teardown reclaims them (M11), a dead task's
+//! kernel stack is zeroed when it is freed (the allocator scrubs on
 //! free), and the self-tests audit the KERNEL's page table for user bits —
 //! which, since user mappings only ever exist in per-task spaces, must never
 //! carry a single one, before, during or after a run.
@@ -37,11 +38,10 @@
 //!   (machine-level events, not something the current task did).
 //! - **One run at a time.** The shell issues runs synchronously; the
 //!   scheduler asserts it is never installed while active.
-//! - **Frames are not reclaimed.** The bump allocator never frees, so each
-//!   run leaks its mapped frames and its page-table frames (a handful per
-//!   task); many manual `user`/`sched` shell invocations would eventually
-//!   exhaust RAM and panic. The parser's 64-page budget bounds how fast a
-//!   single load can drain the allocator.
+//! - **Frames are reclaimed (M11).** Each space records every frame it
+//!   pulls and returns exactly that set — scrubbed — at teardown, so a warm
+//!   run allocates no new physical memory and shell invocations can repeat
+//!   indefinitely. The parser's 64-page budget still bounds a single load.
 
 use crate::memory::AddressSpace;
 use crate::sched::{self, LaunchSpec, RunReport};
@@ -251,9 +251,12 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
     }
 
     // Teardown is dropping the spaces: the kernel's own table was never
-    // touched, so there is nothing to unmap — the per-task tables and user
-    // frames leak (bump allocator), the same accepted cost as before, now
-    // including a handful of page-table frames per task.
+    // touched, so there is nothing to unmap — and since M11 each space
+    // returns every frame it recorded pulling (tables, user pages, stack)
+    // to the allocator's free list, scrubbed. The battery asserts the
+    // in-use frame count lands exactly back on its pre-run baseline. Safe
+    // here and only here: the scheduler restored the kernel's CR3 before
+    // `collect` returned, which Drop's own assert re-checks per space.
     drop(spaces);
     Ok(report)
 }

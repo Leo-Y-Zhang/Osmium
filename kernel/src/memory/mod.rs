@@ -16,6 +16,7 @@
 pub mod frames;
 pub mod heap;
 
+use alloc::vec::Vec;
 use bootloader_api::info::MemoryRegions;
 use core::sync::atomic::{AtomicU64, Ordering};
 use frames::BootFrameAllocator;
@@ -82,11 +83,55 @@ fn phys_offset() -> u64 {
 /// addresses to different frames, which is what makes tasks isolated from
 /// each other and not merely from the kernel.
 ///
-/// Table frames are not reclaimed when a space is dropped (bump allocator —
-/// the same accepted leak as user pages), so a run's spaces cost a handful of
-/// frames each.
+/// Every frame this space pulls — the constructor's three table clones, each
+/// leaf frame `map_user_page` allocates, and the intermediate page-table
+/// frames the mapping machinery creates on the way down — is recorded in
+/// `owned_frames`, and `Drop` returns exactly that list to the allocator
+/// (M11). Recording at the single allocation choke point is what makes the
+/// reclaim provably safe: a space can only ever free what it exclusively
+/// pulled, never a frame shared with the kernel's table.
 pub struct AddressSpace {
     pml4: PhysFrame,
+    owned_frames: Vec<PhysFrame>,
+}
+
+/// The allocation choke point for a space: hands out frames from the real
+/// allocator and records each one against the space that pulled it, so
+/// teardown frees exactly what was allocated — including the page-table
+/// frames `map_to_with_table_flags` conjures internally, which no call site
+/// ever sees.
+struct RecordingAllocator<'a> {
+    inner: &'a mut BootFrameAllocator,
+    log: &'a mut Vec<PhysFrame>,
+}
+
+// SAFETY: delegates to `BootFrameAllocator`, which upholds the contract;
+// recording a frame does not change its ownership.
+unsafe impl FrameAllocator<Size4KiB> for RecordingAllocator<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.inner.allocate_frame()?;
+        self.log.push(frame);
+        Some(frame)
+    }
+}
+
+impl Drop for AddressSpace {
+    /// Returns every frame this space pulled to the allocator's free list
+    /// (M11), each scrubbed on the way back. Must not run while this space
+    /// is the active CR3 — the assert pins it, and the only call sites drop
+    /// spaces after the scheduler has restored the kernel's own root (which
+    /// the battery separately proves with a CR3 read-back after every run).
+    fn drop(&mut self) {
+        assert!(
+            Cr3::read().0 != self.pml4,
+            "dropping the ACTIVE address space"
+        );
+        let mut guard = FRAME_ALLOCATOR.lock();
+        let allocator = guard.as_mut().expect("memory not initialised");
+        for frame in self.owned_frames.drain(..) {
+            allocator.deallocate_frame(frame);
+        }
+    }
 }
 
 /// The physical-address bits of a page-table entry (4-level paging).
@@ -161,12 +206,19 @@ impl AddressSpace {
         let present = PageTableFlags::PRESENT.bits();
         let huge = PageTableFlags::HUGE_PAGE.bits();
         let kernel_pml4 = KERNEL_CR3.load(Ordering::Relaxed);
-        let pml4 = clone_table(allocator, offset, kernel_pml4);
+        // Every clone below is a frame this space owns and Drop must return.
+        let mut owned_frames = Vec::new();
+        let mut clone_owned = |allocator: &mut BootFrameAllocator, src_phys: u64| {
+            let dst = clone_table(allocator, offset, src_phys);
+            owned_frames.push(PhysFrame::containing_address(PhysAddr::new(dst)));
+            dst
+        };
+        let pml4 = clone_owned(allocator, kernel_pml4);
 
         let e0 = read_entry(offset, kernel_pml4, 0);
         if e0 & present != 0 {
             let kernel_pdpt = e0 & ENTRY_ADDR_MASK;
-            let pdpt = clone_table(allocator, offset, kernel_pdpt);
+            let pdpt = clone_owned(allocator, kernel_pdpt);
             let p0 = read_entry(offset, kernel_pdpt, 0);
             if p0 & present != 0 {
                 assert!(
@@ -174,7 +226,7 @@ impl AddressSpace {
                     "the first GiB is a huge page; the per-slot privacy model cannot subdivide it"
                 );
                 let kernel_pd = p0 & ENTRY_ADDR_MASK;
-                let pd = clone_table(allocator, offset, kernel_pd);
+                let pd = clone_owned(allocator, kernel_pd);
                 // Pin the measurement that the kernel side leaves the user
                 // slots vacant, then zero them in the copy. The zeroing is
                 // deliberately redundant today (a vacant kernel slot clones
@@ -201,6 +253,7 @@ impl AddressSpace {
 
         AddressSpace {
             pml4: PhysFrame::containing_address(PhysAddr::new(pml4)),
+            owned_frames,
         }
     }
 
@@ -210,12 +263,14 @@ impl AddressSpace {
         self.pml4
     }
 
-    /// Runs `f` with a mapper over THIS space's table plus the frame
-    /// allocator. The `&mut self` receiver is what makes the exclusive borrow
-    /// of the table sound.
+    /// Runs `f` with a mapper over THIS space's table plus the recording
+    /// allocator, so every frame `f` pulls — directly or through the mapping
+    /// machinery — lands in this space's ownership log for Drop to reclaim.
+    /// The `&mut self` receiver is what makes the exclusive borrow of the
+    /// table sound.
     fn with_mapper<R>(
         &mut self,
-        f: impl FnOnce(&mut OffsetPageTable, &mut BootFrameAllocator) -> R,
+        f: impl FnOnce(&mut OffsetPageTable, &mut RecordingAllocator) -> R,
     ) -> R {
         let offset = VirtAddr::new(phys_offset());
         let virt = offset + self.pml4.start_address().as_u64();
@@ -224,9 +279,13 @@ impl AddressSpace {
         let table = unsafe { &mut *virt.as_mut_ptr::<PageTable>() };
         // SAFETY: same offset contract as the kernel mapper's construction.
         let mut mapper = unsafe { OffsetPageTable::new(table, offset) };
-        let mut allocator = FRAME_ALLOCATOR.lock();
-        let allocator = allocator.as_mut().expect("memory not initialised");
-        f(&mut mapper, allocator)
+        let mut guard = FRAME_ALLOCATOR.lock();
+        let inner = guard.as_mut().expect("memory not initialised");
+        let mut allocator = RecordingAllocator {
+            inner,
+            log: &mut self.owned_frames,
+        };
+        f(&mut mapper, &mut allocator)
     }
 
     /// True iff `virt..virt+len` lies wholly inside the ELF image window or
@@ -442,6 +501,38 @@ pub fn frame_stats() -> (usize, usize) {
         .as_ref()
         .map(BootFrameAllocator::stats)
         .unwrap_or((0, 0))
+}
+
+/// (gross bump hand-outs ever, reclamations ever) — see
+/// [`BootFrameAllocator::gross_stats`]. The first number going quiet across
+/// warm ring-3 runs is the battery's proof that reuse actually happens.
+pub fn frame_gross_stats() -> (usize, usize) {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_ref()
+        .map(BootFrameAllocator::gross_stats)
+        .unwrap_or((0, 0))
+}
+
+/// Proves the free-time scrub (M11): allocate a frame, soil it through the
+/// physical alias, free it, and read the SAME alias back BEFORE any
+/// reallocation. True iff every byte is zero — i.e. the scrub happened when
+/// the frame was let go, not lazily at its next hand-out.
+#[cfg(feature = "selftest")]
+pub fn scrub_on_free_probe() -> bool {
+    let mut guard = FRAME_ALLOCATOR.lock();
+    let allocator = guard.as_mut().expect("memory not initialised");
+    let frame = allocator
+        .allocate_frame()
+        .expect("out of physical frames for the scrub probe");
+    let alias = (phys_offset() + frame.start_address().as_u64()) as *mut u8;
+    // SAFETY: the frame was just handed out exclusively; the alias maps all
+    // physical memory.
+    unsafe { core::ptr::write_bytes(alias, 0xA5, 4096) };
+    allocator.deallocate_frame(frame);
+    // SAFETY: reading RAM the allocator holds in its free list; volatile so
+    // the soil-then-check cannot be folded away.
+    (0..4096).all(|i| unsafe { alias.add(i).read_volatile() } == 0)
 }
 
 unsafe fn active_level_4_table(offset: VirtAddr) -> &'static mut PageTable {

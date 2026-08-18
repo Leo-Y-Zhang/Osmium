@@ -337,10 +337,11 @@ fn mem() {
             crate::memory::heap::HEAP_SIZE / 1024
         ),
     );
+    let (_, frames_reclaimed) = crate::memory::frame_gross_stats();
     field(
         "frames: ",
         &format!(
-            "{frames_used} handed out of {frames_total} usable ({} MiB usable RAM)",
+            "{frames_used} in use of {frames_total} usable ({} MiB usable RAM); {frames_reclaimed} reclaimed in total",
             frames_total as u64 * kshared::FRAME_SIZE / (1024 * 1024)
         ),
     );

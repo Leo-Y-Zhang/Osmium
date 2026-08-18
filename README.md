@@ -30,9 +30,10 @@ than a policy:
   byte changed — the no-persistence claim is checked behaviourally, not just
   by the absence of a driver.
 - **Freed memory is zeroed.** Heap blocks are scrubbed before they re-enter the
-  free list, and physical frames are scrubbed as they are handed out — verified
-  by two boot-time sentinel self-tests that were each observed failing when the
-  scrubbing was deliberately removed.
+  free list, and physical frames are scrubbed both as they are handed out and
+  the moment they are reclaimed (M11) — verified by boot-time sentinel
+  self-tests that were each observed failing when the scrubbing was
+  deliberately removed.
 - **Keystrokes stay on-screen.** Input renders to the local console only; it
   never reaches the serial port. This one holds by construction — the input
   path contains no serial writes, and the `panic` command's message is fixed in
@@ -132,7 +133,10 @@ Three layers, all run by CI on every push:
   each seeing only its own memory), the fault-isolation proof (a page-faulting
   program is terminated alone — repeated until the kill path is seen resuming
   its surviving neighbour — and a fault in the last task alive returns cleanly
-  to the launcher), per-page W^X flag plumbing,
+  to the launcher), the frame-reclamation proof (in-use frames land exactly
+  back on the pre-run baseline, warm runs are served entirely from the free
+  list, and a freed frame is scrubbed at free time), per-page W^X flag
+  plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
 - **Shipped-image boot** (`cargo xtask test --shipped`): the exact image a user
@@ -197,8 +201,11 @@ from each other as well as from the kernel); fault isolation landed as M10 —
 a ring-3 fault terminates the offending task and nothing else, while a
 kernel-context fault still panics, because a kernel bug is not a schedulable
 event (try it: the `crash` shell command page-faults a program next to a
-healthy one). Still ahead: a RAM-disk filesystem, APIC/HPET, and SMP.
-Networking is on no roadmap; if it ever lands, it ships off by default.
+healthy one); frame reclamation landed as M11 — a run's frames all come back,
+scrubbed, so repeated runs no longer creep towards RAM exhaustion (try it:
+`user`, then `mem`, twice — in-use holds still while reclaimed grows). Still
+ahead: a RAM-disk filesystem, APIC/HPET, and SMP. Networking is on no
+roadmap; if it ever lands, it ships off by default.
 
 ## Try it without building
 

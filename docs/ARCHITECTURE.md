@@ -151,16 +151,20 @@ degenerate case of the scheduler. In symbol order:
    and NMI, machine check and double fault stay panic-only at any CPL because
    they report machine-level events, not something the current task did.
 5. **Teardown and audit.** Teardown is dropping the spaces: the kernel's own
-   table was never touched, so there is nothing to unmap — the per-task tables
-   and user frames leak (bump allocator), and the per-task kernel stacks are
-   freed (and therefore zeroed — the allocator scrubs on free).
+   table was never touched, so there is nothing to unmap — and since M11 each
+   space returns every frame it recorded pulling (its three cloned tables,
+   every user page, the stack page and the intermediate page-table frames the
+   mapping machinery created) to the allocator's free list, scrubbed at free
+   time. Recording at the single allocation choke point is what makes the
+   reclaim provably safe: a space can only free what it exclusively pulled,
+   never a frame shared with the kernel. The per-task kernel stacks are
+   freed the same way they always were (heap, scrubbed on free).
    **`memory::no_stray_user_mappings`** then re-audits the KERNEL's table in
    its M9 total form: not one user-accessible entry, leaf or intermediate,
    anywhere, ever. The battery runs that audit both before ring 3 has ever
    run and again after every scenario.
 
-The boundary is stated, not oversold: each run leaks its few mapped frames
-and page-table frames until frame reclamation exists. What M9 removed from
+The boundary is stated, not oversold. What M9 removed from
 this list is memory sharing: tasks are now isolated from each other as well
 as from the kernel, proven by two instances of one image at one virtual
 address each seeing only its own data. What M10 removed is fault fatality: a
@@ -168,7 +172,11 @@ ring-3 fault now terminates the offending task alone — the battery proves it
 by page-faulting `crasher` beside a healthy `hello` and asserting the
 neighbour, the run report and the kernel all came through intact, then by
 faulting the LAST task alive to force the return-to-launcher branch of the
-kill path deterministically.
+kill path deterministically. What M11 removed is the frame leak: the battery
+asserts the in-use frame count lands exactly back on its pre-run baseline
+after every run, that warm runs are served entirely from the free list (the
+gross allocation counter stops moving), and that a freed frame is scrubbed
+at free time — so repeated runs no longer march towards RAM exhaustion.
 
 ## The preemptive context switch (M8)
 
