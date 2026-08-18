@@ -170,7 +170,7 @@ fn kernel_mappings_are_supervisor_only() {
 /// Re-audits the page tables AFTER the ring-3 round trip: the teardown must
 /// leave no user-accessible leaf anywhere, and user-accessible intermediates
 /// only where they reach the declared user window. Without this second look,
-/// battery ordering alone hid whatever `run_user` left behind.
+/// battery ordering alone hid whatever `run_elf` left behind.
 fn no_stray_user_mappings_after_ring3() {
     assert!(
         crate::memory::no_stray_user_mappings(),
@@ -418,8 +418,10 @@ fn user_program_runs_in_ring3() {
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both
-/// writable and executable; the parse must refuse it before anything is
-/// mapped.
+/// writable and executable; the parse must refuse it. Asserts on the PURE
+/// `parse_elf64`, not `run_elf` — a refusal gate whose failure mode is
+/// "map the hostile bytes and iretq to ring 3" is the wrong shape (that is
+/// exactly what happened when the guard was mutated out during verification).
 fn elf_loader_refuses_wx() {
     use kshared::elf::{ElfError, USER_IMAGE_BASE};
     let mut img = alloc::vec![0u8; 64 + 56 + 16];
@@ -442,7 +444,7 @@ fn elf_loader_refuses_wx() {
     img[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // memsz
     assert!(
         matches!(
-            crate::usermode::run_elf(&img),
+            kshared::elf::parse_elf64(&img),
             Err(ElfError::WritableAndExecutable)
         ),
         "a writable-and-executable segment was not refused"

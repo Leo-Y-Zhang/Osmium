@@ -132,6 +132,19 @@ pub fn copy_into_user_page(virt: u64, bytes: &[u8]) {
         (virt & 0xfff) as usize + bytes.len() <= 4096,
         "copy_into_user_page crosses a page boundary"
     );
+    // Defense in depth: the destination must be inside the user window or the
+    // user stack page. The sole caller passes parser-validated addresses, but
+    // that validation lives in another crate; this makes the primitive safe
+    // independent of its caller, so a future loader bug cannot turn it into a
+    // write over kernel memory.
+    let end = virt + bytes.len() as u64;
+    let in_image = virt >= kshared::elf::USER_IMAGE_BASE && end <= kshared::elf::USER_IMAGE_END;
+    let in_stack =
+        virt >= crate::usermode::USER_STACK_ADDR && end <= crate::usermode::USER_STACK_ADDR + 4096;
+    assert!(
+        in_image || in_stack,
+        "copy_into_user_page target {virt:#x} is outside the user window"
+    );
     let mapper = MAPPER.lock();
     let mapper = mapper.as_ref().expect("memory not initialised");
     let (phys, offset) = match mapper.translate(VirtAddr::new(virt)) {
@@ -167,10 +180,12 @@ unsafe fn active_level_4_table(offset: VirtAddr) -> &'static mut PageTable {
 
 /// Audits the live page tables for user-accessible entries. True iff NO leaf
 /// mapping anywhere is user-accessible AND every user-accessible intermediate
-/// entry covers the declared user window (the two fixed pages ring 3 runs
-/// on). Order-independent by construction: it holds before ring 3 has ever
-/// run (no USER bit exists at all) and after any `run_user` teardown — the
-/// leaf unmap clears the leaves, and parent tables legitimately keep USER
+/// entry covers the declared user window (the ELF image region
+/// `USER_IMAGE_BASE..USER_IMAGE_END`, up to `MAX_TOTAL_PAGES` pages, plus the
+/// single user stack page). Order-independent by construction: it holds before
+/// ring 3 has ever run (no USER bit exists at all) and after any `run_elf`
+/// teardown — the leaf unmap clears the leaves, and parent tables legitimately
+/// keep USER
 /// only for the window they exist to reach. A stray user leaf ANYWHERE, at
 /// any point the battery looks, fails it; so does a user-accessible
 /// intermediate reaching outside the window.
@@ -197,7 +212,11 @@ pub fn no_stray_user_mappings() -> bool {
         // VA span per entry: L4 512 GiB, L3 1 GiB, L2 2 MiB, L1 4 KiB.
         let span = 1u64 << (12 + 9 * (u64::from(level) - 1));
         for (i, entry) in table.iter().enumerate() {
-            if entry.is_unused() {
+            // Skip anything not present, not merely all-zero: a non-present
+            // entry that is nonetheless non-zero must not be dereferenced as a
+            // page-table frame below. (Today `unmap` zeroes entries, so this
+            // cannot arise, but the walk should not depend on that.)
+            if !entry.flags().contains(PageTableFlags::PRESENT) {
                 continue;
             }
             let entry_base = base + i as u64 * span;
