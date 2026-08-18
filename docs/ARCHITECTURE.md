@@ -137,8 +137,18 @@ degenerate case of the scheduler. In symbol order:
    Any other syscall marshals into the SysV ABI, calls `syscall_dispatch`,
    scrubs the caller-saved registers (keeping `rax`) and `iretq`s back to the
    program. `SYS_WRITE` renders its byte to the local console, never serial:
-   the shipped `user`/`sched` commands must not grow an off-device output
-   channel, and `cargo xtask privacy` types both commands to prove it.
+   the shipped `user`/`sched`/`crash` commands must not grow an off-device
+   output channel, and `cargo xtask privacy` types all three to prove it.
+   **`sched::kill_current`** (M10) is the involuntary counterpart of
+   `sys_exit`: every fault handler forks on the faulting CPL — ring 3 calls
+   `kill_current(vector)`, which scrubs `EFLAGS.AC`, marks the task
+   fault-terminated with the vector that killed it, and takes the same two
+   exits `sys_exit` does (resume the next ready task's context with its RSP0
+   and CR3, or restore the kernel's world and return to the launcher), via
+   naked never-returning helpers sharing the canonical pop-15/`iretq` restore
+   tail. A CPL-0 fault still panics: a kernel bug is not a schedulable event,
+   and NMI, machine check and double fault stay panic-only at any CPL because
+   they report machine-level events, not something the current task did.
 5. **Teardown and audit.** Teardown is dropping the spaces: the kernel's own
    table was never touched, so there is nothing to unmap — the per-task tables
    and user frames leak (bump allocator), and the per-task kernel stacks are
@@ -148,13 +158,16 @@ degenerate case of the scheduler. In symbol order:
    anywhere, ever. The battery runs that audit both before ring 3 has ever
    run and again after every scenario.
 
-The boundary is stated, not oversold: a misbehaving user program is fatal
-(every exception handler panics — there is no per-task fault termination yet,
-so a fault takes every task down), and each run leaks its few mapped frames
+The boundary is stated, not oversold: each run leaks its few mapped frames
 and page-table frames until frame reclamation exists. What M9 removed from
 this list is memory sharing: tasks are now isolated from each other as well
 as from the kernel, proven by two instances of one image at one virtual
-address each seeing only its own data.
+address each seeing only its own data. What M10 removed is fault fatality: a
+ring-3 fault now terminates the offending task alone — the battery proves it
+by page-faulting `crasher` beside a healthy `hello` and asserting the
+neighbour, the run report and the kernel all came through intact, then by
+faulting the LAST task alive to force the return-to-launcher branch of the
+kill path deterministically.
 
 ## The preemptive context switch (M8)
 

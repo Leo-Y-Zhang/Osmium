@@ -5,13 +5,15 @@ construction, light by measurement**.
 
 [![CI](https://github.com/Leo-Y-Zhang/Osmium/actions/workflows/ci.yml/badge.svg)](https://github.com/Leo-Y-Zhang/Osmium/actions/workflows/ci.yml)
 
-![The Osmium shell answering `help`, then `sched` showing two ring-3 programs preemptively scheduled — the program launched second exits first](docs/screenshot.png)
+![The Osmium shell answering `help`, then `crash` demonstrating fault isolation — a ring-3 program page-faults and is terminated by the kernel while its neighbour exits unharmed and the shell keeps running](docs/screenshot.png)
 
 Osmium boots from BIOS or UEFI, renders its own glyph console on the framebuffer,
 takes keyboard input through an async executor, drops you at a shell, and runs
 user programs in ring 3 under **preemptive multitasking with per-task address
-spaces** — inside 24 MiB of RAM. Every push to `main` must boot in QEMU under CI
-and pass an in-kernel self-test battery; `main` is never un-bootable.
+spaces and fault isolation** — a crashing program is terminated alone, and the
+machine keeps running — inside 24 MiB of RAM. Every push to `main` must boot in
+QEMU under CI and pass an in-kernel self-test battery; `main` is never
+un-bootable.
 
 ## Privacy by construction
 
@@ -189,10 +191,12 @@ and results collect in [docs/HARDWARE.md](docs/HARDWARE.md).
 Ring 3 + syscalls landed as M6; ELF loading landed as M7 (the user programs
 are real linker-scripted Rust binaries); preemptive multitasking of ring-3
 tasks landed as M8; per-task address spaces landed as M9 (tasks are isolated
-from each other as well as from the kernel). Still ahead: per-task fault
-isolation (a crashing program still takes the machine down), a RAM-disk
-filesystem, APIC/HPET, and SMP. Networking is on no roadmap; if it ever
-lands, it ships off by default.
+from each other as well as from the kernel); fault isolation landed as M10 —
+a ring-3 fault terminates the offending task and nothing else, while a
+kernel-context fault still panics, because a kernel bug is not a schedulable
+event (try it: the `crash` shell command page-faults a program next to a
+healthy one). Still ahead: a RAM-disk filesystem, APIC/HPET, and SMP.
+Networking is on no roadmap; if it ever lands, it ships off by default.
 
 ## Try it without building
 

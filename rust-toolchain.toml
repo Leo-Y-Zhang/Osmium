@@ -3,6 +3,10 @@
 # The kernel itself carries exactly one unstable feature (abi_x86_interrupt);
 # CI's feature-allowlist job enforces that nothing else joins it.
 # Bump this pin only in a dedicated PR.
-channel = "nightly-2026-08-15"
+# 2026-08-18: 08-01's cargo was blocked by Smart App Control on the dev box;
+# 08-15 was tried first but its LLVM 23.1 raises a `wcslen` libcall in the
+# uefi crate's UCS-2 length loop that bootloader-x86_64-uefi cannot link
+# (x86_64-unknown-uefi has no libc). 08-05 is the newest LLVM-22 nightly.
+channel = "nightly-2026-08-05"
 components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
 targets = ["x86_64-unknown-none"]

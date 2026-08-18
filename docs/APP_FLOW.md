@@ -72,6 +72,7 @@ exhausted prefix lists the candidates and keeps the input.
 | `privacy` | Reports the claims **as facts the build can support**, not as slogans: no network stack exists, nothing persists, freed heap blocks and handed-out frames are zeroed, keystrokes render on this screen only (never on the serial port), and user code runs in ring 3 under the CPU-advertised SMEP/SMAP/UMIP set. Ends by stating that the memory claims are self-tested and network/persistence are CI-gated, not policy. | None. |
 | `user` | Runs the embedded `hello` ELF in ring 3: parse, per-segment W^X mapping, the `int 0x80` syscall path, teardown. Success prints the value the program passed to `SYS_EXIT` — its own CS, whose low two bits are the CPL. | A refused image is a diagnosis, not a crash: `user: the embedded ELF was refused:` plus the named `ElfError` variant, and nothing was mapped before the refusal. |
 | `sched` | The preemption demonstration: runs `counter` (a long compute loop that never yields, printing a progress dot per eighth) and `hello` concurrently, counter launched first, round-robin on the timer tick. Their output interleaves live — hello's byte lands among counter's dots because the timer, not any yield, moves the CPU. Then a report: preemptive switch and timer round-trip counts, and each program's exit order and value — hello, launched second, exits **first**, which is the visible proof the scheduling is preemptive. | Same refusal shape as `user`: a refused image prints the named `ElfError` and nothing was mapped. |
+| `crash` | The fault-isolation demonstration (M10): runs `crasher` (announces itself with a `!`, then dereferences an unmapped address at CPL 3) beside `hello`. The kernel terminates the crasher — and only it. The report names the fault vector that killed it, confirms hello exited unharmed at CPL 3, and ends with `kernel: still running - you are typing at it`, because the prompt returning is itself the proof. | If the crasher somehow exits without faulting, the report says so (`exited 0xbad without faulting (unexpected)`) instead of pretending; a refused image prints the named `ElfError` as in `user`. |
 | `panic` | Deliberately panics, to demonstrate the panic screen. Documented as a demonstration, not a defect. **It takes no message argument, and that is a privacy decision rather than a missing feature:** a panic is reported on the serial port as well as the screen, so a message argument would be the one path by which something typed at this keyboard could reach serial. The message is fixed in the source instead. | None — it always succeeds by failing. Any text after the verb is ignored. |
 | `shutdown` | Prints `shutting down`, then exits the VM through the `isa-debug-exit` port under QEMU. On real hardware that port write is a no-op and the machine halts — safe to switch off, since nothing was ever written to disk. | The hardware fallback is not an error; it is the honest outcome. |
 | `selftest` | Re-runs the four checks that are safe to repeat — heap allocation, the zero-on-free sentinel, `int3`, and the PIT — printing one `[ ok ]` line each. It is the shell's own copy of them, not the boot battery itself: the battery is compiled in only under the `selftest` feature, and that build has no shell. **Everything else in the boot battery is left out** — the paging probe (a fixed address that cannot be mapped twice), the stack overflow (it cannot return), and the ring-3 round trip with its page-table audits, which the `user` command exercises on demand instead. The screen does not name what it leaves out, which is a gap in the output rather than in the tests. | A failing check prints `[FAIL]` in the danger colour instead of `[ ok ]`, and the shell returns to the prompt. |
@@ -97,8 +98,11 @@ table never carries a user-accessible entry, audited by the battery before ring 
 has ever run and again after every run — and each returns through `int 0x80`.
 Since M8 up to two programs run concurrently under preemptive round-robin, and
 since M9 each runs in its own address space, isolated from the others' memory as
-well as the kernel's. There is still nothing to authenticate against: whoever is
-at the keyboard is the operator, and physical access is total access. **Offline is not applicable because
+well as the kernel's. Since M10 a fault in one of them terminates that task
+alone (the `crash` command demonstrates it live); only a kernel-context fault
+reaches the panic screen. There is still nothing to authenticate against:
+whoever is at the keyboard is the operator, and physical access is total
+access. **Offline is not applicable because
 there is no network stack**. A state that depends on a remote response cannot occur
 where no remote call can be made. Both cells stay "n/a" until accounts or networking
 exist, at which point this document is rewritten before that code is written.
@@ -114,8 +118,9 @@ stateDiagram-v2
     Prompt --> Prompt : keystroke echoed
     Prompt --> Output : Enter, command runs
     Output --> Prompt : always
-    Prompt --> Panic : `panic` command, or a fault
-    Output --> Panic : a fault during a command
+    Prompt --> Panic : `panic` command, or a kernel-context fault
+    Output --> Panic : a kernel-context fault during a command
+    Output --> Output : a ring-3 fault kills that task only (M10)
     Prompt --> Halted : `shutdown` with no mechanism
     Prompt --> [*] : `shutdown` reaches the platform
     Panic --> [*] : power cycle only

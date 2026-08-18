@@ -75,7 +75,7 @@ interrupt-context deadlocks.
 | Global | Type | Initialised at | Protected by | Touched from IRQ? |
 |---|---|---|---|---|
 | `GDT` | `GlobalDescriptorTable` + selectors | M2, once | `spin::LazyLock`, then immutable | No |
-| `TSS` | `TaskStateSegment` in an `UnsafeCell` (`TssCell`) | M2 (ISTs, default RSP0); **RSP0 rewritten per context switch since M8** | Every RSP0 write happens with interrupts disabled (`set_privilege_stack` asserts it), so the CPU cannot take a ring-3 trap mid-update; the GDT descriptor holds only the TSS's address (`tss_segment_unchecked`), so no shared reference is held across a mutation | Read by CPU on privilege transitions; **written from the timer and `SYS_EXIT` paths** (IF=0 in both) |
+| `TSS` | `TaskStateSegment` in an `UnsafeCell` (`TssCell`) | M2 (ISTs, default RSP0); **RSP0 rewritten per context switch since M8** | Every RSP0 write happens with interrupts disabled (`set_privilege_stack` asserts it), so the CPU cannot take a ring-3 trap mid-update; the GDT descriptor holds only the TSS's address (`tss_segment_unchecked`), so no shared reference is held across a mutation | Read by CPU on privilege transitions; **written from the timer, `SYS_EXIT` and fault-kill (M10) paths** (IF=0 in all three — exception gates clear IF like interrupt gates) |
 | `DOUBLE_FAULT_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` | Written only by the CPU on double fault | Yes, by hardware |
 | `IDT` | `InterruptDescriptorTable` | M2, once | `spin::LazyLock`, then immutable | Read by CPU only |
 | `PICS` | `ChainedPics` | M2 | `spin::Mutex` | **Yes** — end-of-interrupt write. Held for a few instructions; never nested with any other lock. |
@@ -90,7 +90,7 @@ interrupt-context deadlocks.
 | `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
 | `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition taken outside a scheduler run (TSS RSP0's default target) | Yes, by hardware |
 | `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `sched::enter_tasks` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's run-complete path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_tasks`, which always writes it first |
-| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, **address-space root (CR3, M9)**, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; real `assert!`s pin the discipline in every build. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
+| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, **address-space root (CR3, M9)**, ready flag, exit code/order, **fault vector (M10)** — `Some(v)` when the kernel terminated the task for a ring-3 fault), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer, `SYS_EXIT` and fault-kill paths run behind interrupt/exception gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; real `assert!`s pin the discipline in every build. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits; **`kill_current` (M10) marks a fault termination and leaves through the same two exits `sys_exit` uses** |
 | `TIMER_ENTRY_AC` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M8 | Atomic, `SeqCst` | **Yes** — set by the timer's Rust half if `EFLAGS.AC` survived the naked entry's scrub; the battery asserts it never did while a hostile program held AC set |
 | `KERNEL_CR3`, `PHYS_OFFSET` | `AtomicU64` × 2 | M9, once at `memory::init` | Write-once, then read-only | `KERNEL_CR3` is read by the scheduler's run-complete path (IF=0) to restore the kernel's root; `PHYS_OFFSET` only from launcher context |
 | `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
@@ -600,6 +600,16 @@ must be seen to break it.
   repetition adds no flake risk), and widened the documented no-new-mappings
   invariant (the deep-copied entry-0 chain makes ANY new kernel mapping under
   PML4[0] unshared, not just new PML4-level entries).
+- *Mutation, M10 (all observed failing 2026-08-18):* remove the page-fault
+  handler's ring-3 fork (the crasher's fault panics the whole kernel — the
+  pre-M10 behaviour — and the battery reddens with the Ring3 frame in the
+  panic dump); report the wrong vector from the same fork, 13 for 14 (the
+  containment assertion fails with "crasher was not terminated by a page
+  fault", `Some(13)` against `Some(14)`); omit the kill path's CR3 switch
+  (the surviving neighbour resumes inside the DEAD task's address space,
+  faults there, and is itself killed — "the innocent neighbour was marked
+  faulted", which is the assertion that proves the kill path must switch
+  worlds exactly as the timer path does).
 
 **Build gates**
 

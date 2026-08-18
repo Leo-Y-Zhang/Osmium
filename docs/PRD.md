@@ -138,7 +138,12 @@ appear in a v1 pull request.
   proves it by running two instances of one image at one VA and asserting each
   read its own pristine data segment; the kernel's own page table now never
   carries a user-accessible entry at all, which the audit asserts in its
-  strongest form.
+  strongest form. **Fault isolation followed as M10:** a ring-3 fault
+  terminates the offending task — with the exception vector recorded in its
+  exit report — and nothing else; a kernel-context fault still panics, and
+  NMI/machine check/double fault stay panic-only at any CPL. The battery
+  proves it by page-faulting one program beside a healthy one and asserting
+  the neighbour, the report and the kernel all survived.
 - **APIC and HPET.** The legacy 8259 PIC and the 8254 timer are used instead. The
   APIC requires ACPI table parsing for no demonstrable v1 benefit; that cost is
   deferred until something needs it.

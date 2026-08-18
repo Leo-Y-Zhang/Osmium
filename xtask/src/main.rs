@@ -150,15 +150,18 @@ fn privacy() -> Result<()> {
     // both programs' output must be just as serial-silent — then quit. Typing
     // `user` here is what makes the allowlist actually cover the
     // syscall-output path a security review flagged; typing `sched` extends
-    // the same proof over the M8 scheduler path. The queued `shutdown`
-    // keystrokes drain after `sched`'s ~a-second run finishes (scancodes
-    // buffer in the IRQ queue), and the clean exit remains the positive
-    // control that everything typed was really executed.
+    // the same proof over the M8 scheduler path, and `crash` over the M10
+    // fault-kill path (a ring-3 page fault, its termination report and the
+    // survivor's output must all stay off the serial port too). The queued
+    // `shutdown` keystrokes drain after the runs finish (scancodes buffer in
+    // the IRQ queue), and the clean exit remains the positive control that
+    // everything typed was really executed.
     let mut monitor = TcpStream::connect(("127.0.0.1", MONITOR_PORT))
         .context("connecting to the QEMU monitor")?;
     send_line_as_keys(&mut monitor, &format!("echo {SENTINEL}"))?;
     send_line_as_keys(&mut monitor, "user")?;
     send_line_as_keys(&mut monitor, "sched")?;
+    send_line_as_keys(&mut monitor, "crash")?;
     send_line_as_keys(&mut monitor, "shutdown")?;
 
     let status = loop {
