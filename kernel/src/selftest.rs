@@ -29,6 +29,7 @@ pub fn run() -> ! {
     faulting_task_is_contained();
     frames_are_reclaimed_and_reused();
     freed_frame_is_scrubbed();
+    reused_frame_is_scrubbed_on_handout();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
     measure_console_scroll();
@@ -874,6 +875,21 @@ fn freed_frame_is_scrubbed() {
         "a freed frame kept its bytes — the free-time scrub is gone"
     );
     serial_println!("[selftest] mem: a freed frame is scrubbed at free time ... ok");
+}
+
+/// The other half of the M11 privacy claim: `allocate_frame` scrubs again
+/// when it serves from the free list. The free-time scrub alone would make
+/// any reused frame read zero, so the probe soils the frame AFTER freeing it
+/// — only the hand-out scrub can clean it. Before this test the hand-out
+/// scrub on that path could be deleted with the whole battery still passing
+/// (adversarial-review finding). (Mutation observed: deleting the pop-path
+/// scrub fails exactly here and nowhere else.)
+fn reused_frame_is_scrubbed_on_handout() {
+    assert!(
+        crate::memory::scrub_on_reuse_probe(),
+        "a frame served from the free list carried its bytes — the hand-out scrub is gone"
+    );
+    serial_println!("[selftest] mem: a reused frame is scrubbed again on hand-out ... ok");
 }
 
 fn breakpoint_handled_and_returns() {

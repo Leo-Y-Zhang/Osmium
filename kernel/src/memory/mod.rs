@@ -494,7 +494,8 @@ pub fn translate_flags(virt: u64) -> Option<PageTableFlags> {
     }
 }
 
-/// (frames handed out, usable frames total).
+/// (frames in use, usable frames total) — hand-outs minus what M11 has
+/// reclaimed, not gross hand-outs; [`frame_gross_stats`] reports those.
 pub fn frame_stats() -> (usize, usize) {
     FRAME_ALLOCATOR
         .lock()
@@ -512,6 +513,44 @@ pub fn frame_gross_stats() -> (usize, usize) {
         .as_ref()
         .map(BootFrameAllocator::gross_stats)
         .unwrap_or((0, 0))
+}
+
+/// Proves the OTHER scrub (M11): the one `allocate_frame` performs when it
+/// serves a frame from the free list. The free-time scrub alone would make
+/// any reused frame read zero, so this probe soils the frame **after** it is
+/// freed — where it sits in the free list — and only the hand-out scrub can
+/// clean it. Without this, deleting that scrub changes no observable
+/// behaviour, and a check that cannot be observed failing is decoration
+/// (an adversarial review made exactly that argument about it).
+///
+/// The identity assert is load-bearing rather than paranoid: it pins the
+/// LIFO assumption the soiling relies on, so an allocator that switched to
+/// FIFO would fail loudly instead of silently soiling one frame and testing
+/// another.
+#[cfg(feature = "selftest")]
+pub fn scrub_on_reuse_probe() -> bool {
+    let mut guard = FRAME_ALLOCATOR.lock();
+    let allocator = guard.as_mut().expect("memory not initialised");
+    let frame = allocator
+        .allocate_frame()
+        .expect("out of physical frames for the reuse probe");
+    allocator.deallocate_frame(frame);
+    // Soil it where it lies, AFTER the free-time scrub has run on it.
+    allocator.soil_next_frame(0x5A);
+    let reused = allocator
+        .allocate_frame()
+        .expect("out of physical frames for the reuse probe");
+    assert_eq!(
+        reused, frame,
+        "the free list did not serve back the frame it was soiled on"
+    );
+    let alias = (phys_offset() + reused.start_address().as_u64()) as *mut u8;
+    // SAFETY: reading the physical alias of a frame this allocator just
+    // handed out exclusively; volatile so the soil-then-check cannot fold.
+    let clean = (0..4096).all(|i| unsafe { alias.add(i).read_volatile() } == 0);
+    // Hand it back so the probe leaves the frame accounting where it found it.
+    allocator.deallocate_frame(reused);
+    clean
 }
 
 /// Proves the free-time scrub (M11): allocate a frame, soil it through the

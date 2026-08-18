@@ -129,7 +129,8 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
         if let Some(frame) = self.free_list.pop() {
             // Already scrubbed at free time; scrub again anyway so the
             // zero-on-hand-out guarantee never rests on the free-time scrub
-            // still being there.
+            // still being there. `scrub_on_reuse_probe` soils the frame after
+            // it is freed, so this line is falsifiable rather than decorative.
             // SAFETY: reclaimed RAM this allocator exclusively holds.
             unsafe { core::ptr::write_bytes(self.alias(frame), 0, 4096) };
             return Some(frame);

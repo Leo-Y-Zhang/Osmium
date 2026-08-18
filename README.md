@@ -135,7 +135,8 @@ Three layers, all run by CI on every push:
   its surviving neighbour — and a fault in the last task alive returns cleanly
   to the launcher), the frame-reclamation proof (in-use frames land exactly
   back on the pre-run baseline, warm runs are served entirely from the free
-  list, and a freed frame is scrubbed at free time), per-page W^X flag
+  list, and both scrubs — at free time and again at hand-out — are proven
+  separately, each observed failing on its own), per-page W^X flag
   plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.

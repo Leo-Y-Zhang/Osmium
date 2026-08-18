@@ -20,8 +20,9 @@ pub const USER_IMAGE_END: u64 = 0x60_0000;
 /// is generous, and refusing more keeps the plan allocator-free.
 pub const MAX_SEGMENTS: usize = 8;
 
-/// Bounds the frames a single load can consume (the kernel's frame allocator
-/// never reclaims, so a huge BSS would be a resource-exhaustion lever).
+/// Bounds the frames a single load can consume: reclamation (M11) returns a
+/// run's frames afterwards, but nothing caps a SINGLE image's appetite, so a
+/// huge BSS would still be a resource-exhaustion lever within one load.
 pub const MAX_TOTAL_PAGES: u64 = 64;
 
 const PAGE_SIZE: u64 = 4096;

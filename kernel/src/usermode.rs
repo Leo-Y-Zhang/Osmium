@@ -69,7 +69,7 @@ pub(crate) const USER_STACK_ADDR: u64 = 0x80_0000;
 
 /// The most programs one run can schedule. Two exercises every multi-task
 /// path (rotation, same-VA isolation) without inviting an unbounded fleet
-/// onto a bump allocator.
+/// onto a single-core round-robin with one kernel stack per task.
 pub const MAX_TASKS: usize = 2;
 
 /// The embedded user programs: real linker-scripted Rust ELFs built from
