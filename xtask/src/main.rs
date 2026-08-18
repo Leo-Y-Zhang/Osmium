@@ -26,8 +26,10 @@ const BIOS_TEST_MEM_MB: u32 = 24;
 const UEFI_TEST_MEM_MB: u32 = 48;
 /// Lightness gate: disk images must stay under this ceiling; growth is a
 /// deliberate decision, never drift. Both images currently sit around
-/// 2.1-2.5 MiB; 4 MiB leaves headroom without hiding a regression.
-const IMAGE_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+/// 2.1-2.5 MiB; 3 MiB is the measured size plus ~0.5 MiB of stated headroom,
+/// tight enough that a real size regression fails rather than hiding in a 4
+/// MiB budget with 60% slack.
+const IMAGE_BUDGET_BYTES: u64 = 3 * 1024 * 1024;
 
 struct Opts {
     uefi: bool,
