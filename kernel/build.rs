@@ -1,8 +1,8 @@
-//! Builds the `hello` user program (a standalone crate in `user/hello`) and
-//! hands its ELF path to the kernel via the `HELLO_ELF` env var, which
+//! Builds the user programs (standalone crates in `user/`) and hands their
+//! ELF paths to the kernel via env vars (`HELLO_ELF`, `COUNTER_ELF`), which
 //! `usermode.rs` embeds with `include_bytes!`.
 //!
-//! The nested cargo gets its own CARGO_TARGET_DIR: sharing the workspace
+//! Each nested cargo gets its own CARGO_TARGET_DIR: sharing the workspace
 //! target dir with the invoking build would deadlock on cargo's build lock.
 
 use std::env;
@@ -10,32 +10,37 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    build_user_program("hello", "HELLO_ELF");
+    build_user_program("counter", "COUNTER_ELF");
+}
+
+fn build_user_program(name: &str, env_var: &str) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let hello_dir = manifest_dir
+    let crate_dir = manifest_dir
         .parent()
         .expect("kernel lives one level below the workspace root")
         .join("user")
-        .join("hello");
+        .join(name);
     for tracked in ["src/main.rs", "Cargo.toml", "link.ld"] {
         println!(
             "cargo:rerun-if-changed={}",
-            hello_dir.join(tracked).display()
+            crate_dir.join(tracked).display()
         );
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target_dir = out_dir.join("hello-target");
+    let target_dir = out_dir.join(format!("{name}-target"));
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let link_script = hello_dir.join("link.ld");
+    let link_script = crate_dir.join("link.ld");
     let status = Command::new(&cargo)
         .arg("build")
         .arg("--release")
         .args(["--target", "x86_64-unknown-none"])
         .arg("--manifest-path")
-        .arg(hello_dir.join("Cargo.toml"))
+        .arg(crate_dir.join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", &target_dir)
         // Static relocation + the fixed-base linker script give an ET_EXEC
-        // image whose first segment sits exactly at the user window base.
+        // image whose segments sit at that program's slot in the user window.
         .env(
             "RUSTFLAGS",
             format!(
@@ -52,10 +57,10 @@ fn main() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CLIPPY_ARGS")
         .status()
-        .expect("spawning cargo to build the hello user program");
-    assert!(status.success(), "building the hello user program failed");
+        .unwrap_or_else(|e| panic!("spawning cargo to build the {name} user program: {e}"));
+    assert!(status.success(), "building the {name} user program failed");
 
-    let elf = target_dir.join("x86_64-unknown-none/release/hello");
-    assert!(elf.is_file(), "hello ELF missing at {}", elf.display());
-    println!("cargo:rustc-env=HELLO_ELF={}", elf.display());
+    let elf = target_dir.join(format!("x86_64-unknown-none/release/{name}"));
+    assert!(elf.is_file(), "{name} ELF missing at {}", elf.display());
+    println!("cargo:rustc-env={env_var}={}", elf.display());
 }

@@ -1,0 +1,435 @@
+//! Preemptive round-robin scheduling of ring-3 tasks (M8).
+//!
+//! The kernel itself is never preempted: the timer switches contexts only
+//! when the interrupted code was running at CPL 3, so every kernel path —
+//! syscall dispatch, the shell, the launcher — runs to completion exactly as
+//! it did before this module existed. What changed is what happens to *user*
+//! programs: each timer tick taken from ring 3 lands in [`timer_entry`],
+//! which saves the interrupted program's complete register file on its own
+//! kernel stack, asks [`timer_tick`] for the next runnable task, and resumes
+//! that task wherever *it* was interrupted. A program that never yields —
+//! never blocks, never syscalls — loses the CPU anyway. That is the whole
+//! definition of preemption, and the self-test battery proves it by exit
+//! order: a short program launched second exits first, while an unyielding
+//! compute loop launched first is still running.
+//!
+//! Design invariants, each load-bearing:
+//! - **One kernel stack per task, and TSS RSP0 always names the current
+//!   task's.** A trap from ring 3 pushes its frame wherever RSP0 points; if
+//!   two tasks shared one privilege stack, the second task's trap would
+//!   overwrite the first task's saved context. Every switch therefore
+//!   rewrites RSP0 (`gdt::set_privilege_stack`) before it resumes the next
+//!   task.
+//! - **The saved context is the 15 GP registers plus the CPU's interrupt
+//!   frame, and that is complete.** Both the kernel and the user programs are
+//!   compiled for `x86_64-unknown-none`, which has no SSE/AVX and soft
+//!   floats, so there is no SIMD or x87 state to save; segment bases (FS/GS)
+//!   are unused. The layout is fixed by [`timer_entry`]'s push order and
+//!   shared by fabricated initial frames — see [`REGS_SAVED`].
+//! - **Scheduler state is locked only with interrupts off.** `SCHED` is a
+//!   spinlock touched from the timer handler and the `int 0x80` exit path
+//!   (both run with IF=0, interrupt gates) and from the launcher (which
+//!   disables interrupts around install/collect). On this single-core kernel
+//!   that makes contention impossible rather than merely handled; the
+//!   `debug_assert`s pin the discipline.
+//! - **`EFLAGS.AC` is scrubbed at every kernel entry ring 3 controls.** An
+//!   interrupt gate clears IF/TF/NT/RF/VM but NOT AC, and SMAP is inert while
+//!   AC is set. The syscall gate has scrubbed AC since M7; the timer entry
+//!   must do the same or a hostile program could hold SMAP off for every
+//!   asynchronous kernel entry taken while it runs. The battery proves the
+//!   scrub by running exactly such a program (`user/counter` holds AC set for
+//!   its entire run) and asserting the kernel never observed the flag.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use spin::Mutex;
+use x86_64::VirtAddr;
+
+/// Bytes of kernel stack per task. Matches the default privilege stack: deep
+/// enough for any trap the task can take (syscall dispatch, an exception's
+/// panic path), small enough that two tasks cost 40 KiB of the 1 MiB heap.
+pub const KSTACK_SIZE: usize = 20 * 1024;
+
+/// How many general-purpose registers [`timer_entry`] saves below the CPU's
+/// interrupt frame. Push order (top of stack last): rax, rcx, rdx, rbx, rbp,
+/// rsi, rdi, r8..r15 — so the saved CS sits at `rsp + REGS_SAVED*8 + 8`.
+const REGS_SAVED: u64 = 15;
+/// Byte offset of the saved CS selector from the post-save stack pointer:
+/// 15 saved registers, then RIP, then CS.
+const SAVED_CS_OFFSET: u64 = REGS_SAVED * 8 + 8;
+
+/// One schedulable ring-3 task.
+struct Task {
+    /// The task's own kernel stack (heap-allocated; freed — and therefore
+    /// zeroed, the allocator scrubs on free — when the run's tasks are
+    /// collected).
+    kstack: Box<[u8]>,
+    /// Where the task's saved context lives: the value RSP had after
+    /// [`timer_entry`] finished saving, or the fabricated initial frame for a
+    /// task that has not run yet. Only meaningful while `ready`.
+    saved_rsp: u64,
+    ready: bool,
+    exit_code: u64,
+    /// Order of exit across the run: 0 for the first task to exit, 1 for the
+    /// next. The battery's preemption proof is this field.
+    exit_seq: u64,
+}
+
+impl Task {
+    /// The 16-byte-aligned top of this task's kernel stack — the value RSP0
+    /// holds while the task is current.
+    fn kstack_top(&self) -> u64 {
+        (self.kstack.as_ptr() as u64 + self.kstack.len() as u64) & !0xf
+    }
+}
+
+/// The scheduler: a fixed task table (built before activation, never resized
+/// while active — the timer path must not allocate), the current index, and
+/// the run's counters.
+struct Sched {
+    tasks: Vec<Task>,
+    current: usize,
+    active: bool,
+    /// Timer-driven switches that landed on a DIFFERENT task.
+    preemptive_switches: u64,
+    /// Timer interrupts taken from ring 3 while active — each one is a full
+    /// save/restore round trip through the context-switch machinery, even
+    /// when the round-robin lands back on the same task.
+    ring3_round_trips: u64,
+    exit_counter: u64,
+}
+
+impl Sched {
+    /// The next ready task after `from`, round-robin with wraparound. While
+    /// the scheduler is active at least one task is ready or exiting is in
+    /// progress, so the timer path (where `from` itself is still ready)
+    /// always finds one.
+    fn next_ready(&self, from: usize) -> Option<usize> {
+        let n = self.tasks.len();
+        (1..=n)
+            .map(|k| (from + k) % n)
+            .find(|&i| self.tasks[i].ready)
+    }
+}
+
+static SCHED: Mutex<Sched> = Mutex::new(Sched {
+    tasks: Vec::new(),
+    current: 0,
+    active: false,
+    preemptive_switches: 0,
+    ring3_round_trips: 0,
+    exit_counter: 0,
+});
+
+/// Records whether `EFLAGS.AC` was ever still set when the timer handler's
+/// Rust half ran — proof the naked entry's AC scrub executed. `user/counter`
+/// holds AC set for its whole run, so with the scrub deleted this reads true
+/// on the first preemption.
+#[cfg(feature = "selftest")]
+pub static TIMER_ENTRY_AC: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// What one task did with its run, reported to the launcher.
+pub struct TaskExit {
+    pub code: u64,
+    /// 0 = exited first, 1 = second, ...
+    pub seq: u64,
+}
+
+/// The launcher-facing summary of a completed scheduler run.
+pub struct RunReport {
+    /// Per launched task, in launch order.
+    pub exits: Vec<TaskExit>,
+    pub preemptive_switches: u64,
+    pub ring3_round_trips: u64,
+}
+
+/// Builds the task table for `entries` (each an entry point + user stack
+/// top), fabricates each task's initial context frame, marks the scheduler
+/// active and points RSP0 at task 0's kernel stack. Returns task 0's initial
+/// `saved_rsp` for [`enter_tasks`].
+///
+/// Must be called with interrupts disabled; allocates (kernel stacks), which
+/// is fine in the launcher's context and forbidden in the timer's — which is
+/// why the table is fully built here and only indexed there.
+pub fn install(entries: &[(u64, u64)]) -> u64 {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "scheduler installed with interrupts enabled"
+    );
+    let sel = crate::gdt::selectors();
+    let user_cs = u64::from(sel.user_code.0); // RPL 3 already in the selector
+    let user_ss = u64::from(sel.user_data.0);
+
+    let mut tasks = Vec::with_capacity(entries.len());
+    for &(entry, user_stack_top) in entries {
+        let mut kstack = alloc::vec![0u8; KSTACK_SIZE].into_boxed_slice();
+        let saved_rsp = build_initial_frame(&mut kstack, entry, user_stack_top, user_cs, user_ss);
+        tasks.push(Task {
+            kstack,
+            saved_rsp,
+            ready: true,
+            exit_code: 0,
+            exit_seq: 0,
+        });
+    }
+
+    let mut sched = SCHED.lock();
+    debug_assert!(!sched.active, "scheduler installed while already active");
+    sched.tasks = tasks;
+    sched.current = 0;
+    sched.active = true;
+    sched.preemptive_switches = 0;
+    sched.ring3_round_trips = 0;
+    sched.exit_counter = 0;
+    crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[0].kstack_top()));
+    sched.tasks[0].saved_rsp
+}
+
+/// Drains the finished run's results. Must be called with interrupts still
+/// disabled, after [`enter_tasks`] has returned (which only happens once the
+/// last task exited and `sys_exit` deactivated the scheduler). Dropping the
+/// task table frees each kernel stack, and the allocator's zero-on-free scrub
+/// means a dead task's saved registers do not linger in the heap.
+pub fn collect() -> RunReport {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "scheduler results collected with interrupts enabled"
+    );
+    let mut sched = SCHED.lock();
+    debug_assert!(!sched.active, "collect() while the scheduler is active");
+    let tasks = core::mem::take(&mut sched.tasks);
+    RunReport {
+        exits: tasks
+            .iter()
+            .map(|t| TaskExit {
+                code: t.exit_code,
+                seq: t.exit_seq,
+            })
+            .collect(),
+        preemptive_switches: sched.preemptive_switches,
+        ring3_round_trips: sched.ring3_round_trips,
+    }
+}
+
+/// Fabricates the initial saved context for a task that has not run yet, at
+/// the top of its kernel stack: the CPU interrupt frame (RIP=entry, ring-3
+/// CS/SS, RFLAGS with IF set so the timer can preempt it, RSP=its user
+/// stack), below it the 15 general-purpose registers all zero — the same
+/// scrub-before-ring-3 guarantee `jump_to_user` gave M6, expressed as data.
+/// The restore path (`pop` x15, `iretq`) cannot tell this frame from one
+/// [`timer_entry`] saved, which is the point: first launch and every later
+/// resume go through one code path.
+fn build_initial_frame(kstack: &mut [u8], entry: u64, user_rsp: u64, cs: u64, ss: u64) -> u64 {
+    let top = ((kstack.as_ptr() as u64 + kstack.len() as u64) & !0xf) - kstack.as_ptr() as u64;
+    let mut off = top as usize;
+    let mut push = |kstack: &mut [u8], val: u64| {
+        off -= 8;
+        kstack[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    };
+    // iretq frame, pushed in hardware order (SS first — highest address).
+    push(kstack, ss);
+    push(kstack, user_rsp);
+    push(kstack, 0x202); // RFLAGS: IF set, reserved bit 1 set, IOPL 0
+    push(kstack, cs);
+    push(kstack, entry);
+    // 15 zeroed GP registers in timer_entry's save order (rax pushed first,
+    // r15 last, so r15 ends lowest).
+    for _ in 0..REGS_SAVED {
+        push(kstack, 0);
+    }
+    kstack.as_ptr() as u64 + off as u64
+}
+
+/// The timer-interrupt entry (vector 32), installed raw in the IDT. Saves
+/// the full register file, lets [`timer_tick`] account the tick and pick the
+/// next context, then restores whichever context it returned — the same one
+/// when no switch is due, another task's when one is.
+///
+/// The AC scrub at the top mirrors `int80_entry`'s and exists for the same
+/// reason: an interrupt gate does not clear AC, ring 3 owns it, and SMAP is
+/// only as strong as the scrub at every entry (module docs). `cld` likewise:
+/// the gate clears IF but not DF, and SysV requires DF=0 at a call boundary.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_entry() {
+    core::arch::naked_asm!(
+        // Scrub EFLAGS.AC (bit 18, low dword of the pushed RFLAGS; the same
+        // portable masked-AND int80_entry uses — no `clac`, which is #UD on a
+        // CPU without SMAP). IF is already 0 from the gate, so popfq cannot
+        // re-enable interrupts.
+        "pushfq",
+        "and dword ptr [rsp], 0xFFFBFFFF",
+        "popfq",
+        "cld",
+        // Save the interrupted context's GP registers. Order is the contract
+        // shared with build_initial_frame and the restore sequence below.
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // rsp now points at the complete saved context (15 regs + CPU frame)
+        // and is 16-byte aligned: the CPU aligned the stack before pushing
+        // its 5-qword frame (leaving rsp ≡ 8 mod 16), and 15 pushes restore
+        // ≡ 0 — the SysV requirement at a call instruction.
+        "mov rdi, rsp",
+        "call {tick}",
+        // rax = the context to resume: unchanged rsp, or another task's.
+        "mov rsp, rax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        tick = sym timer_tick,
+    )
+}
+
+/// The timer entry's address for the IDT gate.
+pub fn timer_entry_addr() -> u64 {
+    timer_entry as *const () as u64
+}
+
+/// The Rust half of the timer interrupt: counts the tick, acknowledges the
+/// PIC, and — only when the interrupted context was ring 3 and the scheduler
+/// is active — performs the round-robin switch. Returns the stack pointer of
+/// the context [`timer_entry`] should restore.
+extern "C" fn timer_tick(rsp: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    crate::interrupts::TICKS.fetch_add(1, Ordering::Relaxed);
+    // EOI first, and never while holding SCHED: handlers hold at most one
+    // lock at a time (TDD concurrency rule).
+    crate::interrupts::end_of_interrupt(crate::interrupts::InterruptIndex::Timer);
+
+    #[cfg(feature = "selftest")]
+    {
+        use x86_64::registers::rflags::{self, RFlags};
+        if rflags::read().contains(RFlags::ALIGNMENT_CHECK) {
+            TIMER_ENTRY_AC.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // Preempt only ring-3 contexts: the saved CS's low two bits are the
+    // interrupted CPL. Kernel code (the shell, the launcher, a syscall that
+    // re-enabled nothing — IF is 0 in handlers, so that last cannot even
+    // occur) is never preempted.
+    // SAFETY: `rsp` is the just-saved context timer_entry built; the CPU
+    // frame sits at the documented fixed offset above the 15 saved registers.
+    let saved_cs = unsafe { *((rsp + SAVED_CS_OFFSET) as *const u64) };
+    if saved_cs & 3 != 3 {
+        return rsp;
+    }
+
+    let mut sched = SCHED.lock();
+    if !sched.active {
+        return rsp;
+    }
+    sched.ring3_round_trips += 1;
+    let cur = sched.current;
+    sched.tasks[cur].saved_rsp = rsp;
+    // The current task is still ready, so next_ready always finds a task
+    // (itself, when it is the only one left).
+    let next = sched
+        .next_ready(cur)
+        .expect("active scheduler with no ready task");
+    if next != cur {
+        sched.preemptive_switches += 1;
+        sched.current = next;
+        crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
+    }
+    sched.tasks[next].saved_rsp
+}
+
+/// The `SYS_EXIT` half of scheduling, called from `int80_entry` (IF is 0 —
+/// interrupt gate). Marks the current task exited and returns either the next
+/// ready task's saved context (the asm resumes it with the shared
+/// pop-15/`iretq` sequence) or 0, meaning no task remains: deactivate, point
+/// RSP0 back at the default privilege stack, and let the asm restore the
+/// launcher continuation.
+pub extern "C" fn sys_exit(code: u64) -> u64 {
+    let mut sched = SCHED.lock();
+    debug_assert!(sched.active, "SYS_EXIT outside a scheduler run");
+    let cur = sched.current;
+    sched.tasks[cur].ready = false;
+    sched.tasks[cur].exit_code = code;
+    sched.tasks[cur].exit_seq = sched.exit_counter;
+    sched.exit_counter += 1;
+    match sched.next_ready(cur) {
+        Some(next) => {
+            sched.current = next;
+            crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
+            sched.tasks[next].saved_rsp
+        }
+        None => {
+            sched.active = false;
+            crate::gdt::set_privilege_stack(crate::gdt::default_privilege_stack_top());
+            0
+        }
+    }
+}
+
+/// Enters the first task of an installed run and does not return until the
+/// last task has exited (`sys_exit` returns 0 to the `int 0x80` entry, whose
+/// launcher path restores the continuation saved here). The callee-saved
+/// registers are pushed first and the stack pointer saved above them, exactly
+/// as M6's `jump_to_user` did — `KERNEL_CONTINUATION_RSP`'s invariant (written
+/// before any ring-3 instruction can execute) is preserved because this is
+/// now the only road to ring 3.
+///
+/// # Safety
+/// `first_rsp` must be the value [`install`] just returned, interrupts must
+/// be disabled, and the task's code/stack pages must be mapped.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_tasks(first_rsp: u64) {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rip + {cont}], rsp", // save the stack just above the saved regs
+        "mov rsp, rdi",
+        // Restore the fabricated initial context: 15 (zeroed) GP registers,
+        // then iretq into ring 3. Identical to timer_entry's restore tail —
+        // first launch and every later resume are the same operation.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        cont = sym crate::usermode::KERNEL_CONTINUATION_RSP,
+    )
+}

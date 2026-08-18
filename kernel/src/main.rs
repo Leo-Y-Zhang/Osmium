@@ -19,6 +19,7 @@ mod logger;
 mod memory;
 #[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 mod qemu;
+mod sched;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;

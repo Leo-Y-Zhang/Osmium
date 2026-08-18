@@ -8,9 +8,10 @@ construction, light by measurement**.
 ![The Osmium shell answering `help` and `privacy`](docs/screenshot.png)
 
 Osmium boots from BIOS or UEFI, renders its own glyph console on the framebuffer,
-takes keyboard input through an async executor, and drops you at a shell — inside
-24 MiB of RAM. Every push to `main` must boot in QEMU under CI and pass an
-in-kernel self-test battery; `main` is never un-bootable.
+takes keyboard input through an async executor, drops you at a shell, and runs
+user programs in ring 3 under **preemptive multitasking** — inside 24 MiB of RAM.
+Every push to `main` must boot in QEMU under CI and pass an in-kernel self-test
+battery; `main` is never un-bootable.
 
 ## Privacy by construction
 
@@ -49,7 +50,7 @@ page. The `privacy` command reports all of this live.
   headroom for QEMU-version variance — so a real RAM-hunger regression fails
   the build. The boot test also cross-checks the kernel's own memory-map
   report against the configured size, so the figure is measured, not quoted.
-- Disk images are **2.1–2.5 MiB**, asserted under a 4 MiB budget on every build.
+- Disk images are **2.1–2.5 MiB**, asserted under a 3 MiB budget on every build.
 - The shell is up about **20 ms after interrupts enable** — CI parses that
   figure from the boot log and fails above a 200 ms ceiling (PIT-measured, shown
   in the banner — the timer cannot see the boot stages before it starts, so
@@ -85,9 +86,19 @@ page. The `privacy` command reports all of this live.
   advertises it, read back and asserted; the loader copies user segments
   through the kernel's physical alias so SMAP stays on with no `stac` in the
   hot path, and a self-test requires every advertised bit to be live
+- **Preemptive multitasking of ring-3 tasks**: the timer tick drives a
+  round-robin context switch — full register file saved on a per-task kernel
+  stack, TSS RSP0 retargeted per switch — so a user program that never yields
+  loses the CPU anyway. The battery proves it by exit order (a short program
+  launched *second* exits *first*, while an unyielding 30M-iteration compute
+  loop is still running), proves register integrity with an exact checksum
+  across every switch, and proves the timer entry scrubs `EFLAGS.AC` against
+  a program that holds it hostile for its whole run. The kernel itself stays
+  non-preemptible, which is what keeps the locking rules simple; `sched` in
+  the shell shows the two programs' output interleaving live
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
-  `keymap` (us/uk), `user`, `selftest`, `panic`, `shutdown` — with an insertion
-  cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
+  `keymap` (us/uk), `user`, `sched`, `selftest`, `panic`, `shutdown` — with an
+  insertion cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
 - Panic screens that report the failure on both the console and the serial
   port; never a silent hang
 
@@ -102,7 +113,12 @@ Three layers, all run by CI on every push:
   the kernel's zeroing rather than the emulator's), a page-table audit that no
   mapping is user-accessible — run again after the ring-3 teardown — kernel-heap
   NX, the executor waker path, a scripted shell session via injected scancodes,
-  a W+X ELF image refused, the embedded `hello` ELF run at CPL 3, per-page W^X
+  a W+X ELF image refused, the embedded `hello` ELF run at CPL 3, the
+  preemption proof (an unyielding compute program is preempted so a
+  later-launched one exits first, with an exact cross-checked checksum proving
+  the register file survives every context switch, and the timer entry's
+  `EFLAGS.AC` scrub proven against a hostile program), two programs claiming
+  the same pages refused before anything maps, per-page W^X
   flag plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
@@ -161,10 +177,12 @@ and results collect in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## Roadmap
 
-Ring 3 + syscalls landed as M6; ELF loading landed as M7 (the user program is
-a real linker-scripted Rust binary). Still ahead: a RAM-disk filesystem,
-preemptive scheduling, APIC/HPET, and SMP. Networking is on no roadmap; if it
-ever lands, it ships off by default.
+Ring 3 + syscalls landed as M6; ELF loading landed as M7 (the user programs
+are real linker-scripted Rust binaries); preemptive multitasking of ring-3
+tasks landed as M8. Still ahead: per-task address spaces (today's tasks are
+isolated from the kernel, not yet from each other), a RAM-disk filesystem,
+APIC/HPET, and SMP. Networking is on no roadmap; if it ever lands, it ships
+off by default.
 
 ## Try it without building
 

@@ -2,6 +2,13 @@
 //! likely to arrive on a broken stack — a double fault (e.g. from a kernel
 //! stack overflow), an NMI, and a machine check — execute on known-good
 //! memory instead of whatever stack was in trouble.
+//!
+//! Since M8 the TSS is *mutable state*, not a build-once table: RSP0 — the
+//! stack the CPU switches to when ring 3 traps in — is rewritten on every
+//! context switch so each user task traps onto its own kernel stack. The TSS
+//! therefore lives in an `UnsafeCell` and its GDT descriptor is built from a
+//! raw pointer (`tss_segment_unchecked`), so no `&'static` shared reference
+//! is ever held across a mutation.
 
 use core::cell::UnsafeCell;
 use spin::LazyLock;
@@ -16,8 +23,10 @@ pub const NMI_IST_INDEX: u16 = 1;
 pub const MACHINE_CHECK_IST_INDEX: u16 = 2;
 
 const IST_STACK_SIZE: usize = 20 * 1024;
-/// Stack the CPU switches to (via TSS RSP0) when `int 0x80` traps in from
-/// ring 3 — the ring-0 privilege stack.
+/// Stack the CPU switches to (via TSS RSP0) when `int 0x80` or an interrupt
+/// traps in from ring 3 while no scheduler task is current — the default
+/// ring-0 privilege stack. While the scheduler runs, RSP0 points at the
+/// current task's own kernel stack instead ([`set_privilege_stack`]).
 const KERNEL_PRIVILEGE_STACK_SIZE: usize = 20 * 1024;
 
 /// Writable static backing for one interrupt stack. A plain (non-mut) static
@@ -44,7 +53,7 @@ static DOUBLE_FAULT_STACK: IstStack = IstStack::new();
 static NMI_STACK: IstStack = IstStack::new();
 static MACHINE_CHECK_STACK: IstStack = IstStack::new();
 
-/// Backing for the ring-0 privilege stack (TSS RSP0).
+/// Backing for the default ring-0 privilege stack (TSS RSP0).
 #[repr(C, align(16))]
 struct PrivilegeStack(UnsafeCell<[u8; KERNEL_PRIVILEGE_STACK_SIZE]>);
 // SAFETY: only the CPU writes it, on a privilege transition into the kernel.
@@ -52,15 +61,16 @@ unsafe impl Sync for PrivilegeStack {}
 static PRIVILEGE_STACK: PrivilegeStack =
     PrivilegeStack(UnsafeCell::new([0; KERNEL_PRIVILEGE_STACK_SIZE]));
 
-static TSS: LazyLock<TaskStateSegment> = LazyLock::new(|| {
-    let mut tss = TaskStateSegment::new();
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = DOUBLE_FAULT_STACK.top();
-    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = NMI_STACK.top();
-    tss.interrupt_stack_table[MACHINE_CHECK_IST_INDEX as usize] = MACHINE_CHECK_STACK.top();
-    tss.privilege_stack_table[0] =
-        VirtAddr::from_ptr(PRIVILEGE_STACK.0.get()) + KERNEL_PRIVILEGE_STACK_SIZE as u64;
-    tss
-});
+/// The TSS, in an `UnsafeCell` because RSP0 changes at runtime (per-task
+/// kernel stacks). All other fields are written once in [`init`], before the
+/// table is loaded.
+struct TssCell(UnsafeCell<TaskStateSegment>);
+// SAFETY: written by `init` (single-threaded early boot) and by
+// `set_privilege_stack`, which is only called with interrupts disabled on
+// this single-core kernel; the CPU reads it only on a privilege transition,
+// which cannot happen while interrupts are off and CPL is 0.
+unsafe impl Sync for TssCell {}
+static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 
 /// Segment selectors the rest of the kernel needs by name.
 pub struct Selectors {
@@ -77,7 +87,10 @@ static GDT: LazyLock<(GlobalDescriptorTable, Selectors)> = LazyLock::new(|| {
     let kernel_data = gdt.append(Descriptor::kernel_data_segment());
     let user_data = gdt.append(Descriptor::user_data_segment());
     let user_code = gdt.append(Descriptor::user_code_segment());
-    let tss = gdt.append(Descriptor::tss_segment(&TSS));
+    // SAFETY: the pointer is to a static TSS that lives for the program's
+    // whole lifetime; `init` populates it before the GDT is loaded, and later
+    // mutation is confined to RSP0 under the `TssCell` discipline above.
+    let tss = gdt.append(unsafe { Descriptor::tss_segment_unchecked(TSS.0.get()) });
     (
         gdt,
         Selectors {
@@ -95,8 +108,45 @@ pub fn selectors() -> &'static Selectors {
     &GDT.1
 }
 
-/// Loads our GDT and TSS, replacing the bootloader's temporary tables.
+/// Points TSS RSP0 at `top`: the stack the CPU will use for the next trap in
+/// from ring 3. The scheduler calls this on every context switch so each task
+/// traps onto its own kernel stack.
+///
+/// Must be called with interrupts disabled (every caller is either `init`,
+/// the timer/syscall path where the interrupt gate already cleared IF, or the
+/// launcher inside its own cli window) — otherwise an interrupt arriving from
+/// ring 3 between the switch decision and this write would land on the wrong
+/// stack.
+pub fn set_privilege_stack(top: VirtAddr) {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "RSP0 rewritten with interrupts enabled"
+    );
+    // SAFETY: writing one field of the static TSS; no shared reference to the
+    // TSS exists (the descriptor holds only its address), and the CPU cannot
+    // read RSP0 concurrently because a ring-3 -> ring-0 transition cannot
+    // occur while interrupts are disabled and we are already at CPL 0.
+    unsafe { (*TSS.0.get()).privilege_stack_table[0] = top };
+}
+
+/// Top of the default (non-scheduler) privilege stack, so the scheduler can
+/// restore RSP0 when the last task exits.
+pub fn default_privilege_stack_top() -> VirtAddr {
+    VirtAddr::from_ptr(PRIVILEGE_STACK.0.get()) + KERNEL_PRIVILEGE_STACK_SIZE as u64
+}
+
+/// Populates the TSS, then loads our GDT and TSS, replacing the bootloader's
+/// temporary tables.
 pub fn init() {
+    // SAFETY: single-threaded early boot, before the GDT (and thus the TSS
+    // descriptor) is loaded; nothing else references the TSS yet.
+    unsafe {
+        let tss = &mut *TSS.0.get();
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = DOUBLE_FAULT_STACK.top();
+        tss.interrupt_stack_table[NMI_IST_INDEX as usize] = NMI_STACK.top();
+        tss.interrupt_stack_table[MACHINE_CHECK_IST_INDEX as usize] = MACHINE_CHECK_STACK.top();
+        tss.privilege_stack_table[0] = default_privilege_stack_top();
+    }
     GDT.0.load();
     // SAFETY: the selectors index the GDT loaded on the line above, and the
     // TSS's IST entries point at valid, unused stack memory.

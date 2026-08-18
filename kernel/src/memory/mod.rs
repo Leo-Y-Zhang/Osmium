@@ -132,15 +132,16 @@ pub fn copy_into_user_page(virt: u64, bytes: &[u8]) {
         (virt & 0xfff) as usize + bytes.len() <= 4096,
         "copy_into_user_page crosses a page boundary"
     );
-    // Defense in depth: the destination must be inside the user window or the
-    // user stack page. The sole caller passes parser-validated addresses, but
-    // that validation lives in another crate; this makes the primitive safe
-    // independent of its caller, so a future loader bug cannot turn it into a
-    // write over kernel memory.
+    // Defense in depth: the destination must be inside the user window or one
+    // of the per-task user stack pages. The sole caller passes
+    // parser-validated addresses, but that validation lives in another crate;
+    // this makes the primitive safe independent of its caller, so a future
+    // loader bug cannot turn it into a write over kernel memory.
     let end = virt + bytes.len() as u64;
     let in_image = virt >= kshared::elf::USER_IMAGE_BASE && end <= kshared::elf::USER_IMAGE_END;
-    let in_stack =
-        virt >= crate::usermode::USER_STACK_ADDR && end <= crate::usermode::USER_STACK_ADDR + 4096;
+    let in_stack = crate::usermode::USER_STACK_ADDRS
+        .iter()
+        .any(|&stack| virt >= stack && end <= stack + 4096);
     assert!(
         in_image || in_stack,
         "copy_into_user_page target {virt:#x} is outside the user window"
@@ -181,11 +182,12 @@ unsafe fn active_level_4_table(offset: VirtAddr) -> &'static mut PageTable {
 /// Audits the live page tables for user-accessible entries. True iff NO leaf
 /// mapping anywhere is user-accessible AND every user-accessible intermediate
 /// entry covers the declared user window (the ELF image region
-/// `USER_IMAGE_BASE..USER_IMAGE_END`, up to `MAX_TOTAL_PAGES` pages, plus the
-/// single user stack page). Order-independent by construction: it holds before
-/// ring 3 has ever run (no USER bit exists at all) and after any `run_elf`
-/// teardown — the leaf unmap clears the leaves, and parent tables legitimately
-/// keep USER
+/// `USER_IMAGE_BASE..USER_IMAGE_END`, up to `MAX_TOTAL_PAGES` pages per
+/// program, plus the per-task user stack pages — all of which share one
+/// 2 MiB page-table region). Order-independent by construction: it holds
+/// before ring 3 has ever run (no USER bit exists at all) and after any
+/// `run_programs` teardown — the leaf unmap clears the leaves, and parent
+/// tables legitimately keep USER
 /// only for the window they exist to reach. A stray user leaf ANYWHERE, at
 /// any point the battery looks, fails it; so does a user-accessible
 /// intermediate reaching outside the window.
@@ -202,10 +204,14 @@ pub fn no_stray_user_mappings() -> bool {
 
     fn covers_user_window(base: u64, span: u64) -> bool {
         // The whole ELF image window is one 2 MiB page-table region, so an
-        // intermediate reaches it iff its range contains the window base;
-        // the stack page sits in its own region.
+        // intermediate reaches it iff its range contains the window base; the
+        // per-task stack pages share a second region, checked page by page so
+        // the list — not this audit — stays the single source of truth.
         let contains = |addr: u64| addr >= base && addr < base.saturating_add(span);
-        contains(kshared::elf::USER_IMAGE_BASE) || contains(crate::usermode::USER_STACK_ADDR)
+        contains(kshared::elf::USER_IMAGE_BASE)
+            || crate::usermode::USER_STACK_ADDRS
+                .iter()
+                .any(|&stack| contains(stack))
     }
 
     fn walk(table: &PageTable, offset: u64, level: u8, base: u64) -> bool {

@@ -248,6 +248,10 @@ pub const COMMANDS: &[Command] = &[
         help: "  user          run a ring-3 program via the syscall path",
     },
     Command {
+        name: "sched",
+        help: "  sched         run two ring-3 programs, preemptively scheduled",
+    },
+    Command {
         name: "selftest",
         help: "  selftest      run the runtime test subset",
     },
@@ -443,9 +447,10 @@ mod tests {
         // Unique: only one command starts with "h".
         assert_eq!(complete("h"), Completion::Unique("help"));
         assert_eq!(complete("cl"), Completion::Unique("clear"));
-        // Ambiguous: sysinfo/selftest/shutdown share only "s".
+        // Ambiguous: sysinfo/sched/selftest/shutdown share only "s".
         assert_eq!(complete("s"), Completion::Ambiguous("s"));
         // Disambiguated by the next letter.
+        assert_eq!(complete("sc"), Completion::Unique("sched"));
         assert_eq!(complete("se"), Completion::Unique("selftest"));
         assert_eq!(complete("sh"), Completion::Unique("shutdown"));
         assert_eq!(complete("sy"), Completion::Unique("sysinfo"));

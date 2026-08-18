@@ -286,6 +286,7 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "sysinfo" => sysinfo(layout_name),
         "privacy" => privacy(),
         "user" => user_command(),
+        "sched" => sched_command(),
         "keymap" => keymap(args, layout_name, decoder),
         // Fixed message on purpose: the argument would be typed input, and
         // panics are reported on the serial port — which typed input must
@@ -425,6 +426,47 @@ fn user_command() {
             &format!("hello ELF exited with CS={exit:#x} (CPL {})", exit & 3),
         ),
         Err(e) => println_con(&format!("user: the embedded ELF was refused: {e:?}")),
+    }
+}
+
+/// The preemption demonstration: `counter` (a long compute loop that never
+/// yields) launched first, `hello` second, scheduled round-robin on the
+/// timer. Their output interleaves above this report — hello's byte lands
+/// among counter's progress dots because the timer, not any yield, moves the
+/// CPU — and the exit order line states the proof: the program launched
+/// second finished first.
+fn sched_command() {
+    match crate::usermode::run_counter_and_hello() {
+        Ok(report) => {
+            // A SYS_WRITE ends mid-line; drop to a fresh one before the report.
+            println_con("");
+            field(
+                "sched:   ",
+                &format!(
+                    "2 programs, {} preemptive switches, {} timer round-trips",
+                    report.preemptive_switches, report.ring3_round_trips
+                ),
+            );
+            let order = |seq: u64| if seq == 0 { "first" } else { "second" };
+            field(
+                "counter: ",
+                &format!(
+                    "exited {} with checksum {:#x}",
+                    order(report.exits[0].seq),
+                    report.exits[0].code
+                ),
+            );
+            field(
+                "hello:   ",
+                &format!(
+                    "exited {} with CS={:#x} (CPL {})",
+                    order(report.exits[1].seq),
+                    report.exits[1].code,
+                    report.exits[1].code & 3
+                ),
+            );
+        }
+        Err(e) => println_con(&format!("sched: an embedded ELF was refused: {e:?}")),
     }
 }
 

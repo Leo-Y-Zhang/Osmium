@@ -54,7 +54,7 @@ Two non-human entry points exist and matter as much:
 
 ## The command surface
 
-Twelve commands, defined once in `kshared::COMMANDS` so the printed `help` list and
+Thirteen commands, defined once in `kshared::COMMANDS` so the printed `help` list and
 Tab completion share a single source. Each prints something; none is silent on
 success unless its whole purpose is to clear the screen. **Tab** completes a command
 verb — a unique prefix fills in, a shared prefix extends as far as it can, and an
@@ -71,6 +71,7 @@ exhausted prefix lists the candidates and keeps the input.
 | `sysinfo` | Version and architecture; the framebuffer's geometry, pixel format and depth; usable RAM and the size of the kernel heap; the active ring-3 hardening set (SMEP/SMAP/UMIP, whichever the CPU advertised); the active keymap; then the `uptime` line, tick rate included. It does not read CPU vendor or brand strings — no part of Osmium needs to know. | None. If the firmware provided no framebuffer the display line is omitted rather than invented. |
 | `privacy` | Reports the claims **as facts the build can support**, not as slogans: no network stack exists, nothing persists, freed heap blocks and handed-out frames are zeroed, keystrokes render on this screen only (never on the serial port), and user code runs in ring 3 under the CPU-advertised SMEP/SMAP/UMIP set. Ends by stating that the memory claims are self-tested and network/persistence are CI-gated, not policy. | None. |
 | `user` | Runs the embedded `hello` ELF in ring 3: parse, per-segment W^X mapping, the `int 0x80` syscall path, teardown. Success prints the value the program passed to `SYS_EXIT` — its own CS, whose low two bits are the CPL. | A refused image is a diagnosis, not a crash: `user: the embedded ELF was refused:` plus the named `ElfError` variant, and nothing was mapped before the refusal. |
+| `sched` | The preemption demonstration: runs `counter` (a long compute loop that never yields, printing a progress dot per eighth) and `hello` concurrently, counter launched first, round-robin on the timer tick. Their output interleaves live — hello's byte lands among counter's dots because the timer, not any yield, moves the CPU. Then a report: preemptive switch and timer round-trip counts, and each program's exit order and value — hello, launched second, exits **first**, which is the visible proof the scheduling is preemptive. | Same refusal shape as `user`: a refused image prints the named `ElfError` and nothing was mapped. |
 | `panic` | Deliberately panics, to demonstrate the panic screen. Documented as a demonstration, not a defect. **It takes no message argument, and that is a privacy decision rather than a missing feature:** a panic is reported on the serial port as well as the screen, so a message argument would be the one path by which something typed at this keyboard could reach serial. The message is fixed in the source instead. | None — it always succeeds by failing. Any text after the verb is ignored. |
 | `shutdown` | Prints `shutting down`, then exits the VM through the `isa-debug-exit` port under QEMU. On real hardware that port write is a no-op and the machine halts — safe to switch off, since nothing was ever written to disk. | The hardware fallback is not an error; it is the honest outcome. |
 | `selftest` | Re-runs the four checks that are safe to repeat — heap allocation, the zero-on-free sentinel, `int3`, and the PIT — printing one `[ ok ]` line each. It is the shell's own copy of them, not the boot battery itself: the battery is compiled in only under the `selftest` feature, and that build has no shell. **Everything else in the boot battery is left out** — the paging probe (a fixed address that cannot be mapped twice), the stack overflow (it cannot return), and the ring-3 round trip with its page-table audits, which the `user` command exercises on demand instead. The screen does not name what it leaves out, which is a gap in the output rather than in the tests. | A failing check prints `[FAIL]` in the danger colour instead of `[ ok ]`, and the shell returns to the prompt. |
@@ -90,11 +91,12 @@ recorded rather than left blank.
 Two entries above deserve to be stated outright rather than inferred from a table
 cell. **Unauthorised is not applicable because Osmium has no accounts or sessions**
 — though no longer because there is no privilege boundary. Since M6 there are two
-rings: the kernel drops to ring 3 to run the embedded user program (the `user`
-command), which can touch nothing of the kernel's — no kernel mapping is
+rings: the kernel drops to ring 3 to run embedded user programs (the `user` and
+`sched` commands), which can touch nothing of the kernel's — no kernel mapping is
 user-accessible, audited by the battery before ring 3 has ever run and again after
-teardown — and returns through `int 0x80`. One privilege boundary, one program at a
-time, and still nothing to authenticate against: whoever is at the keyboard is the
+teardown — and each returns through `int 0x80`. Since M8 up to two programs run
+concurrently under preemptive round-robin, but they share one address space and
+there is still nothing to authenticate against: whoever is at the keyboard is the
 operator, and physical access is total access. **Offline is not applicable because
 there is no network stack**. A state that depends on a remote response cannot occur
 where no remote call can be made. Both cells stay "n/a" until accounts or networking

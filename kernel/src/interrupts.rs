@@ -1,9 +1,13 @@
-//! IDT, exception handlers, and the legacy PIC + PIT wiring.
+//! IDT, exception handlers, and the legacy PIC + PIT wiring. The timer
+//! vector's handler itself lives in `sched` (a naked entry — it must save
+//! and swap the full register file to preempt ring-3 tasks); this module
+//! installs it and owns the PIC/PIT programming around it.
 //!
 //! Locking rules (see TDD): interrupt handlers never take the console or
 //! serial locks and never allocate — they only touch atomics, lock-free
-//! queues and the PIC (whose mutex the main thread only uses before
-//! interrupts are first enabled).
+//! queues, the PIC (whose mutex the main thread only uses before interrupts
+//! are first enabled), and — timer only — the scheduler lock, whose every
+//! non-IRQ taker runs with interrupts disabled.
 
 use crate::gdt;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -129,7 +133,16 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
             .set_handler_fn(machine_check_handler)
             .set_stack_index(gdt::MACHINE_CHECK_IST_INDEX);
     }
-    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
+    // The timer's entry is a raw naked handler (sched::timer_entry): it must
+    // save and swap the FULL register file to context-switch, which the typed
+    // x86-interrupt convention cannot express.
+    // SAFETY: the address is a valid naked entry that saves the interrupted
+    // context, calls the scheduler, and ends in `iretq`; DPL stays 0 (ring 3
+    // cannot issue `int 32` — only the PIC delivers this vector).
+    unsafe {
+        idt[InterruptIndex::Timer.as_u8()]
+            .set_handler_addr(x86_64::VirtAddr::new(crate::sched::timer_entry_addr()));
+    }
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
     // A floating line can produce a spurious IRQ7 even with devices masked.
     idt[PIC_1_OFFSET + 7].set_handler_fn(spurious_handler);
@@ -178,16 +191,11 @@ pub fn init() {
     x86_64::instructions::interrupts::enable();
 }
 
-fn end_of_interrupt(index: InterruptIndex) {
+pub(crate) fn end_of_interrupt(index: InterruptIndex) {
     // SAFETY: acknowledging the interrupt we are currently handling. The main
     // thread never holds the PIC lock once interrupts are enabled, so this
     // cannot deadlock.
     unsafe { PICS.lock().notify_end_of_interrupt(index.as_u8()) };
-}
-
-extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    end_of_interrupt(InterruptIndex::Timer);
 }
 
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {

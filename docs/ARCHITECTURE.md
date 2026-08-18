@@ -29,7 +29,9 @@ From there the init order is deliberate — each step depends on the one before:
    the IDT** on purpose: the double-fault handler is wired to IST slot 0, so the
    stack it will run on must exist before any handler is installed.
 6. **`interrupts::init`** — loads the IDT (every defined exception vector, the
-   timer and keyboard IRQs, and the `int 0x80` gate at DPL 3 so ring 3 may issue
+   keyboard IRQ, the timer vector wired to `sched::timer_entry` — a naked
+   handler installed by address, because preemption needs to save and swap the
+   full register file — and the `int 0x80` gate at DPL 3 so ring 3 may issue
    it), remaps the PIC clear of the exception vectors,
    programs the PIT to 100 Hz, then enables interrupts.
 7. **`memory::init`** — enables EFER.NXE first (so NX mappings are honoured),
@@ -92,35 +94,49 @@ and asserting the serial log never contains it.
 ## The ring-3 round trip
 
 The `user` command (and the battery's `user_program_runs_in_ring3` check) walks
-the kernel's one privilege boundary end to end. In symbol order:
+the kernel's one privilege boundary end to end — since M8 as the one-task
+degenerate case of the scheduler. In symbol order:
 
 1. **`usermode::run_hello`** hands the embedded `user/hello` ELF — a real,
    linker-scripted Rust binary built by the kernel's build script — to
-   **`run_elf`**, which starts with **`kshared::elf::parse_elf64`**. The parser
+   **`run_programs`**, which starts with **`kshared::elf::parse_elf64`** per
+   image. The parser
    is refusal-first and host-tested: bad magic, truncation, a W+X segment, an
    out-of-window or unaligned vaddr, overlapping segments, an oversize load or
-   a non-executable entry are all `Err` before anything is mapped.
+   a non-executable entry are all `Err` before anything is mapped — and
+   `run_programs` adds the cross-image form of the same rule: two programs
+   claiming overlapping pages are refused before any page is mapped.
 2. **Map, copy, lock.** Each `PT_LOAD` segment is mapped writable **and NX**
    (`memory::map_user_page`), the file bytes are copied in (the `memsz` tail is
    BSS, already correct because frames arrive zeroed), and then
    **`memory::update_user_page`** locks each page to its final per-segment W^X
    permissions, adjusting the W and NX bits and touching nothing else — a page
-   is never writable and executable at the same time, even transiently. The
-   stack page (`USER_STACK_ADDR`) is mapped user-writable, never executable.
-3. **`jump_to_user`** (naked) pushes the callee-saved registers, saves the
-   kernel stack pointer into `KERNEL_CONTINUATION_RSP`, builds the `iretq`
-   frame with the ring-3 selectors, scrubs every GP register so ring 3 sees no
-   kernel state, and `iretq`s to the entry point at CPL 3.
-4. **`int80_entry`** (naked, installed at DPL 3) is the way back. It runs `cld`
-   before any Rust code; `SYS_EXIT` records the exit value, restores the saved
-   kernel stack and its callee-saved registers, and returns into the launcher.
+   is never writable and executable at the same time, even transiently. Each
+   task's stack page (`USER_STACK_ADDRS[i]`) is mapped user-writable, never
+   executable.
+3. **`sched::install` + `sched::enter_tasks`.** `install` gives each task its
+   own kernel stack and fabricates its initial saved context — 15 zeroed GP
+   registers (ring 3 sees no kernel state) under an `iretq` frame with the
+   ring-3 selectors — then points TSS RSP0 at task 0's stack. `enter_tasks`
+   (naked) pushes the callee-saved registers, saves the kernel stack pointer
+   into `KERNEL_CONTINUATION_RSP`, and restores task 0's fabricated context:
+   the same pop-15/`iretq` tail every later resume uses, so first launch and
+   resume are one code path.
+4. **`int80_entry`** (naked, installed at DPL 3) is the way back. It scrubs
+   `EFLAGS.AC` and runs `cld` before any Rust code; `SYS_EXIT` hands the exit
+   value to `sched::sys_exit`, which either resumes the next ready task's
+   saved context or — when the last task exits — deactivates the scheduler,
+   restores the default RSP0 and lets the entry return into the launcher.
    Any other syscall marshals into the SysV ABI, calls `syscall_dispatch`,
    scrubs the caller-saved registers (keeping `rax`) and `iretq`s back to the
-   program. `SYS_WRITE`'s byte goes to serial deliberately: it is
-   program-supplied output that lets the CI log show the syscall ran, not typed
-   input.
-5. **Teardown and audit.** `run_elf` unmaps every user page (the frames are not
-   reclaimed — bump allocator), and **`memory::no_stray_user_mappings`** then
+   program. `SYS_WRITE` renders its byte to the local console, never serial:
+   the shipped `user`/`sched` commands must not grow an off-device output
+   channel, and `cargo xtask privacy` types both commands to prove it.
+5. **Teardown and audit.** `run_programs` unmaps every user page of every
+   program (the frames are not
+   reclaimed — bump allocator), the per-task kernel stacks are freed (and
+   therefore zeroed — the allocator scrubs on free), and
+   **`memory::no_stray_user_mappings`** then
    re-audits the live page tables: no user-accessible leaf anywhere, and
    user-accessible intermediates only where they reach the declared user
    window. The battery runs that audit both before ring 3 has ever run and
@@ -128,8 +144,46 @@ the kernel's one privilege boundary end to end. In symbol order:
 
 The boundary is stated, not oversold: a misbehaving user program is fatal
 (every exception handler panics — there is no process model to terminate just
-the program), the loader is one-program-at-a-time by design, and each run leaks
+the program, and a fault takes every task down), tasks share one address space
+(isolated from the kernel, not yet from each other), and each run leaks
 its few mapped frames until frame reclamation exists.
+
+## The preemptive context switch (M8)
+
+The timer path is the one place the kernel swaps register files, and its whole
+design fits in one sequence:
+
+```mermaid
+sequenceDiagram
+    participant A as Task A (ring 3, never yields)
+    participant CPU as CPU
+    participant T as sched::timer_entry (naked)
+    participant R as sched::timer_tick (Rust)
+    participant B as Task B (ring 3)
+
+    A--xCPU: PIT tick (IRQ 0)
+    CPU->>T: push SS/RSP/RFLAGS/CS/RIP onto A's kernel stack (TSS RSP0)
+    Note over T: scrub EFLAGS.AC, cld,<br/>push 15 GP registers
+    T->>R: timer_tick(rsp)
+    Note over R: TICKS++, EOI to the PIC.<br/>Saved CS says CPL 3 and the<br/>scheduler is active → save A's rsp,<br/>round-robin to B, retarget RSP0<br/>at B's kernel stack
+    R->>T: B's saved rsp
+    Note over T: pop B's 15 GP registers
+    T->>B: iretq — B resumes mid-instruction-stream
+```
+
+The invariants that make it sound are three, and each is asserted rather than
+assumed. **Only CPL 3 is preempted**: `timer_tick` reads the saved CS and
+returns unchanged for kernel contexts, so the kernel is non-preemptible and the
+locking rules stay simple. **Every task traps onto its own kernel stack**:
+RSP0 is rewritten at every switch, because two tasks sharing one privilege
+stack would overwrite each other's saved frames. **The saved context has one
+format** — 15 GP registers in a fixed order under the CPU's interrupt frame —
+shared by the timer's save, `install`'s fabricated initial frames, and the
+restore tails in both the timer and syscall entries. The battery proves the
+behaviour rather than the diagram: an unyielding compute program is preempted
+(a later-launched program exits first), its checksum survives every switch
+bit-exact, and a program that holds `EFLAGS.AC` set for its whole run never
+gets it past the entry scrub.
 
 ## Where to read next
 

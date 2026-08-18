@@ -110,7 +110,10 @@ jobs:
           # program's SYS_WRITE could emit to serial post-boot, defeating the
           # keystroke-privacy allowlist. User output now goes to the console;
           # this keeps the syscall path from re-growing a serial channel.
-          files="kernel/src/shell.rs kernel/src/task/keyboard.rs kernel/src/usermode.rs"
+          # sched.rs joined at M8 for the same reason: the timer entry and
+          # SYS_EXIT path run while user programs execute, so they must never
+          # grow a serial or log call either.
+          files="kernel/src/shell.rs kernel/src/task/keyboard.rs kernel/src/usermode.rs kernel/src/sched.rs"
           for p in $files; do
             test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
           done

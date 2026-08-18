@@ -123,9 +123,16 @@ appear in a v1 pull request.
   shell is still compiled into the kernel.
 - **Filesystems: no ramfs, no FAT32.** The bootloader's ramdisk facility is not
   used. Nothing is mounted.
-- **Preemptive scheduling.** The v1 executor is cooperative: tasks yield, and the
-  idle path halts until the next interrupt. There is no timer-driven context switch
-  and no task priority.
+- ~~**Preemptive scheduling.**~~ **Delivered as M8 (2026-08-18) — for ring-3
+  tasks.** The PIT tick now drives a round-robin context switch between user
+  programs, each with its own kernel stack (TSS RSP0 is retargeted per switch):
+  a program that never yields loses the CPU anyway, which the battery proves by
+  exit order, and an exact checksum across dozens of switches proves the saved
+  register file survives intact. The *kernel* remains non-preemptible and the
+  in-kernel executor cooperative — deliberately: kernel paths are short, and
+  non-preemptibility is what keeps the locking rules three lines long. There is
+  still no task priority, and tasks still share one address space (per-task
+  page tables are the next milestone on that road).
 - **APIC and HPET.** The legacy 8259 PIC and the 8254 timer are used instead. The
   APIC requires ACPI table parsing for no demonstrable v1 benefit; that cost is
   deferred until something needs it.

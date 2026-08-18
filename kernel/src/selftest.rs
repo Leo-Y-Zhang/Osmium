@@ -23,6 +23,8 @@ pub fn run() -> ! {
     shell_processes_a_scripted_session();
     elf_loader_refuses_wx();
     user_program_runs_in_ring3();
+    preemptive_scheduling_is_real();
+    concurrent_overlap_is_refused();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
     measure_console_scroll();
@@ -415,6 +417,124 @@ fn user_program_runs_in_ring3() {
         "EFLAGS.AC survived the syscall gate: ring 3 can turn SMAP off"
     );
     serial_println!("[selftest] security: syscall gate scrubs EFLAGS.AC (SMAP stays on) ... ok");
+}
+
+/// The M8 preemption proof, in one run: `counter` — a ~30M-iteration compute
+/// loop that NEVER yields (a syscall is not a yield; only the timer moves the
+/// CPU) — is launched first, `hello` second. Four independent properties:
+///
+/// 1. **Preemption is real.** `hello` exits FIRST even though `counter` was
+///    launched first and never gave up the CPU. Under cooperative scheduling
+///    the exit order is the launch order; only a timer-driven switch can
+///    invert it. (The named mutation — gating the timer's switch path off —
+///    was observed producing exactly the cooperative order.)
+/// 2. **Context switching preserves the register file exactly.** `counter`
+///    keeps eight accumulators live across every switch and exits with their
+///    fold; the kernel recomputes the same fold independently and demands
+///    equality. Tens of save/restore round trips with one corrupted register
+///    anywhere produce a different checksum. (Mutation: clobbering one
+///    callee-saved register in the restore path was observed failing here.)
+/// 3. **Both programs really ran at CPL 3** — hello exits with its CS.
+/// 4. **The timer entry scrubs EFLAGS.AC.** `counter` holds AC set for its
+///    entire run, so every timer interrupt taken from it enters the kernel
+///    with AC at its most hostile; SMAP is only real if the entry scrubs it
+///    before any Rust runs. (Mutation: removing the scrub was observed
+///    setting `TIMER_ENTRY_AC`.)
+fn preemptive_scheduling_is_real() {
+    use core::sync::atomic::Ordering;
+    let report = crate::usermode::run_counter_and_hello()
+        .expect("an embedded ELF was refused for the concurrent run");
+    let counter = &report.exits[0];
+    let hello = &report.exits[1];
+    assert_eq!(
+        (hello.seq, counter.seq),
+        (0, 1),
+        "hello (launched second) did not exit first: scheduling is not preemptive"
+    );
+    assert_eq!(
+        hello.code & 3,
+        3,
+        "the concurrently-scheduled hello ran at CPL {} (expected ring 3)",
+        hello.code & 3
+    );
+    assert!(
+        report.preemptive_switches >= 1,
+        "no timer-driven switch was counted, yet the exit order says one happened"
+    );
+    // Under QEMU TCG (the only environment the battery runs in) counter's
+    // loop spans dozens of 10 ms ticks; ≥2 is the floor that proves the
+    // save/restore machinery cycled repeatedly, not once by luck.
+    assert!(
+        report.ring3_round_trips >= 2,
+        "only {} timer round-trips were taken from ring 3",
+        report.ring3_round_trips
+    );
+    assert_eq!(
+        counter.code,
+        expected_counter_checksum(),
+        "counter's checksum is wrong: a context switch corrupted its registers"
+    );
+    serial_println!(
+        "[selftest] sched: unyielding counter preempted — hello (launched 2nd) exited 1st \
+         ({} switches, {} round-trips) ... ok",
+        report.preemptive_switches,
+        report.ring3_round_trips
+    );
+    serial_println!("[selftest] sched: counter checksum exact across every context switch ... ok");
+    assert!(
+        !crate::sched::TIMER_ENTRY_AC.load(Ordering::SeqCst),
+        "EFLAGS.AC survived the timer entry: ring 3 can turn SMAP off for async kernel entries"
+    );
+    serial_println!(
+        "[selftest] security: timer entry scrubs EFLAGS.AC (SMAP holds under preemption) ... ok"
+    );
+}
+
+/// The kernel's independent twin of `user/counter`'s checksum loop — same
+/// seeds, same mixing, same fold, same iteration count. The two must stay in
+/// step or the battery fails, which is the intended failure mode for a drift:
+/// loud, at the first CI boot. Kept deliberately in ring 0 Rust (not shared
+/// through kshared) so the user program and the expectation cannot share a
+/// single implementation that a bug could hide in.
+fn expected_counter_checksum() -> u64 {
+    const ITERS: u64 = 30_000_000; // must match user/counter/src/main.rs
+    let mut a: u64 = 0x243F_6A88_85A3_08D3;
+    let mut b: u64 = 0x1319_8A2E_0370_7344;
+    let mut c: u64 = 0xA409_3822_299F_31D0;
+    let mut d: u64 = 0x082E_FA98_EC4E_6C89;
+    let mut e: u64 = 0x4528_21E6_38D0_1377;
+    let mut f: u64 = 0xBE54_66CF_34E9_0C6C;
+    let mut g: u64 = 0xC0AC_29B7_C97C_50DD;
+    let mut h: u64 = 0x3F84_D5B5_B547_0917;
+    let mut i: u64 = 0;
+    while i < ITERS {
+        a = a.rotate_left(7) ^ i;
+        b = b.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i);
+        c = c.wrapping_add(a ^ b);
+        d ^= c.rotate_right(11);
+        e = e.wrapping_add(d.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+        f = (f ^ e).rotate_left(3);
+        g = g.wrapping_add(f);
+        h ^= g.wrapping_add(i);
+        i += 1;
+    }
+    a ^ b ^ c ^ d ^ e ^ f ^ g ^ h
+}
+
+/// Two copies of the same image claim the same pages; the cross-image overlap
+/// check must refuse the run BEFORE anything is mapped — the audit right
+/// after proves the refusal left no trace.
+fn concurrent_overlap_is_refused() {
+    use kshared::elf::ElfError;
+    assert!(
+        matches!(crate::usermode::run_hello_twice(), Err(ElfError::Overlap)),
+        "two programs at the same base were not refused"
+    );
+    assert!(
+        crate::memory::no_stray_user_mappings(),
+        "the refused overlapping run left a user-accessible mapping behind"
+    );
+    serial_println!("[selftest] sched: two programs claiming the same pages are refused ... ok");
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both

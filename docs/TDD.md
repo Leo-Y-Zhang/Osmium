@@ -1,12 +1,13 @@
 # TDD — Osmium v1 kernel
 
-**Status:** current — matches the shipped v0.1.0 code; both open questions are resolved below
-**Date:** 2026-08-17 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
+**Status:** current — matches the shipped code through M8 (preemptive multitasking, 2026-08-18); both open questions are resolved below
+**Date:** 2026-08-18 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
 
 ## Approach
 
-Osmium is a three-crate Cargo workspace, plus `user/hello` — a standalone crate the
-kernel's build script compiles into the embedded user ELF. `kernel/` is a `no_std`
+Osmium is a three-crate Cargo workspace, plus `user/hello` and `user/counter` —
+standalone crates the
+kernel's build script compiles into the embedded user ELFs. `kernel/` is a `no_std`
 binary built for
 `x86_64-unknown-none`; it owns everything that touches hardware. `kshared/` is a
 `no_std` library of pure logic — address arithmetic, memory-region maths, the line
@@ -58,9 +59,10 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 | Kernel heap | `0x_4444_4444_0000` | 1 MiB | Chosen to be obviously synthetic in a fault dump. Mapped page by page at M3 from frames supplied by the frame allocator. |
 | Double-fault stack (IST 0) | Allocated in `.bss` | 20 KiB | `DOUBLE_FAULT_STACK`: a byte array inside an `UnsafeCell` (which is what keeps it out of read-only memory) rather than a `static mut`, so no `&mut` to a mutable static is ever formed. Its top is written into `TSS.interrupt_stack_table[0]`. Never overlaps the kernel stack; that separation is the entire point of it. |
 | NMI stack (IST 1), machine-check stack (IST 2) | Allocated in `.bss` | 20 KiB each | Same `IstStack` arrangement as IST 0, wired in `gdt.rs`, so those faults too run on known-good memory. |
-| Ring-0 privilege stack (TSS RSP0) | Allocated in `.bss` | 20 KiB | `PRIVILEGE_STACK`: the stack the CPU switches to when `int 0x80` traps in from ring 3. |
-| User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy. Mapped only while a user program runs; unmapped and audited afterwards. |
-| User stack page | `0x80_0000` | 4 KiB | `usermode::USER_STACK_ADDR`: user-accessible, writable, never executable; sits outside the image window and the audit knows both. |
+| Default ring-0 privilege stack (TSS RSP0) | Allocated in `.bss` | 20 KiB | `PRIVILEGE_STACK`: the stack the CPU switches to when ring 3 traps in *outside* a scheduler run. While tasks run, RSP0 points at the current task's own kernel stack instead — see the next row. |
+| Per-task kernel stacks | Heap-allocated (`Box<[u8]>`) | 20 KiB each (M8) | One per scheduled task, created at `sched::install` and freed at `collect` (the allocator's zero-on-free scrub erases a dead task's saved registers). RSP0 is retargeted to the current task's stack on every context switch, so each task's trap frames land on its own memory — two tasks sharing one privilege stack would overwrite each other's saved context. |
+| User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy. `hello` links at the base, `counter` at `0x50_0000`; the loader refuses cross-image page overlap. Mapped only while user programs run; unmapped and audited afterwards. |
+| User stack pages | `0x80_0000`, `0x81_0000` | 4 KiB each | `usermode::USER_STACK_ADDRS`, one per task slot: user-accessible, writable, never executable; they sit outside the image window in one shared 2 MiB page-table region and the audit knows all of them. |
 | Physical memory window | Bootloader-chosen | All of RAM | Read via `boot_info.physical_memory_offset`; never hard-coded. |
 
 ### Global state table
@@ -72,7 +74,7 @@ interrupt-context deadlocks.
 | Global | Type | Initialised at | Protected by | Touched from IRQ? |
 |---|---|---|---|---|
 | `GDT` | `GlobalDescriptorTable` + selectors | M2, once | `spin::LazyLock`, then immutable | No |
-| `TSS` | `TaskStateSegment` | M2, once | Immutable after load | Read by CPU only |
+| `TSS` | `TaskStateSegment` in an `UnsafeCell` (`TssCell`) | M2 (ISTs, default RSP0); **RSP0 rewritten per context switch since M8** | Every RSP0 write happens with interrupts disabled (`set_privilege_stack` asserts it), so the CPU cannot take a ring-3 trap mid-update; the GDT descriptor holds only the TSS's address (`tss_segment_unchecked`), so no shared reference is held across a mutation | Read by CPU on privilege transitions; **written from the timer and `SYS_EXIT` paths** (IF=0 in both) |
 | `DOUBLE_FAULT_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` | Written only by the CPU on double fault | Yes, by hardware |
 | `IDT` | `InterruptDescriptorTable` | M2, once | `spin::LazyLock`, then immutable | Read by CPU only |
 | `PICS` | `ChainedPics` | M2 | `spin::Mutex` | **Yes** — end-of-interrupt write. Held for a few instructions; never nested with any other lock. |
@@ -81,26 +83,38 @@ interrupt-context deadlocks.
 | `SCANCODE_QUEUE` | `Once<ArrayQueue<u8>>`, capacity 128 | M4; the queue's storage is allocated on the first `ScancodeStream::new()`, in task context | Lock-free queue, `Once` for the one-time construction | **Yes** — the sole IRQ-to-task channel. The handler pushes and never blocks or allocates. A full queue drops the byte that has just arrived — the newest, not the oldest — and nothing counts the loss. Scancodes arriving before the queue exists are dropped for the same reason: nobody is typing during early boot. |
 | `WAKER` | `AtomicWaker` | M4 | Its own atomics | **Yes** — the keyboard handler wakes the shell task through it after a successful push. See the `ALLOCATOR` row for the one drop that entails. |
 | `SERIAL1` | `SerialPort` at `0x3F8` | M1 | `spin::Mutex`, taken with a plain `lock` | **No.** Handlers never write to serial at all. The single exception is the double-fault handler on its terminal path, which disables interrupts and reclaims the lock before printing, because the holder it interrupted can never resume. |
-| `CONSOLE` | `Option<Console>`: glyph renderer writing straight to the framebuffer | M1 | `spin::Mutex` | **Never from an asynchronous IRQ** — the hard rule below. The `int 0x80` syscall dispatcher writes `SYS_WRITE` output to the console, but that is a *synchronous* call in the shell task's own context, not a preempting interrupt; `run_elf` `debug_assert`s the caller does not hold the lock across it, so it cannot deadlock. |
+| `CONSOLE` | `Option<Console>`: glyph renderer writing straight to the framebuffer | M1 | `spin::Mutex` | **Never from an asynchronous IRQ** — the hard rule below. The `int 0x80` syscall dispatcher writes `SYS_WRITE` output to the console, but that is a *synchronous* trap from the running task (IF=0 for its duration — the timer cannot preempt a syscall mid-write), not a preempting interrupt; `run_programs` `debug_assert`s the caller does not hold the lock across a run, so it cannot deadlock. |
 | `ALLOCATOR` | Zeroing wrapper over `LockedHeap` | M3 | `spin::Mutex` inside the heap | **Never allocates from IRQ, and frees from it only in a case that cannot arise.** The keyboard handler's `WAKER.wake()` consumes a cloned `Waker` and drops its `Arc<TaskWaker>`; a *last* drop would deallocate here, in interrupt context, against a lock the interrupted code may hold. It is never the last, and the condition is worth stating because the code depends on it: the executor's `waker_cache` holds a reference for as long as the task exists, and the shell task never completes. A woken task that can finish would break this row, so this row changes before that code does. |
 | `MAPPER`, `FRAME_ALLOCATOR` | `Option<OffsetPageTable>`, `Option<BootFrameAllocator>` | M3 | `spin::Mutex` | No |
 | `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
-| `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition (TSS RSP0) | Yes, by hardware |
-| `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `jump_to_user` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's `SYS_EXIT` path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_ring3`, which always writes it first |
-| `USER_EXIT_CODE` | `AtomicU64` | M6; per `SYS_EXIT` | Atomic, `SeqCst` | Written by the `int 0x80` entry; read by the launcher after control returns |
+| `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition taken outside a scheduler run (TSS RSP0's default target) | Yes, by hardware |
+| `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `sched::enter_tasks` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's run-complete path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_tasks`, which always writes it first |
+| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; `debug_assert`s pin the discipline. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
+| `TIMER_ENTRY_AC` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M8 | Atomic, `SeqCst` | **Yes** — set by the timer's Rust half if `EFLAGS.AC` survived the naked entry's scrub; the battery asserts it never did while a hostile program held AC set |
 | `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
 | `CYCLES_PER_MS` | `AtomicU64`, `#[cfg(feature = "selftest")]` only | `time::calibrate`, battery builds only | Atomic, `Relaxed` | No |
 
 **The concurrency rule, stated once and enforced everywhere:** an interrupt handler
-touches atomics, the lock-free scancode queue, and one lock — the PIC's, for the
-end-of-interrupt write, which the main thread never holds once interrupts are
-enabled. Nothing else. It never takes the console lock, never takes the serial lock,
+touches atomics, the lock-free scancode queue, and at most one lock at a time —
+the PIC's, for the end-of-interrupt write, which the main thread never holds once
+interrupts are enabled, and (timer and `SYS_EXIT` paths only, since M8) the
+scheduler's, whose every non-IRQ taker runs with interrupts disabled, so the lock
+is uncontendable rather than merely uncontended. The timer handler takes them
+strictly in sequence — EOI completes and releases the PIC before `SCHED` is
+touched — so no two locks are ever held together. Nothing else: a handler never
+takes the console lock, never takes the serial lock,
 never allocates and never logs; there is no `try_lock` fallback because there is no
 contended access to fall back from. That is stronger than the rule this document
 first proposed, and it is the reason there is no plausible deadlock between the
 shell and the interrupt handlers. The one handler that does write to serial is the
 double-fault handler, which is a terminal path: it disables interrupts, reclaims the
 lock from a holder that can never resume, prints, and exits.
+
+**Why the kernel is non-preemptible, stated as a decision:** the timer switches
+contexts only when the interrupted CS's CPL is 3. Preempting kernel code would
+invalidate the paragraph above (any lock could then be interrupted mid-hold and
+re-entered), for no benefit a two-task round-robin needs — every kernel path here
+is short. If kernel preemption is ever wanted, this section is rewritten first.
 
 ### Correction to the original plan: three memory-design decisions
 
@@ -229,7 +243,9 @@ mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 M
                  //   user-page map/update/unmap, the page-table audit
 mod time;        // TSC boot-phase marks; battery-only PIT calibration to microseconds
 mod task;        // executor (cooperative), keyboard (ScancodeStream)
-mod usermode;    // ring 3: run_elf over kshared::elf, int 0x80 entry, teardown
+mod sched;       // M8: preemptive round-robin of ring-3 tasks — TCBs, per-task
+                 //   kernel stacks, the naked timer entry, context switch, SYS_EXIT
+mod usermode;    // ring 3: run_programs over kshared::elf, int 0x80 entry, teardown
 mod shell;       // prompt, dispatch, command implementations
 mod selftest;    // #[cfg(feature = "selftest")] battery; arms EXPECTING_DOUBLE_FAULT last
 mod qemu;        // exit_success() / exit_failure() via port 0xf4
@@ -281,8 +297,15 @@ CPU-advertised supervisor-hardening bit (SMEP/SMAP/UMIP) is live in CR4; the ker
 heap is NX; an oversized allocation is refused with the allocator intact; an async
 task completes through its waker; a scripted shell session via injected scancodes
 renders `help`'s full output; a crafted W+X ELF image is refused; the embedded
-`hello` ELF runs at CPL 3 and returns via syscall; the page-table audit again, AFTER
-the ring-3 teardown; `update_user_page` narrows W and NX correctly (the W^X
+`hello` ELF runs at CPL 3 and returns via syscall; the M8 preemption proof —
+`counter` (an unyielding 30M-iteration compute loop holding `EFLAGS.AC` hostile)
+launched first and `hello` second, asserting hello exits first, ≥1 preemptive
+switch and ≥2 ring-3 timer round-trips were taken, counter's exit checksum equals
+the kernel's independent recomputation (register integrity across every switch),
+and the timer entry's AC scrub was never seen defeated; two programs claiming the
+same pages are refused with nothing mapped; the page-table audit again, AFTER
+the ring-3 teardown (covering the concurrent run too); `update_user_page` narrows
+W and NX correctly (the W^X
 plumbing); the console scroll cost is measured; memory stats are reported; and, last
 and unreturning, the deliberate stack overflow.
 
@@ -335,11 +358,13 @@ each is empty is the design.
 | 8 | **Panic-time lock recovery**, serial and console | `panic` handler, double-fault handler | A panic may happen while either lock is held, including from interrupt context, which is the one case the concurrency rule cannot prevent. The order is always the same: interrupts off, reclaim, then report. The panic handler reclaims both because it writes to both; the double-fault handler's selftest exit reclaims serial only, because serial is the only sink it uses. Sound only because the machine is stopping — the handler halts or exits and never returns, no other code will observe either sink again, and a legible panic is worth more than a lock invariant with no future reader. **These two handlers are the only places any lock is force-released.** It is never a pattern to copy. |
 | 9 | **Test reads of freed memory** | `selftest` (`#[cfg(feature = "selftest")]`), and the shell's `selftest` command, which ships a runtime twin of the zero-on-free check | Reads are volatile, through a raw pointer, within a block whose size is known, and the value is used solely for an assertion. The battery copy is not compiled into a shipped image; the shell's twin is, under exactly the same discipline. Prefer the sentinel-absence test, which needs no such read; if a direct read is used, it is confined to this row. |
 | 10 | **`unsafe impl`** — a promise about a whole type, not one expression | `memory::frames`, `memory::heap`, `gdt` | Four of them, each carrying its `// SAFETY:` comment on the impl itself, since there is no block to attach one to. **`FrameAllocator for BootFrameAllocator`** promises a frame is never handed out twice: `next` only ever grows, and it indexes a deterministic iterator over a boot memory map that does not change after hand-over, so frame *n* is returned exactly once. **`GlobalAlloc for ZeroOnFree`** adds nothing to `LockedHeap`'s contract and defers to it for both calls; the only extra act is scrubbing a block the caller has already relinquished, in the window between the caller's last legal access and the inner `dealloc` — after that `dealloc` the allocator owns those bytes, which is why the order is fixed (row 7). **`Sync for IstStack`** covers the three IST `UnsafeCell`s of row 6: nothing in the kernel reads or writes that memory, so there is no cross-thread access to make sound; only the CPU touches it, and only while handling the fault the slot is wired to. **`Sync for PrivilegeStack`** is the same promise for the TSS RSP0 stack: only the CPU writes it, on a privilege transition into the kernel. |
-| 11 | **Naked ring transitions** | `usermode::jump_to_user`, `usermode::int80_entry` | `jump_to_user` pushes the SysV callee-saved registers, saves RSP into `KERNEL_CONTINUATION_RSP` *before* any ring-3 instruction can execute, builds the `iretq` frame with the ring-3 selectors, and scrubs every GP register so ring 3 sees no kernel state. `int80_entry` runs `cld` before any Rust code (an interrupt gate clears IF but **not** DF, and SysV requires DF=0 at a call boundary); `SYS_EXIT` restores the saved kernel stack and its callee-saved registers and `ret`s into the launcher; every other syscall marshals into the SysV ABI, aligns the stack, calls `syscall_dispatch`, scrubs the caller-saved registers (keeping `rax`, the return value) and `iretq`s back. |
-| 12 | **User-image copy** | `usermode::run_elf` | The `copy_nonoverlapping` writes to pages just mapped writable that cover `memsz` bytes; the parser bounds-checked `file_start..+filesz` against the image before anything was mapped. The `memsz` tail past `filesz` is BSS, and frames arrive zeroed, so it is already correct. |
-| 13 | **DPL-3 gate install** | `interrupts` (IDT construction) | The `int 0x80` handler address is a valid naked entry that ends in `iretq` (or, for `SYS_EXIT`, restores the saved kernel stack and returns); DPL 3 lets a ring-3 program issue `int 0x80` without a #GP — and only that vector, since every other gate stays DPL 0. |
+| 11 | **Naked ring transitions and context switches** | `sched::enter_tasks`, `sched::timer_entry`, `usermode::int80_entry` | `enter_tasks` pushes the SysV callee-saved registers, saves RSP into `KERNEL_CONTINUATION_RSP` *before* any ring-3 instruction can execute, and restores the first task's fabricated context (15 zeroed GP registers — ring 3 sees no kernel state — then `iretq` with the ring-3 selectors). `timer_entry` scrubs `EFLAGS.AC` and runs `cld` before anything else (a gate clears IF but neither AC nor DF), saves the 15 GP registers in the one canonical order, and restores whichever saved context `timer_tick` returns — the saved-context layout is a single contract shared by the fabricator, both entries and both restore tails. `int80_entry` scrubs AC and DF the same way; `SYS_EXIT` hands the code to `sched::sys_exit` and either resumes the next task's saved context or restores the launcher continuation; every other syscall marshals into the SysV ABI, aligns the stack, calls `syscall_dispatch`, scrubs the caller-saved registers (keeping `rax`, the return value) and `iretq`s back. |
+| 12 | **User-image copy** | `usermode::run_programs` | The `copy_nonoverlapping` writes to pages just mapped writable that cover `memsz` bytes; the parser bounds-checked `file_start..+filesz` against the image before anything was mapped. The `memsz` tail past `filesz` is BSS, and frames arrive zeroed, so it is already correct. |
+| 13 | **DPL-3 and raw gate installs** | `interrupts` (IDT construction) | The `int 0x80` handler address is a valid naked entry that ends in `iretq` (or, on the last `SYS_EXIT`, restores the saved kernel stack and returns); DPL 3 lets a ring-3 program issue `int 0x80` without a #GP — and only that vector: the timer's naked entry (vector 32, also installed by address, since the typed x86-interrupt convention cannot swap a full register file) stays DPL 0, reachable only by PIC delivery. |
 | 14 | **`rdtsc`** | `time` | Reads the timestamp counter; no memory effects. |
 | 15 | **EFER.NXE** | `memory::init` | The CPU is already in long mode (EFER.LME set by the bootloader); the update only adds NXE, which every x86_64 CPU supports, and it runs before any NX mapping is created so the bit is honoured everywhere it is set. |
+| 16 | **TSS RSP0 mutation** (M8) | `gdt::set_privilege_stack`, `gdt::init` | The TSS lives in an `UnsafeCell` and its GDT descriptor is built from a raw pointer, so no `&'static` shared reference exists to alias the write. Every write happens with interrupts disabled at CPL 0 (asserted), and the CPU reads RSP0 only on a ring-3 → ring-0 transition, which cannot occur in that window — so the CPU never observes a torn or stale value. The accompanying `unsafe impl Sync for TssCell` carries the same argument. |
+| 17 | **Saved-context reads and fabrication** (M8) | `sched::timer_tick` (frame CS read), `sched::build_initial_frame` | `timer_tick`'s one raw read is the saved CS at a fixed, documented offset inside the context `timer_entry` pushed moments earlier on the current stack — in-bounds by the layout contract the same module defines. `build_initial_frame` writes only within the task's own boxed kernel stack through slice indexing (no raw pointers), and the layout it fabricates is the same contract. |
 
 ## Migrations
 
@@ -359,6 +384,7 @@ Every green milestone is committed and pushed.
 | **M5** | The line editor from `kshared` (history is the shell's, because history needs the heap), the full command surface, boot-to-shell time in the banner from the PIT tick count, the complete battery ending with the stack-overflow check, the RAM floor measured and pinned per firmware, the size budget tightened to the measured value, the shipped-image boot job, README screenshot. | Yes | `git revert` to the M4 tag; every earlier gate still holds. |
 | **M6** | Ring 3 and the `int 0x80` system-call path: user GDT segments, TSS RSP0 privilege stack, the DPL-3 gate, `jump_to_user`/`int80_entry` with register scrubbing both ways, and the page-table audit. Self-tests: the user program runs at CPL 3; no mapping is user-accessible. | Yes | `git revert`; M5's single-ring kernel still boots and passes its battery. |
 | **M7** | ELF loading: `user/hello`, a linker-scripted Rust ELF built by the kernel's build script and embedded as bytes; `kshared::elf`, a host-tested refusal-first parser; per-segment W^X via `update_user_page`; the kernel heap made NX. Self-tests: a W+X image refused, the audit re-run after teardown, W^X flag plumbing. | Yes | `git revert`; M6 still proves the ring transition. |
+| **M8** | Preemptive multitasking of ring-3 tasks: `sched` (TCBs, per-task heap-allocated kernel stacks, the naked timer entry with its AC scrub, round-robin switch, `SYS_EXIT` routing), TSS RSP0 made mutable and retargeted per switch, the multi-program loader with cross-image overlap refusal, `user/counter` (an unyielding register-heavy checksum program that holds AC hostile), and the `sched` shell command. Self-tests: exit-order preemption proof, exact checksum across every switch, timer-entry AC scrub, overlap refusal, the existing audits now covering the concurrent run. | Yes | `git revert`; M7's single-program cooperative kernel still boots and passes its battery. |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
 port `0x60` — the controller delivers no further interrupts until it is read — but
@@ -490,6 +516,13 @@ must be seen to break it.
   must fail); map its `.data` read-only (the program's volatile write-back must
   fault); leave a USER probe leaf or a surviving stack mapping (the audit must
   fail); rewrite `update_user_page` wholesale (the NX-preservation check must fail).
+- *Mutation, M8 (all three observed failing 2026-08-18):* pin the timer's pick to
+  the current task (`next = cur` — scheduling degrades to cooperative; the
+  exit-order assertion fails with "scheduling is not preemptive"); delete the
+  timer entry's `pushfq/and/popfq` AC scrub (the `TIMER_ENTRY_AC` assertion
+  fails); zero the preempted task's saved `rbx` at the moment of a switch (the
+  checksum-equality assertion fails with "a context switch corrupted its
+  registers" — one register, one switch, caught).
 
 **Build gates**
 
