@@ -106,14 +106,20 @@ degenerate case of the scheduler. In symbol order:
    a non-executable entry are all `Err` before anything is mapped — and
    `run_programs` adds the cross-image form of the same rule: two programs
    claiming overlapping pages are refused before any page is mapped.
-2. **Map, copy, lock.** Each `PT_LOAD` segment is mapped writable **and NX**
-   (`memory::map_user_page`), the file bytes are copied in (the `memsz` tail is
-   BSS, already correct because frames arrive zeroed), and then
-   **`memory::update_user_page`** locks each page to its final per-segment W^X
-   permissions, adjusting the W and NX bits and touching nothing else — a page
-   is never writable and executable at the same time, even transiently. Each
-   task's stack page (`USER_STACK_ADDRS[i]`) is mapped user-writable, never
-   executable.
+2. **A private world per program (M9), then map, copy, lock.** Each program
+   gets its own **`memory::AddressSpace`** — the kernel's PML4 cloned with
+   every kernel subtree shared and the user region's page-table slots private
+   (the low-half contents this rests on were measured, not assumed; the
+   constructor's comment records the two bootloader mappings it must keep
+   shared, and asserts the user slots are vacant). Each `PT_LOAD` segment is
+   then mapped writable **and NX** into that space, the file bytes are copied
+   in through the kernel's physical alias (the `memsz` tail is BSS, already
+   correct because frames arrive zeroed), and
+   **`AddressSpace::update_user_page`** locks each page to its final
+   per-segment W^X permissions, adjusting the W and NX bits and touching
+   nothing else — a page is never writable and executable at the same time,
+   even transiently. The stack page (`USER_STACK_ADDR` — the SAME virtual
+   address in every space) is mapped user-writable, never executable.
 3. **`sched::install` + `sched::enter_tasks`.** `install` gives each task its
    own kernel stack and fabricates its initial saved context — 15 zeroed GP
    registers (ring 3 sees no kernel state) under an `iretq` frame with the
@@ -125,28 +131,30 @@ degenerate case of the scheduler. In symbol order:
 4. **`int80_entry`** (naked, installed at DPL 3) is the way back. It scrubs
    `EFLAGS.AC` and runs `cld` before any Rust code; `SYS_EXIT` hands the exit
    value to `sched::sys_exit`, which either resumes the next ready task's
-   saved context or — when the last task exits — deactivates the scheduler,
-   restores the default RSP0 and lets the entry return into the launcher.
+   saved context (loading that task's RSP0 **and CR3**) or — when the last
+   task exits — deactivates the scheduler, restores the default RSP0 and the
+   kernel's own CR3, and lets the entry return into the launcher.
    Any other syscall marshals into the SysV ABI, calls `syscall_dispatch`,
    scrubs the caller-saved registers (keeping `rax`) and `iretq`s back to the
    program. `SYS_WRITE` renders its byte to the local console, never serial:
    the shipped `user`/`sched` commands must not grow an off-device output
    channel, and `cargo xtask privacy` types both commands to prove it.
-5. **Teardown and audit.** `run_programs` unmaps every user page of every
-   program (the frames are not
-   reclaimed — bump allocator), the per-task kernel stacks are freed (and
-   therefore zeroed — the allocator scrubs on free), and
-   **`memory::no_stray_user_mappings`** then
-   re-audits the live page tables: no user-accessible leaf anywhere, and
-   user-accessible intermediates only where they reach the declared user
-   window. The battery runs that audit both before ring 3 has ever run and
-   again after teardown.
+5. **Teardown and audit.** Teardown is dropping the spaces: the kernel's own
+   table was never touched, so there is nothing to unmap — the per-task tables
+   and user frames leak (bump allocator), and the per-task kernel stacks are
+   freed (and therefore zeroed — the allocator scrubs on free).
+   **`memory::no_stray_user_mappings`** then re-audits the KERNEL's table in
+   its M9 total form: not one user-accessible entry, leaf or intermediate,
+   anywhere, ever. The battery runs that audit both before ring 3 has ever
+   run and again after every scenario.
 
 The boundary is stated, not oversold: a misbehaving user program is fatal
-(every exception handler panics — there is no process model to terminate just
-the program, and a fault takes every task down), tasks share one address space
-(isolated from the kernel, not yet from each other), and each run leaks
-its few mapped frames until frame reclamation exists.
+(every exception handler panics — there is no per-task fault termination yet,
+so a fault takes every task down), and each run leaks its few mapped frames
+and page-table frames until frame reclamation exists. What M9 removed from
+this list is memory sharing: tasks are now isolated from each other as well
+as from the kernel, proven by two instances of one image at one virtual
+address each seeing only its own data.
 
 ## The preemptive context switch (M8)
 
@@ -171,19 +179,24 @@ sequenceDiagram
     T->>B: iretq — B resumes mid-instruction-stream
 ```
 
-The invariants that make it sound are three, and each is asserted rather than
+The invariants that make it sound are four, and each is asserted rather than
 assumed. **Only CPL 3 is preempted**: `timer_tick` reads the saved CS and
 returns unchanged for kernel contexts, so the kernel is non-preemptible and the
 locking rules stay simple. **Every task traps onto its own kernel stack**:
 RSP0 is rewritten at every switch, because two tasks sharing one privilege
-stack would overwrite each other's saved frames. **The saved context has one
+stack would overwrite each other's saved frames. **Every task runs in its own
+address space (M9)**: CR3 is loaded beside RSP0 at every switch — sound under
+the kernel's feet because every space's kernel half is a clone of the kernel's
+own table — so the resumed task sees only its private user mappings. **The
+saved context has one
 format** — 15 GP registers in a fixed order under the CPU's interrupt frame —
 shared by the timer's save, `install`'s fabricated initial frames, and the
 restore tails in both the timer and syscall entries. The battery proves the
 behaviour rather than the diagram: an unyielding compute program is preempted
 (a later-launched program exits first), its checksum survives every switch
-bit-exact, and a program that holds `EFLAGS.AC` set for its whole run never
-gets it past the entry scrub.
+bit-exact, a program that holds `EFLAGS.AC` set for its whole run never
+gets it past the entry scrub, and two instances of one image at one virtual
+address each see only their own memory.
 
 ## Where to read next
 

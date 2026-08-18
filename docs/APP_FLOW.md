@@ -92,12 +92,13 @@ Two entries above deserve to be stated outright rather than inferred from a tabl
 cell. **Unauthorised is not applicable because Osmium has no accounts or sessions**
 — though no longer because there is no privilege boundary. Since M6 there are two
 rings: the kernel drops to ring 3 to run embedded user programs (the `user` and
-`sched` commands), which can touch nothing of the kernel's — no kernel mapping is
-user-accessible, audited by the battery before ring 3 has ever run and again after
-teardown — and each returns through `int 0x80`. Since M8 up to two programs run
-concurrently under preemptive round-robin, but they share one address space and
-there is still nothing to authenticate against: whoever is at the keyboard is the
-operator, and physical access is total access. **Offline is not applicable because
+`sched` commands), which can touch nothing of the kernel's — the kernel's page
+table never carries a user-accessible entry, audited by the battery before ring 3
+has ever run and again after every run — and each returns through `int 0x80`.
+Since M8 up to two programs run concurrently under preemptive round-robin, and
+since M9 each runs in its own address space, isolated from the others' memory as
+well as the kernel's. There is still nothing to authenticate against: whoever is
+at the keyboard is the operator, and physical access is total access. **Offline is not applicable because
 there is no network stack**. A state that depends on a remote response cannot occur
 where no remote call can be made. Both cells stay "n/a" until accounts or networking
 exist, at which point this document is rewritten before that code is written.

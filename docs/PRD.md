@@ -131,8 +131,14 @@ appear in a v1 pull request.
   register file survives intact. The *kernel* remains non-preemptible and the
   in-kernel executor cooperative — deliberately: kernel paths are short, and
   non-preemptibility is what keeps the locking rules three lines long. There is
-  still no task priority, and tasks still share one address space (per-task
-  page tables are the next milestone on that road).
+  still no task priority. **Per-task address spaces followed as M9 (same
+  day):** every task runs on its own page-table root — CR3 is switched with
+  RSP0 at every context switch — so two programs can occupy the SAME virtual
+  addresses simultaneously, each seeing only its own memory. The battery
+  proves it by running two instances of one image at one VA and asserting each
+  read its own pristine data segment; the kernel's own page table now never
+  carries a user-accessible entry at all, which the audit asserts in its
+  strongest form.
 - **APIC and HPET.** The legacy 8259 PIC and the 8254 timer are used instead. The
   APIC requires ACPI table parsing for no demonstrable v1 benefit; that cost is
   deferred until something needs it.

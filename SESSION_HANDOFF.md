@@ -1,8 +1,8 @@
 # Session handoff
 
-**State: v0.1.0 + M6 (ring 3) + M7 (ELF loader) + M8 (preemptive multitasking),
-hardened.** M8 landed 2026-08-18: the PIT tick now drives a round-robin context
-switch between ring-3 tasks. Nothing is in flight and nothing is owed.
+**State: v0.3.0 — M6 (ring 3) + M7 (ELF loader) + M8 (preemptive
+multitasking) + M9 (per-task address spaces), hardened.** M8 and M9 both
+landed 2026-08-18. Nothing is in flight and nothing is owed.
 
 - All milestones are merged, pushed and CI-green on `main`. The four
   engineering documents in `docs/` are reconciled to the shipped code; treat
@@ -16,47 +16,43 @@ switch between ring-3 tasks. Nothing is in flight and nothing is owed.
   CI on ubuntu is unaffected. Force a fresh clippy (`touch` changed files) —
   cached results can hide a lint CI's fresh run catches.
 
-## What M8 added
+## What M9 added (same day as M8)
 
-- **`kernel/src/sched.rs`** — TCBs with per-task heap-allocated kernel stacks,
-  a naked timer entry (vector 32, installed by address) that saves the full
-  register file and scrubs `EFLAGS.AC`, a round-robin `timer_tick` that only
-  ever preempts CPL-3 contexts (the kernel stays non-preemptible), `SYS_EXIT`
-  routed through the scheduler, and TSS RSP0 retargeted at every switch
-  (`gdt::set_privilege_stack`; the TSS now lives in an `UnsafeCell`).
-- **`user/counter`** — an unyielding 30M-iteration checksum program linked at
-  the upper half of the user window; holds AC set for its whole run. The
-  battery launches it first, `hello` second, and asserts hello exits FIRST
-  (the preemption proof), the checksum is bit-exact across every switch
-  (register-integrity proof, recomputed independently kernel-side — the two
-  loops must stay in step), and the timer AC scrub held. All three named
-  mutations were observed failing (TDD test plan records them).
-- **`run_programs`** — the multi-program loader; refuses cross-image page
-  overlap before mapping anything. `user` is now the one-task degenerate case.
-- The `sched` shell command demonstrates it live (dots + hello's byte
-  interleave); `cargo xtask privacy` types it, so the serial-silence allowlist
-  covers the scheduler path; CI's input-path grep gate covers `sched.rs`.
+- **`memory::AddressSpace`** — per-task PML4: every kernel subtree shared,
+  the entry-0 chain deep-copied so the user window's and stack's 2 MiB PD
+  slots are private per task. The low-half contents this rests on were
+  MEASURED, not assumed (the bootloader leaves an identity-mapped handover
+  region at `0x0..0x200000` and its early-GDT region at `0x1000000..0x1200000`
+  — both stay shared; `new_user` asserts the user slots are vacant
+  kernel-side). A first draft assumed entry 0 was empty and the assert caught
+  it on the first boot — the measure-then-build lesson, again.
+- **CR3 switched with RSP0** at every context switch (`sched::load_cr3`),
+  restored to the kernel's root when the last task exits. Same-VA programs
+  now coexist: the battery runs hello twice at one VA; hello's exit code
+  carries the data-segment value it read, so a shared page is caught as
+  instance 1 reading `0x46` ('F', the other instance's write) instead of the
+  pristine `0x45`. Observed failing under three mutations (TDD test plan).
+- **The kernel-table audit is now total**: not one user-accessible entry,
+  leaf or intermediate, ever — user mappings exist only in task spaces, and
+  teardown is dropping the spaces (nothing to unmap in the kernel table).
+- The M8 cross-image overlap refusal was REMOVED (same-VA is the point now);
+  `kshared::plans_overlap` and its host tests went with it. The user stack is
+  one VA (`0x80_0000`) in every space; `USER_STACK_ADDRS` is gone.
 
-## Same-day adversarial review (15-agent fleet), 6 findings fixed
+## M8, for context (earlier the same day)
 
-Three lenses (security / concurrency / test-strength) + a skeptic per finding;
-6 of 12 findings survived and all are fixed, each fix observed failing first:
-every M8 `debug_assert!` was dead code (the kernel only ever builds
-`--release`; all seven are real `assert!`s now — repo rule: a `debug_assert`
-here proves nothing); the battery could not see a rotate-once scheduler (new
-sustained-rotation proof: the same counter linked at two bases scheduled
-against itself, ≥4-switch floor + both checksums exact; exit order is
-deliberately NOT asserted — one partial quantum of head start against
-non-identical per-task costs is a coin flip, and a first version that
-asserted it flaked at ~50%); `SAVED_CS_OFFSET` was asserted
-by comment (new always-on CS-selector tripwire on every tick); the cross-image
-overlap check was only ever shown identical images (predicate moved to
-`kshared::elf::plans_overlap` with partial-overlap host tests). The CPL-3
-gate remains deliberately untestable-as-false (documented in the TDD — while
-the scheduler is active no kernel path runs with IF=1).
+Preemptive round-robin of ring-3 tasks — naked timer entry saving the full
+register file per task on its own kernel stack, TSS RSP0 retargeted per
+switch, kernel non-preemptible, AC scrubbed at every ring-3-controlled entry.
+Proven by exit order, an exact cross-checked checksum, and a hostile-AC
+program; hardened same-day by a 15-agent adversarial review (6 findings
+fixed, each observed failing first — including every `debug_assert!` being
+dead code in this release-only repo, and a ~50%-flaky exit-order assertion
+that CI passed once by luck).
 
 ## Roadmap (PRD Won't-list, unchanged)
 
-Per-task address spaces (tasks are isolated from the kernel, not yet from each
-other), ramfs, APIC/HPET, SMP. Networking is on no roadmap. The console scroll
-cell-grid rework stays deferred with its measured number in the TDD.
+Per-task fault isolation (a crashing program still takes the machine down —
+tasks are memory-isolated, not fault-isolated), ramfs, APIC/HPET, SMP.
+Networking is on no roadmap. The console scroll cell-grid rework stays
+deferred with its measured number in the TDD.

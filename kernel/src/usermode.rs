@@ -1,47 +1,48 @@
 //! Ring 3 and a software-interrupt (`int 0x80`) system-call path — Osmium's
 //! privilege boundary — plus the ELF64 loader that feeds it.
 //!
-//! The user programs are real, linker-scripted Rust ELFs (`user/hello` at the
-//! base of the user window, `user/counter` at its upper half), built by the
-//! kernel's build script and embedded here. [`run_programs`] parses each with
-//! `kshared::elf` (host-tested, refusal-by-default), refuses any cross-image
-//! page overlap before anything maps, maps each `PT_LOAD` per-segment W^X,
-//! gives every program its own stack page and its own kernel stack, and hands
-//! the set to the scheduler (`sched`), which runs them at CPL 3 under
-//! preemptive round-robin — a timer tick taken from ring 3 moves the CPU to
-//! the next ready task whether or not the current one ever yields. Each
-//! program leaves by issuing `int 0x80` with `SYS_EXIT`; when the last one
-//! exits, the entry stub restores the kernel stack saved before the first
-//! launch and returns to the launcher. Other syscalls dispatch to Rust and
-//! `iretq` back into whichever task made them.
+//! The user programs are real, linker-scripted Rust ELFs (`user/hello`,
+//! `user/counter`), built by the kernel's build script and embedded here.
+//! Since M9 every program runs in its **own address space**
+//! ([`crate::memory::AddressSpace`]): [`run_programs`] parses each image with
+//! `kshared::elf` (host-tested, refusal-by-default), maps its `PT_LOAD`
+//! segments per-segment W^X into a private per-task page table, gives it its
+//! own stack page and kernel stack, and hands the set to the scheduler
+//! (`sched`), which runs them at CPL 3 under preemptive round-robin, loading
+//! each task's CR3 as it becomes current. Two programs may therefore occupy
+//! the **same virtual addresses** — same code window, same stack address —
+//! and neither can see or touch the other's memory; the battery proves it by
+//! running two instances of the same image at the same VA and asserting each
+//! saw its own private, freshly-initialised data segment.
 //!
-//! Privacy carries over: the frames the user runs on are zeroed on hand-out
-//! like every other (which is also what makes BSS correct for free), the
-//! self-tests audit the page tables both before ring 3 has run and again
-//! after teardown — no kernel mapping is ever user-accessible, and no user
-//! leaf survives a run — and a dead task's kernel stack is zeroed when it is
-//! freed (the allocator scrubs on free).
+//! Each program leaves by issuing `int 0x80` with `SYS_EXIT`; when the last
+//! one exits, the scheduler restores the kernel's own CR3 and the entry stub
+//! returns to the launcher. Other syscalls dispatch to Rust and `iretq` back
+//! into whichever task made them.
+//!
+//! Privacy carries over: the frames a task runs on are zeroed on hand-out
+//! like every other (which is also what makes BSS correct for free), a dead
+//! task's kernel stack is zeroed when it is freed (the allocator scrubs on
+//! free), and the self-tests audit the KERNEL's page table for user bits —
+//! which, since user mappings only ever exist in per-task spaces, must never
+//! carry a single one, before, during or after a run.
 //!
 //! Boundaries, stated so they are not mistaken for isolation guarantees:
-//! - **A misbehaving user program is fatal.** Every exception handler panics,
-//!   so a ring-3 fault (bad memory access, `#DE`, a privileged instruction,
-//!   `int n` for any vector but 0x80) takes the whole kernel down — and with
-//!   it every other task. Fault isolation (terminate the offender, keep the
-//!   rest) is a later milestone.
-//! - **Tasks share one address space.** Each program is linked at its own
-//!   slot in the user window and the loader refuses overlap, but nothing
-//!   stops a program *reading or writing* its neighbour's pages: separation
-//!   is W^X and ring 3 vs ring 0, not per-process page tables. Address-space
-//!   isolation (per-task CR3) is the next milestone on that road.
-//! - **One run at a time.** The loader uses fixed slot addresses and a single
-//!   continuation, and the shell issues runs synchronously; the scheduler
-//!   asserts it is never installed while active.
+//! - **A misbehaving user program is still fatal to the machine.** Every
+//!   exception handler panics, so a ring-3 fault takes the whole kernel down
+//!   — and with it every other task. Address-space isolation protects tasks'
+//!   MEMORY from each other; fault isolation (terminate the offender, keep
+//!   the rest) is a later milestone.
+//! - **One run at a time.** The shell issues runs synchronously; the
+//!   scheduler asserts it is never installed while active.
 //! - **Frames are not reclaimed.** The bump allocator never frees, so each
-//!   run leaks its mapped frames (a few pages); many manual `user`/`sched`
-//!   shell invocations would eventually exhaust RAM and panic. The parser's
-//!   64-page budget bounds how fast a single load can drain the allocator.
+//!   run leaks its mapped frames and its page-table frames (a handful per
+//!   task); many manual `user`/`sched` shell invocations would eventually
+//!   exhaust RAM and panic. The parser's 64-page budget bounds how fast a
+//!   single load can drain the allocator.
 
-use crate::sched::{self, RunReport};
+use crate::memory::AddressSpace;
+use crate::sched::{self, LaunchSpec, RunReport};
 use core::sync::atomic::AtomicU64;
 use kshared::elf::{ElfError, LoadPlan};
 
@@ -57,26 +58,25 @@ const SYS_WRITE: u64 = 1;
 /// which always writes it before any ring-3 instruction can execute.
 pub(crate) static KERNEL_CONTINUATION_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// Per-task user stack pages, indexed by launch position. Program segments
-/// live in the image window (`kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`);
-/// the stacks sit outside it in one shared 2 MiB page-table region, and the
-/// page-table audit (`memory::no_stray_user_mappings`) allows user-accessible
-/// intermediate entries only where they reach the window or a stack.
-pub(crate) const USER_STACK_ADDRS: [u64; 2] = [0x80_0000, 0x81_0000];
-/// The single-program stack (task slot 0), kept under its M6 name for the
-/// battery's W^X probe test and the audit's documentation.
-#[cfg(feature = "selftest")]
-pub(crate) const USER_STACK_ADDR: u64 = USER_STACK_ADDRS[0];
+/// The user stack page — the SAME virtual address in every task's space
+/// (M9), which is itself a statement of the isolation model: program
+/// segments live in the image window
+/// (`kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`), the stack sits outside
+/// it, and each task's page table maps both privately.
+pub(crate) const USER_STACK_ADDR: u64 = 0x80_0000;
 
-/// The most programs one run can schedule — one per stack slot.
-pub const MAX_TASKS: usize = USER_STACK_ADDRS.len();
+/// The most programs one run can schedule. Two exercises every multi-task
+/// path (rotation, same-VA isolation) without inviting an unbounded fleet
+/// onto a bump allocator.
+pub const MAX_TASKS: usize = 2;
 
 /// The embedded user programs: real linker-scripted Rust ELFs built from
 /// `user/hello` and `user/counter` by the kernel's build script. The battery
-/// additionally embeds the SAME counter source linked at a second base
-/// (`link_alt.ld`), so two unyielding programs can be scheduled against each
-/// other — the sustained-round-robin proof needs two tasks that both outlive
-/// many quanta, and no pair of distinct programs here does that.
+/// additionally embeds the counter linked at a second base (`link_alt.ld`) —
+/// a leftover convenience from M8's shared-address-space era that still earns
+/// its place: scheduling it against the primary counter proves sustained
+/// rotation with DIFFERENT layouts, while two same-base instances prove
+/// same-VA isolation.
 static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("COUNTER_ELF"));
 #[cfg(feature = "selftest")]
@@ -103,27 +103,32 @@ pub fn run_counter_and_hello() -> Result<RunReport, ElfError> {
     run_programs(&[COUNTER_ELF, HELLO_ELF])
 }
 
-/// The refusal surface for the battery: two copies of the same image claim
-/// the same pages, which must be refused before anything is mapped.
+/// The M9 isolation proof: two instances of the SAME image, occupying the
+/// SAME virtual addresses, each in its own address space. Before M9 this was
+/// the overlap-refusal case; now both must run — and each must see its own
+/// private, freshly-initialised data segment (hello reports the value it
+/// read back, and a shared page would show the first instance's write to the
+/// second).
 #[cfg(feature = "selftest")]
 pub fn run_hello_twice() -> Result<RunReport, ElfError> {
     run_programs(&[HELLO_ELF, HELLO_ELF])
 }
 
-/// Two unyielding compute programs — the same counter source at two disjoint
-/// bases — scheduled against each other for the battery's sustained
-/// round-robin proof: neither ever yields, so every quantum boundary for the
-/// whole run is a timer-driven switch to the other task.
+/// Two unyielding compute programs — the counter at two different bases —
+/// scheduled against each other for the battery's sustained round-robin
+/// proof: neither ever yields, so every quantum boundary for the whole run
+/// is a timer-driven switch to the other task.
 #[cfg(feature = "selftest")]
 pub fn run_two_counters() -> Result<RunReport, ElfError> {
     run_programs(&[COUNTER_ELF, COUNTER_ALT_ELF])
 }
 
-/// Parses, maps, schedules and tears down up to [`MAX_TASKS`] static ELF64
-/// user programs. Refusal happens before anything is mapped: every image must
-/// parse (`kshared::elf`, refusal-by-default), and no two images may claim
-/// overlapping pages — two programs linked at the same base are an [`ElfError::Overlap`]
-/// here for exactly the reason two segments of one program are in the parser.
+/// Parses, maps into per-task address spaces, schedules and tears down up to
+/// [`MAX_TASKS`] static ELF64 user programs. Refusal happens before anything
+/// is mapped: every image must parse (`kshared::elf`, refusal-by-default).
+/// There is no cross-image overlap check any more, and its absence is the
+/// point — images that claim the same virtual pages land in different page
+/// tables, which is exactly what M9 exists to allow.
 pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
     assert!(
         !images.is_empty() && images.len() <= MAX_TASKS,
@@ -133,11 +138,10 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
     // caller must not hold the console lock across a ring-3 run or SYS_WRITE
     // would deadlock against it. All callers (the `user`/`sched` shell
     // commands and the battery) call this outside any `with_console`; this
-    // pins that.
-    // A real assert (the kernel is only ever built --release, where a
-    // debug_assert is dead code): with the lock held, a task's SYS_WRITE
-    // would spin forever behind an interrupt gate — an undiagnosable silent
-    // hang, which is exactly what this turns into a named panic.
+    // pins that. A real assert (the kernel is only ever built --release,
+    // where a debug_assert is dead code): with the lock held, a task's
+    // SYS_WRITE would spin forever behind an interrupt gate — an
+    // undiagnosable silent hang, which this turns into a named panic.
     assert!(
         !crate::console::CONSOLE.is_locked(),
         "run_programs called while the console lock is held; SYS_WRITE would deadlock"
@@ -147,39 +151,30 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
     for image in images {
         plans.push(kshared::elf::parse_elf64(image)?);
     }
-    // Cross-image page overlap: the parser checks segments within one image;
-    // `kshared::elf::plans_overlap` is the same interval test across images
-    // (host-tested there, partial-overlap cases included), and it must pass
-    // before any page is mapped so a refused run leaves nothing behind.
-    for (i, a) in plans.iter().enumerate() {
-        for b in plans.iter().skip(i + 1) {
-            if kshared::elf::plans_overlap(a, b) {
-                return Err(ElfError::Overlap);
-            }
-        }
-    }
 
+    // Build each program its own world: a fresh address space, its segments
+    // mapped and locked W^X, its stack page — all before any task runs.
+    let mut spaces: alloc::vec::Vec<AddressSpace> = alloc::vec::Vec::with_capacity(images.len());
     for (plan, image) in plans.iter().zip(images) {
+        let mut space = AddressSpace::new_user();
         // Map every segment writable + NX for the copy: a page is never
         // writable and executable at the same time, even transiently.
         for seg in plan.segments() {
             for page in 0..seg.page_count() {
-                crate::memory::map_user_page(seg.vaddr + page * 4096, true, false);
+                space.map_user_page(seg.vaddr + page * 4096, true, false);
             }
             // Copy the file-backed bytes page by page through the kernel's
-            // physical alias (SMAP-safe: the loader never touches the user
-            // VA). The parser bounds-checked `file_start..+filesz` against
-            // the image. The `memsz` tail past `filesz` is BSS, and frames
-            // arrive zeroed, so it is already correct.
+            // physical alias (SMAP-safe, and the only route that exists —
+            // the user VA is not mapped in the kernel's own table). The
+            // parser bounds-checked `file_start..+filesz` against the image.
+            // The `memsz` tail past `filesz` is BSS, and frames arrive
+            // zeroed, so it is already correct.
             let src = &image[seg.file_start..seg.file_start + seg.filesz as usize];
             let mut copied = 0usize;
             while copied < src.len() {
                 let page_off = (seg.vaddr as usize + copied) & 0xfff;
                 let chunk = (4096 - page_off).min(src.len() - copied);
-                crate::memory::copy_into_user_page(
-                    seg.vaddr + copied as u64,
-                    &src[copied..copied + chunk],
-                );
+                space.copy_into_user_page(seg.vaddr + copied as u64, &src[copied..copied + chunk]);
                 copied += chunk;
             }
         }
@@ -187,52 +182,46 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
         // any segment claiming both).
         for seg in plan.segments() {
             for page in 0..seg.page_count() {
-                crate::memory::update_user_page(
-                    seg.vaddr + page * 4096,
-                    seg.writable,
-                    seg.executable,
-                );
+                space.update_user_page(seg.vaddr + page * 4096, seg.writable, seg.executable);
             }
         }
-    }
-    // Stack pages: user-accessible, writable, never executable; one per task.
-    for &stack in USER_STACK_ADDRS.iter().take(plans.len()) {
-        crate::memory::map_user_page(stack, true, false);
+        // Stack page: user-accessible, writable, never executable — the same
+        // virtual address in every space.
+        space.map_user_page(USER_STACK_ADDR, true, false);
+        spaces.push(space);
     }
 
     // Hand the set to the scheduler. The int 0x80 gate clears IF on the way
     // in, so control returns here with interrupts disabled; restore them only
     // if the caller had them enabled.
-    let entries: alloc::vec::Vec<(u64, u64)> = plans
+    let specs: alloc::vec::Vec<LaunchSpec> = plans
         .iter()
-        .enumerate()
-        .map(|(i, plan)| (plan.entry, USER_STACK_ADDRS[i] + 4096))
+        .zip(&spaces)
+        .map(|(plan, space)| LaunchSpec {
+            entry: plan.entry,
+            user_stack_top: USER_STACK_ADDR + 4096,
+            cr3: space.cr3(),
+        })
         .collect();
     let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
-    let first_rsp = sched::install(&entries);
+    let first_rsp = sched::install(&specs);
     // SAFETY: `first_rsp` is the frame `install` just fabricated, interrupts
-    // are disabled, and every task's code and stack pages were mapped above;
-    // control returns (via the launcher continuation) once the last task has
-    // exited and the scheduler has deactivated itself.
+    // are disabled, task 0's address space is loaded and its code and stack
+    // pages are mapped in it; control returns (via the launcher continuation,
+    // with the kernel's own CR3 restored) once the last task has exited and
+    // the scheduler has deactivated itself.
     unsafe { sched::enter_tasks(first_rsp) };
     let report = sched::collect();
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
     }
 
-    // Tear the user mappings down so the loader can run again (the frames
-    // are not reclaimed — bump allocator — only the mappings).
-    for plan in &plans {
-        for seg in plan.segments() {
-            for page in 0..seg.page_count() {
-                crate::memory::unmap_user_page(seg.vaddr + page * 4096);
-            }
-        }
-    }
-    for &stack in USER_STACK_ADDRS.iter().take(plans.len()) {
-        crate::memory::unmap_user_page(stack);
-    }
+    // Teardown is dropping the spaces: the kernel's own table was never
+    // touched, so there is nothing to unmap — the per-task tables and user
+    // frames leak (bump allocator), the same accepted cost as before, now
+    // including a handful of page-table frames per task.
+    drop(spaces);
     Ok(report)
 }
 
@@ -266,7 +255,8 @@ unsafe extern "C" fn int80_entry() {
         "jne 2f",
         // SYS_EXIT: hand the exit code (already in rdi — the user's a0) to the
         // scheduler. It marks the task exited and returns either the next
-        // ready task's saved context, or 0 meaning the run is complete.
+        // ready task's saved context (having switched RSP0 and CR3 to that
+        // task), or 0 meaning the run is complete (kernel CR3 restored).
         // The 5-qword CPU frame leaves rsp ≡ 8 mod 16; align for the call.
         "sub rsp, 8",
         "call {exit}",

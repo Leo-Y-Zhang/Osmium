@@ -25,7 +25,7 @@ pub fn run() -> ! {
     user_program_runs_in_ring3();
     preemptive_scheduling_is_real();
     round_robin_is_sustained();
-    concurrent_overlap_is_refused();
+    address_spaces_isolate_same_va();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
     measure_console_scroll();
@@ -170,16 +170,19 @@ fn kernel_mappings_are_supervisor_only() {
     serial_println!("[selftest] privacy: no mapping is user-accessible ... ok");
 }
 
-/// Re-audits the page tables AFTER the ring-3 round trip: the teardown must
-/// leave no user-accessible leaf anywhere, and user-accessible intermediates
-/// only where they reach the declared user window. Without this second look,
-/// battery ordering alone hid whatever `run_elf` left behind.
+/// Re-audits the KERNEL's page table AFTER every ring-3 scenario has run.
+/// The M9 claim is total: user mappings only ever exist in per-task address
+/// spaces, so the kernel's own table must not carry a single user-accessible
+/// bit — leaf or intermediate — no matter how many programs just ran.
 fn no_stray_user_mappings_after_ring3() {
     assert!(
         crate::memory::no_stray_user_mappings(),
-        "a user-accessible mapping survived the ring-3 teardown"
+        "a user-accessible entry reached the kernel table during the ring-3 scenarios"
     );
-    serial_println!("[selftest] privacy: ring-3 teardown left no user-accessible leaf ... ok");
+    serial_println!(
+        "[selftest] privacy: kernel table carried no user-accessible entry through every \
+         ring-3 run ... ok"
+    );
 }
 
 /// Every supervisor-hardening bit the CPU advertises must actually be set in
@@ -247,16 +250,21 @@ fn heap_is_not_executable() {
     serial_println!("[selftest] security: kernel heap is non-executable ... ok");
 }
 
-/// Exercises the loader's flag plumbing on a probe page: tightening to
+/// Exercises the loader's flag plumbing on a probe page in a scratch address
+/// space (M9: user mappings never touch the kernel table): tightening to
 /// read-only must keep NX; granting execute must clear it; nothing else may
 /// change. (The wholesale-rewrite mutation of `update_user_page` fails
-/// exactly here.)
+/// exactly here.) The kernel-table audit afterwards proves the whole exercise
+/// left the kernel's own table untouched.
 fn update_user_page_enforces_wx() {
     use x86_64::structures::paging::PageTableFlags;
     let addr = crate::usermode::USER_STACK_ADDR;
-    crate::memory::map_user_page(addr, true, false);
-    crate::memory::update_user_page(addr, false, false);
-    let flags = crate::memory::translate_flags(addr).expect("probe page is not mapped");
+    let mut space = crate::memory::AddressSpace::new_user();
+    space.map_user_page(addr, true, false);
+    space.update_user_page(addr, false, false);
+    let flags = space
+        .translate_flags(addr)
+        .expect("probe page is not mapped");
     assert!(
         !flags.contains(PageTableFlags::WRITABLE),
         "update_user_page left the page writable"
@@ -265,18 +273,19 @@ fn update_user_page_enforces_wx() {
         flags.contains(PageTableFlags::NO_EXECUTE),
         "update_user_page dropped NO_EXECUTE while tightening to read-only"
     );
-    crate::memory::update_user_page(addr, false, true);
-    let flags = crate::memory::translate_flags(addr).expect("probe page is not mapped");
+    space.update_user_page(addr, false, true);
+    let flags = space
+        .translate_flags(addr)
+        .expect("probe page is not mapped");
     assert!(
         !flags.contains(PageTableFlags::NO_EXECUTE),
         "update_user_page failed to clear NX for an executable page"
     );
-    crate::memory::unmap_user_page(addr);
-    // This probe mapped a user page of its own; audit its teardown the same
-    // way the ring-3 run's teardown is audited.
+    // The scratch space (abandoned here) held the only user mapping; the
+    // kernel's table must never have seen it.
     assert!(
         crate::memory::no_stray_user_mappings(),
-        "the W^X probe's own teardown left a user-accessible leaf"
+        "a scratch address space's user mapping reached the kernel table"
     );
     serial_println!("[selftest] security: user page flags narrow correctly (W^X plumbing) ... ok");
 }
@@ -394,20 +403,27 @@ fn shell_processes_a_scripted_session() {
 
 fn user_program_runs_in_ring3() {
     // The embedded `hello` ELF proves the whole loader path: parse, per-
-    // segment W^X mapping, a volatile write into its own data segment (which
-    // faults if .data is mapped read-only), and syscalls. It exits with its
-    // own CS, whose low two bits are the CPL — the discriminating assertion
-    // (launching in ring 0 instead makes it fail, which the M6 mutation
-    // confirmed).
+    // segment W^X mapping into its own address space, a volatile write into
+    // its own data segment (which faults if .data is mapped read-only), and
+    // syscalls. It exits with its CS in the low byte — whose low two bits are
+    // the CPL, the discriminating assertion (launching in ring 0 instead
+    // makes it fail, which the M6 mutation confirmed) — and the data value it
+    // read in the next byte, which must be the pristine 'E'.
     let exit = crate::usermode::run_hello().expect("the embedded hello ELF was refused");
+    let cs = exit & 0xff;
     assert_eq!(
-        exit & 3,
+        cs & 3,
         3,
         "user program ran at CPL {} (expected ring 3)",
-        exit & 3
+        cs & 3
+    );
+    assert_eq!(
+        (exit >> 8) & 0xff,
+        u64::from(b'E'),
+        "hello read a non-pristine data segment on a fresh run"
     );
     serial_println!(
-        "[selftest] usermode: hello ELF ran in ring 3 (CS={exit:#x}), returned via syscall ... ok"
+        "[selftest] usermode: hello ELF ran in ring 3 (CS={cs:#x}), returned via syscall ... ok"
     );
 
     // hello set EFLAGS.AC before its SYS_WRITE; the kernel must have scrubbed
@@ -569,20 +585,47 @@ fn expected_counter_checksum() -> u64 {
     a ^ b ^ c ^ d ^ e ^ f ^ g ^ h
 }
 
-/// Two copies of the same image claim the same pages; the cross-image overlap
-/// check must refuse the run BEFORE anything is mapped — the audit right
-/// after proves the refusal left no trace.
-fn concurrent_overlap_is_refused() {
-    use kshared::elf::ElfError;
-    assert!(
-        matches!(crate::usermode::run_hello_twice(), Err(ElfError::Overlap)),
-        "two programs at the same base were not refused"
+/// The M9 isolation proof: two instances of the SAME image, at the SAME
+/// virtual addresses, run in one schedule — legal only because each lives in
+/// its own address space. Three properties, one run:
+///
+/// 1. **Same-VA coexistence.** Before M9 this exact call was the
+///    overlap-refusal case; now both instances must run to completion at
+///    CPL 3.
+/// 2. **Write isolation, witnessed.** Each hello reads its `GREETING` static
+///    (initially `'E'`), then writes back `'F'`, and reports the value it
+///    READ in its exit code. If the two instances shared pages in any way —
+///    aliased frames, a shared low slot, a CR3 switch that never happened —
+///    the second-scheduled instance would read the first's `'F'`. Both must
+///    report the pristine `'E'`. (Mutation observed: deleting the scheduler's
+///    CR3 loads makes the second instance run on the first's tables and
+///    report 0x46.)
+/// 3. **The kernel table stays clean throughout** — the audit that follows
+///    this test asserts the kernel's own page table never carried a single
+///    user-accessible bit, which is only possible because everything above
+///    happened in per-task tables.
+fn address_spaces_isolate_same_va() {
+    let report = crate::usermode::run_hello_twice()
+        .expect("two same-VA hello instances were refused; per-task address spaces are broken");
+    for (i, exit) in report.exits.iter().enumerate() {
+        assert_eq!(
+            exit.code & 3,
+            3,
+            "same-VA hello instance {i} ran at CPL {} (expected ring 3)",
+            exit.code & 3
+        );
+        assert_eq!(
+            (exit.code >> 8) & 0xff,
+            u64::from(b'E'),
+            "same-VA hello instance {i} read {:#x} from its data segment, not the pristine 'E': \
+             the instances share memory",
+            (exit.code >> 8) & 0xff
+        );
+    }
+    serial_println!(
+        "[selftest] isolation: two programs at the SAME virtual addresses ran in private \
+         address spaces, each seeing pristine data ... ok"
     );
-    assert!(
-        crate::memory::no_stray_user_mappings(),
-        "the refused overlapping run left a user-accessible mapping behind"
-    );
-    serial_println!("[selftest] sched: two programs claiming the same pages are refused ... ok");
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both

@@ -9,9 +9,9 @@ construction, light by measurement**.
 
 Osmium boots from BIOS or UEFI, renders its own glyph console on the framebuffer,
 takes keyboard input through an async executor, drops you at a shell, and runs
-user programs in ring 3 under **preemptive multitasking** — inside 24 MiB of RAM.
-Every push to `main` must boot in QEMU under CI and pass an in-kernel self-test
-battery; `main` is never un-bootable.
+user programs in ring 3 under **preemptive multitasking with per-task address
+spaces** — inside 24 MiB of RAM. Every push to `main` must boot in QEMU under CI
+and pass an in-kernel self-test battery; `main` is never un-bootable.
 
 ## Privacy by construction
 
@@ -96,6 +96,14 @@ page. The `privacy` command reports all of this live.
   a program that holds it hostile for its whole run. The kernel itself stays
   non-preemptible, which is what keeps the locking rules simple; `sched` in
   the shell shows the two programs' output interleaving live
+- **Per-task address spaces**: every program runs on its own page-table root,
+  loaded into CR3 at each context switch — two programs can occupy the *same*
+  virtual addresses simultaneously, each seeing only its own memory. The
+  battery runs two instances of one image at one VA and asserts each read its
+  own pristine data segment (a shared page would leak the first instance's
+  write to the second — and did, when the CR3 switch was deliberately
+  deleted). The kernel's own page table never carries a user-accessible entry
+  at all, which the page-table audit now asserts in its strongest form
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
   `keymap` (us/uk), `user`, `sched`, `selftest`, `panic`, `shutdown` — with an
   insertion cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
@@ -117,8 +125,9 @@ Three layers, all run by CI on every push:
   preemption proof (an unyielding compute program is preempted so a
   later-launched one exits first, with an exact cross-checked checksum proving
   the register file survives every context switch, and the timer entry's
-  `EFLAGS.AC` scrub proven against a hostile program), two programs claiming
-  the same pages refused before anything maps, per-page W^X
+  `EFLAGS.AC` scrub proven against a hostile program), the address-space
+  isolation proof (two instances of one image at the same virtual addresses,
+  each seeing only its own memory), per-page W^X
   flag plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
@@ -179,10 +188,11 @@ and results collect in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 Ring 3 + syscalls landed as M6; ELF loading landed as M7 (the user programs
 are real linker-scripted Rust binaries); preemptive multitasking of ring-3
-tasks landed as M8. Still ahead: per-task address spaces (today's tasks are
-isolated from the kernel, not yet from each other), a RAM-disk filesystem,
-APIC/HPET, and SMP. Networking is on no roadmap; if it ever lands, it ships
-off by default.
+tasks landed as M8; per-task address spaces landed as M9 (tasks are isolated
+from each other as well as from the kernel). Still ahead: per-task fault
+isolation (a crashing program still takes the machine down), a RAM-disk
+filesystem, APIC/HPET, and SMP. Networking is on no roadmap; if it ever
+lands, it ships off by default.
 
 ## Try it without building
 

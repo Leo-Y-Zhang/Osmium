@@ -61,8 +61,9 @@ configuration is fixed in `kernel/src/main.rs` and is load-bearing:
 | NMI stack (IST 1), machine-check stack (IST 2) | Allocated in `.bss` | 20 KiB each | Same `IstStack` arrangement as IST 0, wired in `gdt.rs`, so those faults too run on known-good memory. |
 | Default ring-0 privilege stack (TSS RSP0) | Allocated in `.bss` | 20 KiB | `PRIVILEGE_STACK`: the stack the CPU switches to when ring 3 traps in *outside* a scheduler run. While tasks run, RSP0 points at the current task's own kernel stack instead — see the next row. |
 | Per-task kernel stacks | Heap-allocated (`Box<[u8]>`) | 20 KiB each (M8) | One per scheduled task, created at `sched::install` and freed at `collect` (the allocator's zero-on-free scrub erases a dead task's saved registers). RSP0 is retargeted to the current task's stack on every context switch, so each task's trap frames land on its own memory — two tasks sharing one privilege stack would overwrite each other's saved context. |
-| User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy. `hello` links at the base, `counter` at `0x50_0000`; the loader refuses cross-image page overlap. Mapped only while user programs run; unmapped and audited afterwards. |
-| User stack pages | `0x80_0000`, `0x81_0000` | 4 KiB each | `usermode::USER_STACK_ADDRS`, one per task slot: user-accessible, writable, never executable; they sit outside the image window in one shared 2 MiB page-table region and the audit knows all of them. |
+| User image window | `0x40_0000`–`0x60_0000` | 2 MiB window | `kshared::elf::USER_IMAGE_BASE..USER_IMAGE_END`: the only region a user segment may occupy — **per address space** since M9. Two programs may claim the same pages; they land in different page tables. Mapped only in per-task spaces, never in the kernel's table. |
+| User stack page | `0x80_0000` | 4 KiB | `usermode::USER_STACK_ADDR` — the SAME virtual address in every task's space, which is itself a statement of the M9 isolation model: each space maps it to its own private frame. |
+| Per-task page tables | Allocated frames (M9) | ~5 frames per space | Each [`AddressSpace`]: a cloned PML4 sharing every kernel subtree, plus a deep-copied entry-0 chain (PDPT + first-GiB PD) privatising only the user window's and stack's 2 MiB PD slots. The bootloader's two measured low mappings (its handover region at `0x0..0x200000`, its early-GDT region at `0x1000000..0x1200000`) stay shared; `new_user` asserts the user slots are vacant kernel-side, pinning the measurement. Not reclaimed on drop (bump allocator). |
 | Physical memory window | Bootloader-chosen | All of RAM | Read via `boot_info.physical_memory_offset`; never hard-coded. |
 
 ### Global state table
@@ -89,8 +90,9 @@ interrupt-context deadlocks.
 | `EXPECTING_DOUBLE_FAULT` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M5, by the battery's last check | Atomic, `SeqCst` | Read by the double-fault handler; see the battery protocol below. |
 | `PRIVILEGE_STACK` | `UnsafeCell<[u8; 20 KiB]>` | Static, in `.bss` (M6) | Written only by the CPU, on a ring-3 → ring-0 transition taken outside a scheduler run (TSS RSP0's default target) | Yes, by hardware |
 | `KERNEL_CONTINUATION_RSP` | `AtomicU64` | M6; rewritten by every `sched::enter_tasks` | Written before any ring-3 instruction can execute | Read by the `int 0x80` entry's run-complete path — a software interrupt from ring 3, sound only because ring 3 is reachable *only* through `enter_tasks`, which always writes it first |
-| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; real `assert!`s pin the discipline in every build. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
+| `SCHED` | `Mutex<Sched>`: the task table (per-task kernel stack, saved RSP, **address-space root (CR3, M9)**, ready flag, exit code/order), current index, active flag, counters | M8; task table built at `install`, drained at `collect` | `spin::Mutex`, **locked only with interrupts off** — the timer and `SYS_EXIT` paths run behind interrupt gates (IF=0), and the launcher wraps install/enter/collect in its own cli window. On one core that makes contention impossible; real `assert!`s pin the discipline in every build. The task table is fully allocated in `install` (launcher context) and only indexed from handlers, preserving the handlers-never-allocate rule | **Yes** — the timer handler saves/picks/switches; the `int 0x80` `SYS_EXIT` path marks exits |
 | `TIMER_ENTRY_AC` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M8 | Atomic, `SeqCst` | **Yes** — set by the timer's Rust half if `EFLAGS.AC` survived the naked entry's scrub; the battery asserts it never did while a hostile program held AC set |
+| `KERNEL_CR3`, `PHYS_OFFSET` | `AtomicU64` × 2 | M9, once at `memory::init` | Write-once, then read-only | `KERNEL_CR3` is read by the scheduler's run-complete path (IF=0) to restore the kernel's root; `PHYS_OFFSET` only from launcher context |
 | `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
 | `CYCLES_PER_MS` | `AtomicU64`, `#[cfg(feature = "selftest")]` only | `time::calibrate`, battery builds only | Atomic, `Relaxed` | No |
 
@@ -264,7 +266,8 @@ mod gdt;         // init(): GDT (kernel + user segments), TSS, three IST stacks,
 mod interrupts;  // init(): IDT (incl. the DPL-3 int 0x80 gate), PIC remap to 32..47,
                  //   timer at 100 Hz, keyboard IRQ
 mod memory;      // frames (bump allocator), paging (OffsetPageTable), heap (1 MiB, NX),
-                 //   user-page map/update/unmap, the page-table audit
+                 //   per-task AddressSpace (M9: clone + private user slots, per-space
+                 //   map/update/copy), the kernel-table audit
 mod time;        // TSC boot-phase marks; battery-only PIT calibration to microseconds
 mod task;        // executor (cooperative), keyboard (ScancodeStream)
 mod sched;       // M8: preemptive round-robin of ring-3 tasks — TCBs, per-task
@@ -334,11 +337,14 @@ rotate-once scheduler satisfied) and both checksums must be exact across
 dozens of descheduled-and-resumed cycles — exit order is deliberately NOT
 asserted there: the head start is one partial quantum against non-identical
 per-task costs, so it is a coin flip, and an earlier form of the test that
-asserted it flaked at ~50%; two programs claiming the
-same pages are refused with nothing mapped; the page-table audit again, AFTER
-the ring-3 teardown (covering the concurrent run too); `update_user_page` narrows
-W and NX correctly (the W^X
-plumbing); the console scroll cost is measured; memory stats are reported; and, last
+asserted it flaked at ~50%; the M9 isolation proof — two instances of ONE
+image at the SAME virtual addresses both run at CPL 3 and each reports the
+pristine `'E'` from its private data segment (a shared page would show the
+first instance's write to the second); the kernel-table audit again, AFTER
+every ring-3 scenario, in its M9 total form — not one user-accessible entry,
+leaf or intermediate, ever; `update_user_page` narrows
+W and NX correctly (the W^X plumbing, now exercised in a scratch address
+space); the console scroll cost is measured; memory stats are reported; and, last
 and unreturning, the deliberate stack overflow.
 
 **The final check is the deliberate stack overflow, and it cannot return.** The
@@ -397,6 +403,7 @@ each is empty is the design.
 | 15 | **EFER.NXE** | `memory::init` | The CPU is already in long mode (EFER.LME set by the bootloader); the update only adds NXE, which every x86_64 CPU supports, and it runs before any NX mapping is created so the bit is honoured everywhere it is set. |
 | 16 | **TSS RSP0 mutation** (M8) | `gdt::set_privilege_stack`, `gdt::init` | The TSS lives in an `UnsafeCell` and its GDT descriptor is built from a raw pointer, so no `&'static` shared reference exists to alias the write. Every write happens with interrupts disabled at CPL 0 (asserted), and the CPU reads RSP0 only on a ring-3 → ring-0 transition, which cannot occur in that window — so the CPU never observes a torn or stale value. The accompanying `unsafe impl Sync for TssCell` carries the same argument. |
 | 17 | **Saved-context reads and fabrication** (M8) | `sched::timer_tick` (frame CS read), `sched::build_initial_frame` | `timer_tick`'s one raw read is the saved CS at a fixed, documented offset inside the context `timer_entry` pushed moments earlier on the current stack — in-bounds by the layout contract the same module defines. `build_initial_frame` writes only within the task's own boxed kernel stack through slice indexing (no raw pointers), and the layout it fabricates is the same contract. |
+| 18 | **Address-space construction and CR3 loads** (M9) | `memory::AddressSpace` (`new_user`, `with_mapper`, `copy_into_user_page`), `sched::load_cr3` | `new_user` reads and writes whole page-table frames only through the physical alias: sources are the live kernel tables (read-only), destinations are zeroed frames the allocator just handed out exclusively, and the user PD slots are asserted vacant kernel-side before being privatised. `with_mapper` forms the one `&mut PageTable` per space through `&mut self`, so the borrow is exclusive by construction. `Cr3::write` is confined to `load_cr3`, whose contract is that every root passed shares the kernel half — the kernel keeps executing across the load — and every call site runs with IF=0, in step with the RSP0 write beside it. |
 
 ## Migrations
 
@@ -417,6 +424,7 @@ Every green milestone is committed and pushed.
 | **M6** | Ring 3 and the `int 0x80` system-call path: user GDT segments, TSS RSP0 privilege stack, the DPL-3 gate, `jump_to_user`/`int80_entry` with register scrubbing both ways, and the page-table audit. Self-tests: the user program runs at CPL 3; no mapping is user-accessible. | Yes | `git revert`; M5's single-ring kernel still boots and passes its battery. |
 | **M7** | ELF loading: `user/hello`, a linker-scripted Rust ELF built by the kernel's build script and embedded as bytes; `kshared::elf`, a host-tested refusal-first parser; per-segment W^X via `update_user_page`; the kernel heap made NX. Self-tests: a W+X image refused, the audit re-run after teardown, W^X flag plumbing. | Yes | `git revert`; M6 still proves the ring transition. |
 | **M8** | Preemptive multitasking of ring-3 tasks: `sched` (TCBs, per-task heap-allocated kernel stacks, the naked timer entry with its AC scrub, round-robin switch, `SYS_EXIT` routing), TSS RSP0 made mutable and retargeted per switch, the multi-program loader with cross-image overlap refusal, `user/counter` (an unyielding register-heavy checksum program that holds AC hostile), and the `sched` shell command. Self-tests: exit-order preemption proof, exact checksum across every switch, timer-entry AC scrub, overlap refusal, the existing audits now covering the concurrent run. | Yes | `git revert`; M7's single-program cooperative kernel still boots and passes its battery. |
+| **M9** | Per-task address spaces: `memory::AddressSpace` (kernel PML4 cloned, entry-0 chain deep-copied against the MEASURED bootloader low mappings, user PD slots private), CR3 switched with RSP0 at every context switch and restored when the last task exits, hello's exit code widened to carry its data-segment read (the isolation witness), the M8 cross-image overlap refusal REMOVED (same-VA programs are now the point — `plans_overlap` and its host tests deleted with it), and the audit strengthened to its total form: the kernel table never carries any user-accessible entry. Self-tests: two instances of one image at one VA both run and both read pristine data; the W^X probe moved into a scratch space. | Yes | `git revert`; M8's shared-address-space scheduler still boots and passes its battery (its overlap refusal returns with it). |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
 port `0x60` — the controller delivers no further interrupts until it is read — but
@@ -561,7 +569,20 @@ must be seen to break it.
   original battery could not see); point `SAVED_CS_OFFSET` at the saved SS
   (the CS-selector tripwire panics on the first tick, `saved CS 0x10`);
   degrade `plans_overlap` to `ra.start == rb.start` (the host partial-overlap
-  test fails — the battery's identical-images case alone could not see it).
+  test fails — the battery's identical-images case alone could not see it;
+  the predicate and its tests were later deleted at M9, which made cross-image
+  overlap meaningless).
+- *Mutation, M9 (all observed failing 2026-08-18):* delete the scheduler's
+  switch-time CR3 loads (the first cross-layout switch resumes a task in the
+  wrong space and page-faults — the battery reddens at the first concurrent
+  scenario); delete only the `SYS_EXIT`-path CR3 load and run the same-VA
+  scenario directly (the isolation assertion catches instance 1 reading
+  `0x46` — the first instance's write — "the instances share memory"); map
+  both images into ONE space (`PageAlreadyMapped` — same-VA coexistence is
+  impossible in a single table, which is the capability M9 added). The
+  targeted second observation used a reduced battery order (counter scenarios
+  skipped) because any cross-layout switch faults before the same-layout case
+  is reached — recorded here so the reduction is a fact, not a trick.
 
 **Build gates**
 

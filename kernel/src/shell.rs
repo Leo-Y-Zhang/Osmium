@@ -423,7 +423,11 @@ fn user_command() {
     match crate::usermode::run_hello() {
         Ok(exit) => field(
             "user:    ",
-            &format!("hello ELF exited with CS={exit:#x} (CPL {})", exit & 3),
+            &format!(
+                "hello ELF exited with CS={:#x} (CPL {})",
+                exit & 0xff,
+                exit & 3
+            ),
         ),
         Err(e) => println_con(&format!("user: the embedded ELF was refused: {e:?}")),
     }
@@ -465,7 +469,7 @@ fn sched_command() {
                 &format!(
                     "exited {} with CS={:#x} (CPL {})",
                     order(report.exits[1].seq),
-                    report.exits[1].code,
+                    report.exits[1].code & 0xff,
                     report.exits[1].code & 3
                 ),
             );

@@ -40,11 +40,18 @@
 //!   asynchronous kernel entry taken while it runs. The battery proves the
 //!   scrub by running exactly such a program (`user/counter` holds AC set for
 //!   its entire run) and asserting the kernel never observed the flag.
+//! - **RSP0 and CR3 change together, or not at all (M9).** A switch is three
+//!   writes under one lock with IF=0: `current`, RSP0 (where the next trap
+//!   lands) and CR3 (which memory the next task sees). Loading a task's CR3
+//!   under the kernel's feet is sound because every space's kernel half is a
+//!   clone of the kernel's own table — only the low user slot differs.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::VirtAddr;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::PhysFrame;
 
 /// Bytes of kernel stack per task. Matches the default privilege stack: deep
 /// enough for any trap the task can take (syscall dispatch, an exception's
@@ -69,11 +76,29 @@ struct Task {
     /// [`timer_entry`] finished saving, or the fabricated initial frame for a
     /// task that has not run yet. Only meaningful while `ready`.
     saved_rsp: u64,
+    /// The task's address-space root (M9): loaded into CR3 whenever this task
+    /// becomes current, so each task sees its own private user mappings under
+    /// a shared kernel half. The kernel keeps running across the load because
+    /// every kernel mapping exists identically in every space.
+    cr3: PhysFrame,
     ready: bool,
     exit_code: u64,
     /// Order of exit across the run: 0 for the first task to exit, 1 for the
     /// next. The battery's preemption proof is this field.
     exit_seq: u64,
+}
+
+/// Loads a task's (or the kernel's) page-table root. The context-switch half
+/// of M9's isolation: RSP0 says where the next trap lands, CR3 says which
+/// memory the next task sees, and every switch updates both together.
+///
+/// SAFETY wrapper: callers pass either `memory::kernel_cr3()` or an
+/// [`crate::memory::AddressSpace`]'s root, both valid tables whose kernel
+/// halves are identical — which is the invariant that makes switching under
+/// the kernel's feet sound. Interrupts are off at every call site.
+fn load_cr3(root: PhysFrame) {
+    // SAFETY: per the doc comment — a valid PML4 sharing the kernel half.
+    unsafe { Cr3::write(root, Cr3Flags::empty()) };
 }
 
 impl Task {
@@ -145,15 +170,23 @@ pub struct RunReport {
     pub ring3_round_trips: u64,
 }
 
-/// Builds the task table for `entries` (each an entry point + user stack
-/// top), fabricates each task's initial context frame, marks the scheduler
-/// active and points RSP0 at task 0's kernel stack. Returns task 0's initial
-/// `saved_rsp` for [`enter_tasks`].
+/// What the launcher hands `install` per task: where to start it, where its
+/// user stack tops out, and which address space it runs in.
+pub struct LaunchSpec {
+    pub entry: u64,
+    pub user_stack_top: u64,
+    pub cr3: PhysFrame,
+}
+
+/// Builds the task table for `specs`, fabricates each task's initial context
+/// frame, marks the scheduler active, points RSP0 at task 0's kernel stack
+/// and loads task 0's address space. Returns task 0's initial `saved_rsp`
+/// for [`enter_tasks`].
 ///
 /// Must be called with interrupts disabled; allocates (kernel stacks), which
 /// is fine in the launcher's context and forbidden in the timer's — which is
 /// why the table is fully built here and only indexed there.
-pub fn install(entries: &[(u64, u64)]) -> u64 {
+pub fn install(specs: &[LaunchSpec]) -> u64 {
     // Real asserts throughout this module, not debug_asserts: the kernel is
     // only ever built --release, where a debug_assert is dead code — a lesson
     // an adversarial review of M8 landed the same day the milestone did.
@@ -165,13 +198,20 @@ pub fn install(entries: &[(u64, u64)]) -> u64 {
     let user_cs = u64::from(sel.user_code.0); // RPL 3 already in the selector
     let user_ss = u64::from(sel.user_data.0);
 
-    let mut tasks = Vec::with_capacity(entries.len());
-    for &(entry, user_stack_top) in entries {
+    let mut tasks = Vec::with_capacity(specs.len());
+    for spec in specs {
         let mut kstack = alloc::vec![0u8; KSTACK_SIZE].into_boxed_slice();
-        let saved_rsp = build_initial_frame(&mut kstack, entry, user_stack_top, user_cs, user_ss);
+        let saved_rsp = build_initial_frame(
+            &mut kstack,
+            spec.entry,
+            spec.user_stack_top,
+            user_cs,
+            user_ss,
+        );
         tasks.push(Task {
             kstack,
             saved_rsp,
+            cr3: spec.cr3,
             ready: true,
             exit_code: 0,
             exit_seq: 0,
@@ -187,6 +227,10 @@ pub fn install(entries: &[(u64, u64)]) -> u64 {
     sched.ring3_round_trips = 0;
     sched.exit_counter = 0;
     crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[0].kstack_top()));
+    // Enter task 0's world before `enter_tasks` iretqs into it: its user
+    // pages exist only in its own space. The kernel keeps running on the
+    // shared kernel half until then.
+    load_cr3(sched.tasks[0].cr3);
     sched.tasks[0].saved_rsp
 }
 
@@ -374,6 +418,7 @@ extern "C" fn timer_tick(rsp: u64) -> u64 {
         sched.preemptive_switches += 1;
         sched.current = next;
         crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
+        load_cr3(sched.tasks[next].cr3);
     }
     sched.tasks[next].saved_rsp
 }
@@ -396,11 +441,16 @@ pub extern "C" fn sys_exit(code: u64) -> u64 {
         Some(next) => {
             sched.current = next;
             crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
+            load_cr3(sched.tasks[next].cr3);
             sched.tasks[next].saved_rsp
         }
         None => {
             sched.active = false;
             crate::gdt::set_privilege_stack(crate::gdt::default_privilege_stack_top());
+            // Leave the dead task's world: the launcher resumes in the
+            // kernel's own address space, whose table never carried a user
+            // mapping (the M9 audit's whole claim).
+            load_cr3(crate::memory::kernel_cr3());
             0
         }
     }

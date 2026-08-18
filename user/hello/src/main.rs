@@ -53,19 +53,24 @@ extern "C" fn _start() -> ! {
     }
 
     // Prove the data segment is real and writable: volatile read, then a
-    // volatile write-back (a read-only .data mapping faults here).
+    // volatile write-back (a read-only .data mapping faults here). The
+    // write-back is also the M9 isolation witness: a SECOND instance of this
+    // program sharing the page would read the incremented value instead of
+    // the pristine 'E', and its exit code (below) would say so.
     // SAFETY: raw-pointer access to our own static; no references are formed.
     let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(GREETING)) };
     // SAFETY: as above.
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(GREETING), v + 1) };
     syscall(SYS_WRITE, v);
 
-    // Exit with CS: its low two bits are the CPL, which is the kernel-side
-    // assertion that this program really ran in ring 3.
+    // Exit with CS in the low byte (its low two bits are the CPL — the
+    // kernel-side assertion that this program really ran in ring 3) and the
+    // data-segment value read above in the next byte (the kernel-side
+    // assertion that this instance's .data was private and fresh).
     let cs: u64;
     // SAFETY: reading a segment register has no side effects.
     unsafe { core::arch::asm!("mov {}, cs", out(reg) cs) };
-    syscall(SYS_EXIT, cs);
+    syscall(SYS_EXIT, (cs & 0xff) | (v << 8));
     // SYS_EXIT never returns; this satisfies the diverging signature.
     loop {
         core::hint::spin_loop();
