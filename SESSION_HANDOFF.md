@@ -23,12 +23,24 @@ committed and pushed immediately; CI is the gate, not local success.
   observed red then reverted; every gate run with pipefail.
   ⚠ Local `cargo test -p xtask` needs `--release` (Smart App Control blocks
   the dev-profile bootloader stage-4 build script); CI (ubuntu) is unaffected.
-- **Next action:** remaining Wave-3 as time allows, in value order: rank 20
-  (image budget 3 MiB), rank 14 (boot-perf fill_rows + mix early-outs, uses
-  rank 7's accessor), rank 12 (shell output consistency + format_uptime host
-  test), rank 10 (release/CI hardening), rank 13 (screenshot refresh — LAST,
-  after help text is final), then optional 15/17/18. Then Phase 3 adversarial
-  verification, then closure from 11:00.
+- **Progress:** ranks 1-14, 16-subset, 17, 19-21 and 13 (screenshot) all
+  landed, pushed, CI-green (screenshot run pending — it carries all of rank
+  17 too). Only rank 15 (dedup zero-on-free into checks.rs) and rank 18
+  (history into kshared) remain from the plan — both optional internal
+  quality. ⚠ Lesson: local clippy uses cached results and MISSED a real
+  question_mark error that CI caught (commit cf9a5.. → 695c1.. green); the
+  "exit 101" I dismissed as build-lock races were real first-run clippy
+  failures. Force a fresh clippy (touch changed files) and never dismiss a
+  clippy 101.
+- **In flight:** Phase 3 — a tester agent (adversarial: break the ELF parser,
+  page audit, SMAP copy, completion) and a security-reviewer agent (ring-3 /
+  ELF / syscall / SMAP surface) are analyzing the night's diff read-only. Hold
+  code edits on selftest.rs/shell.rs/memory until they report; fix real
+  findings, then optionally do 15/18.
+- **Next action:** consume the two Phase-3 reports, fix any real finding
+  (test-first, mutation-observed), then closure from ~11:00: full gates, CI
+  green on final HEAD, gh api notifications (UNKNOWN if it errors, never 0),
+  update project_osmium.md + MEMORY.md, final report.
 - **Standing constraints:** networking on NO roadmap ever; console scroll rework
   stays DEFERRED (measured ~87 ms/100 scrolls under TCG, needs real-hardware or
   KVM data first); the four privacy properties are inviolable; exactly one
