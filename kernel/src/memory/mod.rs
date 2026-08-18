@@ -109,11 +109,18 @@ impl AddressSpace {
     /// silently sharing user memory with the kernel's low mappings.
     ///
     /// A second invariant is documented rather than asserted (nothing can
-    /// observe it here): the kernel must not CREATE new PML4-level entries
-    /// while task spaces exist, because a clone only shares the subtrees that
-    /// existed when it was taken. Every kernel PML4 entry is created at boot
-    /// (heap, the bootloader's mappings) or between runs (the battery's probe
-    /// page), so this holds by construction.
+    /// observe it here), and its scope is wider than "no new PML4 entries"
+    /// (an adversarial review caught the first, narrower wording): **the
+    /// kernel must not create any new mapping that a clone would fail to
+    /// share while task spaces exist** — that means no new PML4-level
+    /// entries anywhere, AND no new mappings at any level under PML4 entry 0,
+    /// whose PDPT and first-GiB PD are deep-COPIES here, not shared frames.
+    /// A kernel mapping added under entry 0 mid-run (say, a future LAPIC
+    /// MMIO window) would exist in the kernel's table but not in live
+    /// spaces, and fault only when touched with a task CR3 active. Every
+    /// kernel mapping today is created at boot (heap, the bootloader's
+    /// mappings) or between runs (the battery's probe page), so this holds
+    /// by construction — any milestone that maps at runtime must revisit it.
     pub fn new_user() -> Self {
         let mut allocator = FRAME_ALLOCATOR.lock();
         let allocator = allocator.as_mut().expect("memory not initialised");
@@ -168,8 +175,14 @@ impl AddressSpace {
                 );
                 let kernel_pd = p0 & ENTRY_ADDR_MASK;
                 let pd = clone_table(allocator, offset, kernel_pd);
-                // Privatise the user slots — and pin the measurement that the
-                // kernel side leaves them vacant.
+                // Pin the measurement that the kernel side leaves the user
+                // slots vacant, then zero them in the copy. The zeroing is
+                // deliberately redundant today (a vacant kernel slot clones
+                // as vacant): it defends the one case the assert's PRESENT
+                // check waves through — a non-present-but-nonzero kernel
+                // entry, which must not survive into a table that map_to
+                // will later walk. The deep copy above is what actually
+                // privatises the slots between spaces.
                 let window_slots = (kshared::elf::USER_IMAGE_BASE >> 21)
                     ..=((kshared::elf::USER_IMAGE_END - 1) >> 21);
                 let stack_slot = crate::usermode::USER_STACK_ADDR >> 21;
@@ -216,13 +229,42 @@ impl AddressSpace {
         f(&mut mapper, allocator)
     }
 
+    /// True iff `virt..virt+len` lies wholly inside the ELF image window or
+    /// the user stack page — the only regions a user mapping may occupy. The
+    /// arithmetic is overflow-checked so the refusal is profile-independent
+    /// (the release kernel wraps silently; a wrapped `end` of 0 would have
+    /// waved a top-of-address-space VA through the window comparison — an
+    /// adversarial review demonstrated exactly that bypass).
+    fn in_user_region(virt: u64, len: u64) -> bool {
+        let Some(end) = virt.checked_add(len) else {
+            return false;
+        };
+        let in_image = virt >= kshared::elf::USER_IMAGE_BASE && end <= kshared::elf::USER_IMAGE_END;
+        let in_stack = virt >= crate::usermode::USER_STACK_ADDR
+            && end <= crate::usermode::USER_STACK_ADDR + 4096;
+        in_image || in_stack
+    }
+
     /// Maps one user-accessible page at `virt` in this space. The
     /// `USER_ACCESSIBLE` flag must be on the intermediate tables too, not just
     /// the leaf — the classic mistake is setting it only on the leaf and
     /// getting a fault from ring 3 anyway — so this uses
     /// `map_to_with_table_flags`. Permissions are adjusted later with
     /// [`Self::update_user_page`] (W^X once a program has been copied in).
+    ///
+    /// The window assert is the primitive defending itself, not decoration:
+    /// only the entry-0 chain is private to this space — every other subtree
+    /// is SHARED with the kernel's table, and the x86_64 crate ORs the USER
+    /// parent flag into already-present entries on the way down. A wild VA
+    /// here would therefore stamp USER into the kernel's own page-table
+    /// frames for every space at once. The parser bounds every real caller,
+    /// but that validation lives in another crate; this makes the one
+    /// primitive that grants ring-3 reachability safe independent of it.
     pub fn map_user_page(&mut self, virt: u64, writable: bool, executable: bool) {
+        assert!(
+            Self::in_user_region(virt, 4096),
+            "map_user_page target {virt:#x} is outside the user window"
+        );
         self.with_mapper(|mapper, allocator| {
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
             let frame = allocator.allocate_frame().expect("out of physical frames");
@@ -296,16 +338,13 @@ impl AddressSpace {
             "copy_into_user_page crosses a page boundary"
         );
         // Defense in depth: the destination must be inside the user window or
-        // the user stack page. The sole caller passes parser-validated
-        // addresses, but that validation lives in another crate; this makes
-        // the primitive safe independent of its caller, so a future loader
-        // bug cannot turn it into a write over kernel memory.
-        let end = virt + bytes.len() as u64;
-        let in_image = virt >= kshared::elf::USER_IMAGE_BASE && end <= kshared::elf::USER_IMAGE_END;
-        let in_stack = virt >= crate::usermode::USER_STACK_ADDR
-            && end <= crate::usermode::USER_STACK_ADDR + 4096;
+        // the user stack page (overflow-checked — see `in_user_region`). The
+        // sole caller passes parser-validated addresses, but that validation
+        // lives in another crate; this makes the primitive safe independent
+        // of its caller, so a future loader bug cannot turn it into a write
+        // over kernel memory.
         assert!(
-            in_image || in_stack,
+            Self::in_user_region(virt, bytes.len() as u64),
             "copy_into_user_page target {virt:#x} is outside the user window"
         );
         self.with_mapper(|mapper, _| {
@@ -326,6 +365,44 @@ impl AddressSpace {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
             }
         });
+    }
+
+    /// Audits THIS space's tables: true iff no user-accessible leaf is both
+    /// writable and executable. The scratch-space W^X probe proves the
+    /// `update_user_page` primitive narrows flags correctly; this proves the
+    /// REAL loaded spaces obeyed W^X end to end — without it, a loader that
+    /// mapped the stack or a data segment executable passed the battery,
+    /// because no program executes from those pages (adversarial-review
+    /// finding, observed as exactly that mutation).
+    #[cfg(feature = "selftest")]
+    pub fn user_mappings_are_wx_clean(&mut self) -> bool {
+        fn walk(table: &PageTable, offset: u64, level: u8) -> bool {
+            for entry in table.iter() {
+                if !entry.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                let leaf = level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE);
+                if leaf {
+                    let user = entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+                    let writable = entry.flags().contains(PageTableFlags::WRITABLE);
+                    let nx = entry.flags().contains(PageTableFlags::NO_EXECUTE);
+                    if user && writable && !nx {
+                        return false;
+                    }
+                } else {
+                    let virt = offset + entry.addr().as_u64();
+                    // SAFETY: present entry -> page-table frame; phys alias;
+                    // read-only; recursion bounded by the four levels.
+                    let child = unsafe { &*(virt as *const PageTable) };
+                    if !walk(child, offset, level - 1) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        let offset = phys_offset();
+        self.with_mapper(|mapper, _| walk(mapper.level_4_table(), offset, 4))
     }
 
     /// The lowest-level page-table entry flags for `virt` in this space, if

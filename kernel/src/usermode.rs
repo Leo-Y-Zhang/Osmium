@@ -188,6 +188,15 @@ pub fn run_programs(images: &[&[u8]]) -> Result<RunReport, ElfError> {
         // Stack page: user-accessible, writable, never executable — the same
         // virtual address in every space.
         space.map_user_page(USER_STACK_ADDR, true, false);
+        // The battery audits every REAL loaded space for W^X, not just the
+        // synthetic probe: a loader bug that left the stack or a data segment
+        // executable would otherwise pass, since no program executes from
+        // them (adversarial-review finding).
+        #[cfg(feature = "selftest")]
+        assert!(
+            space.user_mappings_are_wx_clean(),
+            "a loaded address space contains a writable+executable user page"
+        );
         spaces.push(space);
     }
 

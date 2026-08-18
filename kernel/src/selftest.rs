@@ -605,27 +605,49 @@ fn expected_counter_checksum() -> u64 {
 ///    user-accessible bit, which is only possible because everything above
 ///    happened in per-task tables.
 fn address_spaces_isolate_same_va() {
-    let report = crate::usermode::run_hello_twice()
-        .expect("two same-VA hello instances were refused; per-task address spaces are broken");
-    for (i, exit) in report.exits.iter().enumerate() {
-        assert_eq!(
-            exit.code & 3,
-            3,
-            "same-VA hello instance {i} ran at CPL {} (expected ring 3)",
-            exit.code & 3
-        );
-        assert_eq!(
-            (exit.code >> 8) & 0xff,
-            u64::from(b'E'),
-            "same-VA hello instance {i} read {:#x} from its data segment, not the pristine 'E': \
-             the instances share memory",
-            (exit.code >> 8) & 0xff
-        );
+    // Three rounds, because the witness is probabilistic in one direction
+    // (adversarial-review finding): under a SHARING regression, a timer tick
+    // landing in the sub-microsecond window between instance 0's volatile
+    // read and write would let both instances read pristine 'E' and hide the
+    // bug — roughly a 1e-4 chance per round, so three independent rounds put
+    // a missed detection below 1e-12. For correct, isolated code the reads
+    // are deterministic, so the repetition adds no flake risk.
+    for round in 0..3 {
+        let report = crate::usermode::run_hello_twice()
+            .expect("two same-VA hello instances were refused; per-task address spaces are broken");
+        for (i, exit) in report.exits.iter().enumerate() {
+            assert_eq!(
+                exit.code & 3,
+                3,
+                "same-VA hello instance {i} (round {round}) ran at CPL {} (expected ring 3)",
+                exit.code & 3
+            );
+            assert_eq!(
+                (exit.code >> 8) & 0xff,
+                u64::from(b'E'),
+                "same-VA hello instance {i} (round {round}) read {:#x} from its data segment, \
+                 not the pristine 'E': the instances share memory",
+                (exit.code >> 8) & 0xff
+            );
+        }
     }
     serial_println!(
         "[selftest] isolation: two programs at the SAME virtual addresses ran in private \
-         address spaces, each seeing pristine data ... ok"
+         address spaces, each seeing pristine data (3 rounds) ... ok"
     );
+
+    // The scheduler must have left us back in the kernel's own address space
+    // — the terminal CR3 restore in sys_exit is load-bearing, and without
+    // this read-back nothing in the battery could ever see it deleted
+    // (adversarial-review finding: the audit reads the kernel table through
+    // the init-time mapper regardless of the live CR3).
+    use x86_64::registers::control::Cr3;
+    assert_eq!(
+        Cr3::read().0,
+        crate::memory::kernel_cr3(),
+        "the scheduler did not restore the kernel's CR3 after the last task exited"
+    );
+    serial_println!("[selftest] isolation: kernel CR3 restored after every run ... ok");
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both

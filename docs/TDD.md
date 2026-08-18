@@ -583,6 +583,23 @@ must be seen to break it.
   targeted second observation used a reduced battery order (counter scenarios
   skipped) because any cross-layout switch faults before the same-layout case
   is reached — recorded here so the reduction is a fact, not a trick.
+- *Mutation, M9 adversarial-review round (both observed failing 2026-08-18):*
+  delete the terminal kernel-CR3 restore in `sys_exit` (the new CR3 read-back
+  assertion fails with "did not restore the kernel's CR3" — before the review
+  round, nothing in the battery could see this deletion); map the user stack
+  executable (the new per-space W^X audit in `run_programs` fails with
+  "writable+executable user page" — the synthetic probe alone never checked a
+  REAL loaded space). The same round also added the overflow-checked
+  `in_user_region` guard to BOTH user-page primitives (`map_user_page` had no
+  bounds check at all, and a wild VA would have stamped USER bits into
+  page-table frames shared with the kernel; `copy_into_user_page`'s check was
+  wrap-around-bypassable at the top of the address space), made the same-VA
+  isolation witness run three rounds (under a sharing regression, a timer
+  tick in the sub-microsecond read-to-write window could hide the bug with
+  ~1e-4 probability per round; correct code is deterministic, so the
+  repetition adds no flake risk), and widened the documented no-new-mappings
+  invariant (the deep-copied entry-0 chain makes ANY new kernel mapping under
+  PML4[0] unshared, not just new PML4-level entries).
 
 **Build gates**
 
