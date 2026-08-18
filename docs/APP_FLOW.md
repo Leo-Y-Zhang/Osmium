@@ -54,8 +54,11 @@ Two non-human entry points exist and matter as much:
 
 ## The command surface
 
-Twelve commands. Each prints something; none is silent on success unless its whole
-purpose is to clear the screen.
+Twelve commands, defined once in `kshared::COMMANDS` so the printed `help` list and
+Tab completion share a single source. Each prints something; none is silent on
+success unless its whole purpose is to clear the screen. **Tab** completes a command
+verb — a unique prefix fills in, a shared prefix extends as far as it can, and an
+exhausted prefix lists the candidates and keeps the input.
 
 | Command | Does | Error case |
 |---|---|---|

@@ -366,6 +366,24 @@ fn shell_processes_a_scripted_session() {
         after.saturating_sub(before)
     );
     serial_println!("[selftest] shell: Ctrl-A moves to the line start ... ok");
+
+    // Tab completion: "he" + Tab uniquely completes to "help", then Enter runs
+    // it. If completion is dead, "he" stays and is an unknown two-row command.
+    let mut shell = crate::shell::Shell::new();
+    let mut scancodes = ScancodeSet1::new();
+    crate::console::with_console(|c| c.clear_screen());
+    let before = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    for &code in &[0x23u8, 0x12, 0x0f, 0x1c] {
+        // h e Tab Enter
+        shell.feed_scancode(&mut scancodes, code);
+    }
+    let after = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    assert!(
+        after.saturating_sub(before) >= 10,
+        "Tab did not complete 'he' to 'help' ({} rows)",
+        after.saturating_sub(before)
+    );
+    serial_println!("[selftest] shell: Tab completes a command verb ... ok");
 }
 
 fn user_program_runs_in_ring3() {

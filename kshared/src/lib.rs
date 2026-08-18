@@ -200,6 +200,107 @@ impl core::fmt::Display for Uptime {
     }
 }
 
+/// One shell command: the verb the completer matches on, and the help line
+/// the `help` command prints. Keeping both here means the help list and tab
+/// completion cannot drift from each other (the dispatch in `shell.rs` still
+/// owns the behaviour, and every verb here must have an arm there).
+pub struct Command {
+    pub name: &'static str,
+    pub help: &'static str,
+}
+
+/// The shell's command surface, in the order `help` prints it.
+pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "help",
+        help: "  help          this list",
+    },
+    Command {
+        name: "echo",
+        help: "  echo <text>   print text",
+    },
+    Command {
+        name: "clear",
+        help: "  clear         clear the screen",
+    },
+    Command {
+        name: "mem",
+        help: "  mem           heap and physical-frame statistics",
+    },
+    Command {
+        name: "uptime",
+        help: "  uptime        time since boot",
+    },
+    Command {
+        name: "sysinfo",
+        help: "  sysinfo       hardware and kernel summary",
+    },
+    Command {
+        name: "privacy",
+        help: "  privacy       what this OS can and cannot leak",
+    },
+    Command {
+        name: "keymap",
+        help: "  keymap [us|uk] show or switch keyboard layout",
+    },
+    Command {
+        name: "user",
+        help: "  user          run a ring-3 program via the syscall path",
+    },
+    Command {
+        name: "selftest",
+        help: "  selftest      run the runtime test subset",
+    },
+    Command {
+        name: "panic",
+        help: "  panic         demonstrate the panic screen",
+    },
+    Command {
+        name: "shutdown",
+        help: "  shutdown      power off (QEMU) or halt",
+    },
+];
+
+/// The result of completing a command prefix against [`COMMANDS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// No command starts with the prefix.
+    None,
+    /// Exactly one command matches; the full verb.
+    Unique(&'static str),
+    /// Several match; the longest prefix common to all of them (always at
+    /// least the input prefix). The caller lists the candidates itself.
+    Ambiguous(&'static str),
+}
+
+/// Completes `prefix` against the command surface. Case-sensitive, matching
+/// the shell's own dispatch.
+pub fn complete(prefix: &str) -> Completion {
+    let mut matches = COMMANDS
+        .iter()
+        .map(|c| c.name)
+        .filter(|n| n.starts_with(prefix));
+    let Some(first) = matches.next() else {
+        return Completion::None;
+    };
+    // Fold the remaining matches into the longest common prefix.
+    let mut common_len = first.len();
+    let mut any_more = false;
+    for m in matches {
+        any_more = true;
+        common_len = common_prefix_len(&first[..common_len], m);
+    }
+    if any_more {
+        Completion::Ambiguous(&first[..common_len])
+    } else {
+        Completion::Unique(first)
+    }
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
 /// Splits a command line into (command, argument string), both trimmed.
 /// Returns None for blank lines.
 pub fn parse_command(line: &str) -> Option<(&str, &str)> {
@@ -335,6 +436,38 @@ mod tests {
         assert_eq!(fmt(6_000, 100), "up 1m 00 s (6000 ticks @ 100 Hz)");
         // 3600 s rolls to an hour.
         assert_eq!(fmt(360_000, 100), "up 1h 00m 00 s (360000 ticks @ 100 Hz)");
+    }
+
+    #[test]
+    fn complete_resolves_unique_ambiguous_and_none() {
+        // Unique: only one command starts with "h".
+        assert_eq!(complete("h"), Completion::Unique("help"));
+        assert_eq!(complete("cl"), Completion::Unique("clear"));
+        // Ambiguous: sysinfo/selftest/shutdown share only "s".
+        assert_eq!(complete("s"), Completion::Ambiguous("s"));
+        // Disambiguated by the next letter.
+        assert_eq!(complete("se"), Completion::Unique("selftest"));
+        assert_eq!(complete("sh"), Completion::Unique("shutdown"));
+        assert_eq!(complete("sy"), Completion::Unique("sysinfo"));
+        // The empty prefix matches everything and its common prefix is empty.
+        assert_eq!(complete(""), Completion::Ambiguous(""));
+        // No match.
+        assert_eq!(complete("xyz"), Completion::None);
+        // A full command completes to itself, uniquely.
+        assert_eq!(complete("help"), Completion::Unique("help"));
+    }
+
+    #[test]
+    fn every_command_help_line_names_its_verb() {
+        // The help line and the verb must agree, or the completer would offer
+        // a command the printed help does not describe.
+        for c in COMMANDS {
+            assert!(
+                c.help.contains(c.name),
+                "help line for {:?} does not mention the verb",
+                c.name
+            );
+        }
     }
 
     #[test]

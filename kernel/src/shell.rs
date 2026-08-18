@@ -76,6 +76,10 @@ impl Shell {
                 self.recall = None;
                 self.render();
             }
+            // Tab: complete the command verb against kshared::COMMANDS.
+            DecodedKey::Unicode('\t') => {
+                self.complete_line();
+            }
             // Ctrl-A / Ctrl-E: jump to start / end of the line, the way every
             // readline-style shell does. MapLettersToUnicode delivers these.
             DecodedKey::Unicode('\u{1}') => {
@@ -161,6 +165,49 @@ impl Shell {
                 self.render();
             }
             DecodedKey::RawKey(_) => {}
+        }
+    }
+
+    /// Tab completion of the command verb. Completes only a single-token line
+    /// (no arguments yet); a unique match fills the verb in, a shared prefix
+    /// extends as far as it can, and an exhausted prefix lists the candidates
+    /// on one line and keeps the input.
+    fn complete_line(&mut self) {
+        let line = self.editor.line().to_string();
+        if line.is_empty() || line.contains(char::is_whitespace) {
+            return;
+        }
+        match kshared::complete(&line) {
+            kshared::Completion::None => {}
+            kshared::Completion::Unique(name) => {
+                self.editor.set_line(name);
+                self.recall = None;
+                self.render();
+            }
+            kshared::Completion::Ambiguous(common) if common.len() > line.len() => {
+                self.editor.set_line(common);
+                self.recall = None;
+                self.render();
+            }
+            kshared::Completion::Ambiguous(common) => {
+                with_console(|con| con.commit_input(&line));
+                let mut list = String::new();
+                for c in kshared::COMMANDS {
+                    if c.name.starts_with(common) {
+                        if !list.is_empty() {
+                            list.push(' ');
+                        }
+                        list.push_str(c.name);
+                    }
+                }
+                with_console(|con| {
+                    con.set_color(MUTED);
+                    let _ = writeln!(con, "{list}");
+                    con.set_color(FOREGROUND);
+                });
+                prompt();
+                self.render();
+            }
         }
     }
 }
@@ -252,18 +299,11 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
 
 fn help() {
     println_con("commands:");
-    println_con("  help          this list");
-    println_con("  echo <text>   print text");
-    println_con("  clear         clear the screen");
-    println_con("  mem           heap and physical-frame statistics");
-    println_con("  uptime        time since boot");
-    println_con("  sysinfo       hardware and kernel summary");
-    println_con("  privacy       what this OS can and cannot leak");
-    println_con("  keymap [us|uk] show or switch keyboard layout");
-    println_con("  user          run a ring-3 program via the syscall path");
-    println_con("  selftest      run the runtime test subset");
-    println_con("  panic         demonstrate the panic screen");
-    println_con("  shutdown      power off (QEMU) or halt");
+    // The list is data-driven from kshared::COMMANDS, the same source tab
+    // completion uses, so the two can never disagree.
+    for c in kshared::COMMANDS {
+        println_con(c.help);
+    }
     keys_help();
 }
 
@@ -273,6 +313,7 @@ fn keys_help() {
     with_console(|con| {
         con.set_color(MUTED);
         let _ = writeln!(con, "keys:");
+        let _ = writeln!(con, "  tab           complete a command name");
         let _ = writeln!(con, "  up/down       recall history");
         let _ = writeln!(con, "  left/right    move within the line");
         let _ = writeln!(con, "  home/end      jump to start/end of line");
