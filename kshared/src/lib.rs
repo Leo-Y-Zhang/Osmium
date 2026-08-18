@@ -166,6 +166,40 @@ impl Default for LineEditor {
     }
 }
 
+/// Milliseconds represented by `ticks` at `hz`, computed multiply-first so it
+/// is exact at any tick rate. The tempting `ticks * (1000 / hz)` divides
+/// first and loses precision at every rate that does not divide 1000 evenly
+/// (e.g. 60 Hz), which is the kind of latent bug a "it works at 100 Hz"
+/// constant hides. Callers: the boot-latency line and the shell banner.
+pub const fn ticks_to_ms(ticks: u64, hz: u64) -> u64 {
+    ticks * 1000 / hz
+}
+
+/// A boot/uptime duration that renders itself, so the one formatting rule
+/// lives here (host-tested) instead of being re-derived at each call site.
+/// Under a minute: `S.CC s`; past a minute: `Mm SS s`; past an hour:
+/// `Hh MM SS s`. The raw tick count and rate follow in parentheses.
+pub struct Uptime {
+    pub ticks: u64,
+    pub hz: u64,
+}
+
+impl core::fmt::Display for Uptime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let total_s = self.ticks / self.hz;
+        let centis = (self.ticks % self.hz) * 100 / self.hz;
+        let (h, m, s) = (total_s / 3600, (total_s % 3600) / 60, total_s % 60);
+        if h > 0 {
+            write!(f, "up {h}h {m:02}m {s:02} s")?;
+        } else if m > 0 {
+            write!(f, "up {m}m {s:02} s")?;
+        } else {
+            write!(f, "up {s}.{centis:02} s")?;
+        }
+        write!(f, " ({} ticks @ {} Hz)", self.ticks, self.hz)
+    }
+}
+
 /// Splits a command line into (command, argument string), both trimmed.
 /// Returns None for blank lines.
 pub fn parse_command(line: &str) -> Option<(&str, &str)> {
@@ -280,6 +314,27 @@ mod tests {
         assert_eq!(ed.line(), "abc"); // the backspace must not delete 'b'
         ed.set_line("a\u{7f}b\nc");
         assert_eq!(ed.line(), "abc");
+    }
+
+    #[test]
+    fn ticks_to_ms_is_exact_multiply_first() {
+        assert_eq!(ticks_to_ms(2, 100), 20);
+        assert_eq!(ticks_to_ms(0, 100), 0);
+        // The case a divide-first `ticks * (1000 / hz)` gets wrong: at 60 Hz
+        // it would compute 3 * 16 = 48, not 50.
+        assert_eq!(ticks_to_ms(3, 60), 50);
+        assert_eq!(ticks_to_ms(1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn uptime_formats_and_rolls_over() {
+        let fmt = |ticks, hz| format!("{}", Uptime { ticks, hz });
+        assert_eq!(fmt(105, 100), "up 1.05 s (105 ticks @ 100 Hz)");
+        // 59 s stays in seconds; 60 s rolls to a minute.
+        assert_eq!(fmt(5_900, 100), "up 59.00 s (5900 ticks @ 100 Hz)");
+        assert_eq!(fmt(6_000, 100), "up 1m 00 s (6000 ticks @ 100 Hz)");
+        // 3600 s rolls to an hour.
+        assert_eq!(fmt(360_000, 100), "up 1h 00m 00 s (360000 ticks @ 100 Hz)");
     }
 
     #[test]

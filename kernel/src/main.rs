@@ -124,8 +124,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // "boot complete; shell ready" prefix and parses the ms figure (the
         // same PIT-measured span the on-screen banner shows) to gate it. This
         // is a boot diagnostic, not keystroke output, so serial is correct.
-        let boot_ms = interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed)
-            * (1000 / interrupts::TICK_HZ);
+        let boot_ms = kshared::ticks_to_ms(
+            interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed),
+            interrupts::TICK_HZ,
+        );
         log::info!("boot complete; shell ready ({boot_ms} ms after interrupts-on)");
         let mut executor = task::executor::Executor::new();
         executor.spawn(task::Task::new(shell::run()));

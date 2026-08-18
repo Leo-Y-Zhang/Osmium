@@ -76,6 +76,16 @@ impl Shell {
                 self.recall = None;
                 self.render();
             }
+            // Ctrl-A / Ctrl-E: jump to start / end of the line, the way every
+            // readline-style shell does. MapLettersToUnicode delivers these.
+            DecodedKey::Unicode('\u{1}') => {
+                self.editor.move_home();
+                self.render();
+            }
+            DecodedKey::Unicode('\u{5}') => {
+                self.editor.move_end();
+                self.render();
+            }
             // Ctrl-L: clear the screen, keep the in-progress line.
             DecodedKey::Unicode('\u{c}') => {
                 with_console(|con| con.clear_screen());
@@ -176,7 +186,10 @@ pub async fn run() {
 }
 
 fn banner() {
-    let ms = crate::interrupts::TICKS.load(Ordering::Relaxed) * (1000 / crate::interrupts::TICK_HZ);
+    let ms = kshared::ticks_to_ms(
+        crate::interrupts::TICKS.load(Ordering::Relaxed),
+        crate::interrupts::TICK_HZ,
+    );
     with_console(|con| {
         con.set_color(ACCENT);
         let _ = writeln!(
@@ -233,7 +246,7 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "panic" => panic!("user-requested panic (the 'panic' command)"),
         "shutdown" => shutdown(),
         "selftest" => runtime_selftest(),
-        other => println_con(&format!("unknown command: {other} (try 'help')")),
+        other => error(&format!("unknown command: {other} (try 'help')")),
     }
 }
 
@@ -293,11 +306,7 @@ fn mem() {
 fn uptime() {
     let ticks = crate::interrupts::TICKS.load(Ordering::Relaxed);
     let hz = crate::interrupts::TICK_HZ;
-    println_con(&format!(
-        "up {}.{:02} s ({ticks} ticks @ {hz} Hz)",
-        ticks / hz,
-        ticks % hz
-    ));
+    println_con(&format!("{}", kshared::Uptime { ticks, hz }));
 }
 
 fn sysinfo(layout_name: &str) {
@@ -364,7 +373,7 @@ fn keymap(args: &str, layout_name: &mut &'static str, decoder: &mut EventDecoder
             println_con("keymap: uk");
         }
         "" => println_con(&format!("keymap: {layout_name} (available: us, uk)")),
-        _ => println_con("usage: keymap [us|uk]"),
+        _ => error("usage: keymap [us|uk]"),
     }
 }
 
@@ -479,5 +488,18 @@ fn field(label: &str, value: &str) {
         let _ = write!(con, "{label}");
         con.set_color(FOREGROUND);
         let _ = writeln!(con, "{value}");
+    });
+}
+
+/// A shell error line: a danger-coloured `error:` marker (the Design Brief's
+/// Danger role, which was otherwise unused in the shell) followed by the
+/// message in the ordinary colour, so the words carry the meaning and colour
+/// is only reinforcement.
+fn error(msg: &str) {
+    with_console(|con| {
+        con.set_color(DANGER);
+        let _ = write!(con, "error: ");
+        con.set_color(FOREGROUND);
+        let _ = writeln!(con, "{msg}");
     });
 }

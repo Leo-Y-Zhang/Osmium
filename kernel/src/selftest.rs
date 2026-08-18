@@ -342,6 +342,30 @@ fn shell_processes_a_scripted_session() {
         after.saturating_sub(before)
     );
     serial_println!("[selftest] shell: scripted 'help' renders its full output ... ok");
+
+    // Ctrl-A wiring: type "elp", Ctrl-A to the line start, insert 'h' -> "help".
+    // If Ctrl-A does not move home, 'h' lands at the end giving "elph", an
+    // unknown command whose two-row output fails the delta.
+    let mut shell = crate::shell::Shell::new();
+    let mut scancodes = ScancodeSet1::new();
+    crate::console::with_console(|c| c.clear_screen());
+    let before = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    // "elp", then Ctrl (0x1D down) + 'a' (0x1E) + releases, then 'h', Enter.
+    for &code in &[
+        0x12u8, 0x26, 0x19, // e l p
+        0x1d, 0x1e, 0x9e, 0x9d, // Ctrl-A (ctrl down, a, a up, ctrl up)
+        0x23, // h
+        0x1c, // Enter
+    ] {
+        shell.feed_scancode(&mut scancodes, code);
+    }
+    let after = crate::console::with_console(|c| c.cursor().0).unwrap_or(0);
+    assert!(
+        after.saturating_sub(before) >= 10,
+        "Ctrl-A did not move to the line start: the line was not 'help' ({} rows)",
+        after.saturating_sub(before)
+    );
+    serial_println!("[selftest] shell: Ctrl-A moves to the line start ... ok");
 }
 
 fn user_program_runs_in_ring3() {
