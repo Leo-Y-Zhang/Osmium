@@ -45,7 +45,10 @@ every M8 `debug_assert!` was dead code (the kernel only ever builds
 `--release`; all seven are real `assert!`s now — repo rule: a `debug_assert`
 here proves nothing); the battery could not see a rotate-once scheduler (new
 sustained-rotation proof: the same counter linked at two bases scheduled
-against itself, exit order + ≥4-switch floor); `SAVED_CS_OFFSET` was asserted
+against itself, ≥4-switch floor + both checksums exact; exit order is
+deliberately NOT asserted — one partial quantum of head start against
+non-identical per-task costs is a coin flip, and a first version that
+asserted it flaked at ~50%); `SAVED_CS_OFFSET` was asserted
 by comment (new always-on CS-selector tripwire on every tick); the cross-image
 overlap check was only ever shown identical images (predicate moved to
 `kshared::elf::plans_overlap` with partial-overlap host tests). The CPL-3

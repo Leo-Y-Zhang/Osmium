@@ -498,27 +498,24 @@ fn preemptive_scheduling_is_real() {
 /// Here the SAME counter program, linked at two disjoint bases, is scheduled
 /// against itself: two unyielding tasks alive for many quanta each.
 ///
-/// - **Exit order pins sustained rotation.** The programs do identical work
-///   and task 0 runs its quantum first, so under genuine round-robin task 0
-///   stays strictly ahead and exits FIRST. A rotate-once (or task-0-only)
-///   scheduler parks task 1 with the CPU until it finishes, inverting the
-///   order. (Mutation observed: preempt-once-then-pin flipped it.)
 /// - **The switch floor proves rotation kept happening** — with both tasks
 ///   compute-bound, nearly every ring-3 tick while both live is a switch to
-///   the other task; under TCG that is dozens, and 4 is the floor.
+///   the other task; under TCG that is dozens, and 4 is the floor. The
+///   rotate-once and task-0-only mutations both count exactly 1 and fail it
+///   (observed). Exit ORDER is deliberately not asserted: task 0's head
+///   start is only its partial first quantum (the tick phase is random) and
+///   per-task costs are not identical (a progress dot that lands on a row
+///   end pays a ~1 ms console scroll), so the order is a coin flip — an
+///   earlier version asserted it and flaked at ~50%.
 /// - **Both checksums exact** extends the register-integrity proof to a task
 ///   that is descheduled AND rescheduled dozens of times mid-computation
-///   (hello's single quantum never exercised a resume-after-preemption).
+///   (hello's single quantum never exercised a resume-after-preemption), and
+///   also proves both tasks genuinely COMPLETED under rotation.
 fn round_robin_is_sustained() {
     let report = crate::usermode::run_two_counters()
         .expect("an embedded counter ELF was refused for the two-counter run");
     let first = &report.exits[0];
     let second = &report.exits[1];
-    assert_eq!(
-        (first.seq, second.seq),
-        (0, 1),
-        "task 0 (identical work, first quantum) did not exit first: rotation stopped"
-    );
     let expected = expected_counter_checksum();
     assert_eq!(
         first.code, expected,

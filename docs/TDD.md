@@ -328,11 +328,13 @@ switch and ≥2 ring-3 timer round-trips were taken, counter's exit checksum equ
 the kernel's independent recomputation (register integrity across every switch),
 and the timer entry's AC scrub was never seen defeated; the sustained-rotation
 proof — the same counter linked at two bases and scheduled against itself, so
-both tasks outlive many quanta: task 0 (identical work, first quantum) must
-exit first, both checksums must be exact across dozens of
-descheduled-and-resumed cycles, and ≥4 preemptive switches must be counted (the
+both tasks outlive many quanta: ≥4 preemptive switches must be counted (the
 counter+hello scenario inherently sees exactly one switch, which a
-rotate-once scheduler satisfied); two programs claiming the
+rotate-once scheduler satisfied) and both checksums must be exact across
+dozens of descheduled-and-resumed cycles — exit order is deliberately NOT
+asserted there: the head start is one partial quantum against non-identical
+per-task costs, so it is a coin flip, and an earlier form of the test that
+asserted it flaked at ~50%; two programs claiming the
 same pages are refused with nothing mapped; the page-table audit again, AFTER
 the ring-3 teardown (covering the concurrent run too); `update_user_page` narrows
 W and NX correctly (the W^X
@@ -554,12 +556,12 @@ must be seen to break it.
   checksum-equality assertion fails with "a context switch corrupted its
   registers" — one register, one switch, caught).
 - *Mutation, M8 adversarial-review round (all three observed failing
-  2026-08-18):* preempt once then pin forever (the two-counter exit-order
-  assertion fails with "rotation stopped" — the mutation the original battery
-  could not see); point `SAVED_CS_OFFSET` at the saved SS (the CS-selector
-  tripwire panics on the first tick, `saved CS 0x10`); degrade
-  `plans_overlap` to `ra.start == rb.start` (the host partial-overlap test
-  fails — the battery's identical-images case alone could not see it).
+  2026-08-18):* preempt once then pin forever (the two-counter switch floor
+  fails with "rotation is not sustained" at 1 switch — the mutation the
+  original battery could not see); point `SAVED_CS_OFFSET` at the saved SS
+  (the CS-selector tripwire panics on the first tick, `saved CS 0x10`);
+  degrade `plans_overlap` to `ra.start == rb.start` (the host partial-overlap
+  test fails — the battery's identical-images case alone could not see it).
 
 **Build gates**
 
