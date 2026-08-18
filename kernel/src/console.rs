@@ -160,13 +160,9 @@ impl Console {
         let cycles = crate::time::rdtsc().wrapping_sub(start);
 
         let mut bg = [0u8; 8];
-        let n = match self.display.pixel_bytes(0, 0) {
-            Some(b) => {
-                bg[..b.len()].copy_from_slice(b);
-                b.len()
-            }
-            None => return None,
-        };
+        let src = self.display.pixel_bytes(0, 0)?;
+        let n = src.len();
+        bg[..n].copy_from_slice(src);
         let bg = &bg[..n];
         let all_bg = corners
             .iter()
