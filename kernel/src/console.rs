@@ -132,11 +132,15 @@ impl Console {
         inside_differs && outside_bg && colour_ok
     }
 
-    /// Proves `clear` fills every row including the last: soils the four
-    /// screen corners with a non-background colour, clears, and asserts all
-    /// four (and the centre) read back as background. A `fill_rows` off-by-one
-    /// that leaves the last row uncopied leaves the soiled bottom corners set,
-    /// failing here. Returns the cycles the clear took, for the perf line.
+    /// Proves `clear` fills every row with the BACKGROUND colour. The expected
+    /// bytes are captured from a scratch pixel painted BACKGROUND *before* the
+    /// corners are soiled — NOT read back from the cleared framebuffer, which
+    /// would only prove the screen is uniform and let a no-op `clear` (or a
+    /// wrong-colour one) pass. The corners are then soiled a different colour,
+    /// cleared, and each must read back as the captured BACKGROUND pattern. A
+    /// `fill_rows` off-by-one (soiled bottom corner survives), a no-op clear
+    /// (corner stays soiled), and a wrong-colour clear are all caught. Returns
+    /// the cycles the clear took, for the perf line.
     #[cfg(feature = "selftest")]
     pub fn clear_probe(&mut self) -> Option<(bool, u64)> {
         use crate::framebuffer::{ACCENT, BACKGROUND};
@@ -145,6 +149,21 @@ impl Console {
         if w == 0 || h == 0 {
             return None;
         }
+        // Capture the true BACKGROUND byte pattern from a scratch write, so
+        // the expectation is independent of what `clear` actually did.
+        self.display.set_pixel(0, 0, BACKGROUND);
+        let mut bg = [0u8; 8];
+        let src = self.display.pixel_bytes(0, 0)?;
+        let n = src.len();
+        bg[..n].copy_from_slice(src);
+        let bg = &bg[..n];
+        // The soil colour must differ from BACKGROUND in bytes, or the test
+        // proves nothing.
+        self.display.set_pixel(0, 0, ACCENT);
+        if self.display.pixel_bytes(0, 0) == Some(bg) {
+            return Some((false, 0));
+        }
+
         let corners = [
             (0, 0),
             (w - 1, 0),
@@ -159,11 +178,6 @@ impl Console {
         self.display.clear(BACKGROUND);
         let cycles = crate::time::rdtsc().wrapping_sub(start);
 
-        let mut bg = [0u8; 8];
-        let src = self.display.pixel_bytes(0, 0)?;
-        let n = src.len();
-        bg[..n].copy_from_slice(src);
-        let bg = &bg[..n];
         let all_bg = corners
             .iter()
             .all(|&(x, y)| self.display.pixel_bytes(x, y) == Some(bg));
