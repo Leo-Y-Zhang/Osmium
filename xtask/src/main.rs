@@ -144,10 +144,14 @@ fn privacy() -> Result<()> {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // Drive the keyboard through the monitor: echo the sentinel, then quit.
+    // Drive the keyboard through the monitor: echo the sentinel, run the
+    // ring-3 program (whose SYS_WRITE must reach the console, not serial), then
+    // quit. Typing `user` here is what makes the allowlist actually cover the
+    // syscall-output path a security review flagged.
     let mut monitor = TcpStream::connect(("127.0.0.1", MONITOR_PORT))
         .context("connecting to the QEMU monitor")?;
     send_line_as_keys(&mut monitor, &format!("echo {SENTINEL}"))?;
+    send_line_as_keys(&mut monitor, "user")?;
     send_line_as_keys(&mut monitor, "shutdown")?;
 
     let status = loop {

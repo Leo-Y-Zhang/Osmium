@@ -106,7 +106,11 @@ jobs:
         # grep exit 1 (searched, found nothing) passes — a renamed file must
         # fail the gate, not disarm it.
         run: |
-          files="kernel/src/shell.rs kernel/src/task/keyboard.rs"
+          # usermode.rs is on the list: a security review found the user
+          # program's SYS_WRITE could emit to serial post-boot, defeating the
+          # keystroke-privacy allowlist. User output now goes to the console;
+          # this keeps the syscall path from re-growing a serial channel.
+          files="kernel/src/shell.rs kernel/src/task/keyboard.rs kernel/src/usermode.rs"
           for p in $files; do
             test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
           done

@@ -74,6 +74,14 @@ pub fn run_hello() -> Result<u64, ElfError> {
 /// mapped. Not reentrant — one user program at a time, which is all the
 /// cooperative single-core model needs.
 pub fn run_elf(image: &[u8]) -> Result<u64, ElfError> {
+    // The syscall dispatcher writes SYS_WRITE output to the console, so the
+    // caller must not hold the console lock across a ring-3 run or SYS_WRITE
+    // would deadlock against it. Both callers (the `user` shell command and the
+    // battery) call this outside any `with_console`; this pins that.
+    debug_assert!(
+        !crate::console::CONSOLE.is_locked(),
+        "run_elf called while the console lock is held; SYS_WRITE would deadlock"
+    );
     let plan: LoadPlan = kshared::elf::parse_elf64(image)?;
 
     // Map every segment writable + NX for the copy: a page is never writable
@@ -277,11 +285,19 @@ extern "C" fn syscall_dispatch(nr: u64, a0: u64, _a1: u64) -> u64 {
     }
     match nr {
         SYS_WRITE => {
-            // Kernel-mediated output on behalf of the user program. This byte
-            // is supplied by the program, not typed at the keyboard, so serial
-            // is the right channel — it lets the CI log show the syscall ran.
+            // The user program's output belongs on the LOCAL console, never on
+            // serial: serial is an off-device channel the keystroke-privacy
+            // allowlist requires stays silent after boot, and a security review
+            // found that a serial write here let the shipped `user` command
+            // emit to serial post-boot. Rendering to the console keeps the byte
+            // on screen (correct for program output) and serial empty. The CI
+            // still proves the syscall ran through the ring-3 exit-code and
+            // AC-scrub assertions, not through a serial line.
             let byte = (a0 & 0xff) as u8 as char;
-            crate::serial_println!("[user] SYS_WRITE {byte:?}");
+            crate::console::with_console(|c| {
+                use core::fmt::Write;
+                let _ = write!(c, "{byte}");
+            });
             0
         }
         _ => u64::MAX,
