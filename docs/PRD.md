@@ -61,10 +61,12 @@ Three readers, in order of how often they are inconvenienced.
       pinned just above the observed floor, with the measurement recorded in the
       repository.
 - [x] **CI greps for networking and storage on every push.** The
-      `no-network-no-storage` job scans `kernel/src`, `kshared/src` and
-      `kernel/Cargo.toml` for the tokens either would have to bring with it and fails
-      on a hit, so neither a crate nor a hand-written driver can enter the tree
-      unnoticed.
+      `no-network-no-storage` job scans `kernel/src`, `kshared/src`, the `user`
+      programs and both `Cargo.toml` manifests for the tokens either would have to
+      bring with it, **and** greps the resolved `cargo tree -p kernel` dependency
+      graph, so neither a hand-written driver nor a transitive crate can enter the
+      tree unnoticed. It fails on a hit — and only on a clean grep exit (a renamed
+      path errors rather than silently passing).
 - [x] `README.md` claims nothing that the above does not check.
 
 ## Requirements
@@ -97,7 +99,11 @@ Three readers, in order of how often they are inconvenienced.
 - Boot-to-shell time measured from a timestamp counter calibrated against the timer,
   displayed in the banner.
 - Command history and cursor movement within the line, not just backspace.
-- ANSI colour handling in the console writer.
+- ~~ANSI colour handling in the console writer.~~ **Superseded by a deliberate
+  decision:** the console has no ANSI parser. Colour is applied through named
+  role constants (`set_color`), which the Design Brief now records as the
+  intended design — a full ANSI palette would let any future code paint
+  anything and erode the restraint the brief requires.
 - Keyboard layout switching between US and UK.
 - A screenshot in the README captured from a real boot rather than a mock-up.
 
@@ -156,10 +162,12 @@ The three privacy claims, stated as properties of the build rather than settings
 
 1. **No network stack exists.** Not disabled: absent. There is no driver, no
    protocol code, and no networking crate in the dependency tree. CI checks that on
-   every push: the `no-network-no-storage` job greps the kernel and `kshared` sources
-   and the kernel's manifest for the tokens a network or storage driver would have to
-   carry, and a hit fails the build. It reads the source as well as the manifest, so
-   the claim covers code written here, not just crates pulled in. Osmium cannot phone
+   every push: the `no-network-no-storage` job greps the kernel and `kshared` sources,
+   the `user` programs and both manifests for the tokens a network or storage driver
+   would have to carry, and also greps the resolved `cargo tree -p kernel` graph, so a
+   hit anywhere fails the build. It reads the source, the manifests and the resolved
+   dependency graph, so the claim covers code written here and crates pulled in
+   transitively. Osmium cannot phone
    home for the same reason a hammer cannot: it has no mechanism.
 2. **No persistence.** There is no filesystem and no storage driver, so the kernel
    cannot write to the medium it booted from. Osmium is a live system: a cold boot

@@ -22,7 +22,10 @@ than a policy:
   greps the kernel sources, manifests and the resolved dependency graph on
   every push, so neither hand-written code nor a transitive crate can creep in.
 - **No persistence.** RAM-only live system: no disk writes, no filesystem; a
-  cold boot is a clean slate. The same CI gate covers storage drivers.
+  cold boot is a clean slate. The same CI gate covers storage drivers, and
+  every CI boot sha256s the disk image before and after the run and fails if a
+  byte changed — the no-persistence claim is checked behaviourally, not just
+  by the absence of a driver.
 - **Freed memory is zeroed.** Heap blocks are scrubbed before they re-enter the
   free list, and physical frames are scrubbed as they are handed out — verified
   by two boot-time sentinel self-tests that were each observed failing when the
@@ -30,9 +33,13 @@ than a policy:
 - **Keystrokes stay on-screen.** Input renders to the local console only; it
   never reaches the serial port. This one holds by construction — the input
   path contains no serial writes, and the `panic` command's message is fixed in
-  the source precisely so typed text has no route there.
+  the source precisely so typed text has no route there. A CI job boots the
+  shipped image, types a sentinel through the QEMU monitor, and fails if the
+  serial port emits anything at all after boot.
 
-The `privacy` command reports these live.
+The kernel also drops user code to ring 3 under the CPU-advertised SMEP, SMAP
+and UMIP protections, so a supervisor bug cannot execute or blindly read a user
+page. The `privacy` command reports all of this live.
 
 ## Light by measurement
 
@@ -74,6 +81,10 @@ The `privacy` command reports these live.
   host-tested and refuses W+X segments, out-of-window addresses and malformed
   images; self-tests prove the program executed in ring 3, that a W+X image
   is refused, and that no kernel mapping is ever user-accessible
+- **SMEP, SMAP and UMIP**: each CPUID-gated and set in CR4 when the CPU
+  advertises it, read back and asserted; the loader copies user segments
+  through the kernel's physical alias so SMAP stays on with no `stac` in the
+  hot path, and a self-test requires every advertised bit to be live
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
   `keymap` (us/uk), `user`, `selftest`, `panic`, `shutdown` — with an insertion
   cursor, arrow keys, Home/End, Ctrl-U/L/C, and history

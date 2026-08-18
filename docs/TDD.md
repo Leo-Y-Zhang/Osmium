@@ -77,7 +77,7 @@ interrupt-context deadlocks.
 | `IDT` | `InterruptDescriptorTable` | M2, once | `spin::LazyLock`, then immutable | Read by CPU only |
 | `PICS` | `ChainedPics` | M2 | `spin::Mutex` | **Yes** — end-of-interrupt write. Held for a few instructions; never nested with any other lock. |
 | `TICKS` | `AtomicU64` | M2 | Atomic, `Relaxed` | **Yes** — incremented by the timer handler. |
-| `BREAKPOINT_HITS`, `SCANCODES_SEEN` | `AtomicUsize` | M2 | Atomic, `Relaxed` | **Yes** — bumped by the breakpoint and keyboard handlers. Counters only; nothing reads them in interrupt context. |
+| `BREAKPOINT_HITS` | `AtomicUsize` | M2 | Atomic, `Relaxed` | **Yes** — bumped by the breakpoint handler. A counter only; nothing reads it in interrupt context. (The M2-era `SCANCODES_SEEN` counter was removed once M4's waker-backed queue superseded it and nothing read it.) |
 | `SCANCODE_QUEUE` | `Once<ArrayQueue<u8>>`, capacity 128 | M4; the queue's storage is allocated on the first `ScancodeStream::new()`, in task context | Lock-free queue, `Once` for the one-time construction | **Yes** — the sole IRQ-to-task channel. The handler pushes and never blocks or allocates. A full queue drops the byte that has just arrived — the newest, not the oldest — and nothing counts the loss. Scancodes arriving before the queue exists are dropped for the same reason: nobody is typing during early boot. |
 | `WAKER` | `AtomicWaker` | M4 | Its own atomics | **Yes** — the keyboard handler wakes the shell task through it after a successful push. See the `ALLOCATOR` row for the one drop that entails. |
 | `SERIAL1` | `SerialPort` at `0x3F8` | M1 | `spin::Mutex`, taken with a plain `lock` | **No.** Handlers never write to serial at all. The single exception is the double-fault handler on its terminal path, which disables interrupts and reclaims the lock before printing, because the holder it interrupted can never resume. |
@@ -220,6 +220,7 @@ pub fn parse_command(line: &str) -> Option<(&str, &str)>;
 mod serial;      // COM1 at 0x3F8 behind a plain Mutex, plus the panic path's force-unlock
 mod framebuffer; // Display: safe slice writes keyed off FrameBufferInfo
 mod console;     // Console: glyph rendering, wrapping, scrolling, caller-set colour
+mod cpu;         // init(): CPUID-gated SMEP/SMAP/UMIP in CR4, read back and surfaced
 mod logger;      // log::Log impl fanning out to console and serial, honouring the lock rule
 mod gdt;         // init(): GDT (kernel + user segments), TSS, three IST stacks, RSP0
 mod interrupts;  // init(): IDT (incl. the DPL-3 int 0x80 gate), PIC remap to 32..47,
@@ -269,18 +270,21 @@ rest: it prints the panic to serial and to the console, then `SELFTEST FAILED`, 
 exits 35.
 
 The order in `run` is the contract: boot reached `kernel_main`; console renders and
-the cursor advances; `int3` handled and execution resumed; every installed IDT
-exception vector read back present; PIT ticks advance; heap `Box` + 50k-element
-`Vec`; zero-on-free sentinel absent (the scan starts past the allocator's 16-byte
-Hole node); a fresh, deliberately pre-soiled page maps zeroed and writable; the
-page-table audit — no mapping is user-accessible before ring 3 has ever run; the
-kernel heap is NX; an oversized allocation is refused with the allocator intact; an
-async task completes through its waker; a scripted shell session via injected
-scancodes; a crafted W+X ELF image is refused; the embedded `hello` ELF runs at
-CPL 3 and returns via syscall; the page-table audit again, AFTER the ring-3
-teardown; `update_user_page` narrows W and NX correctly (the W^X plumbing); the
-console scroll cost is measured; memory stats are reported; and, last and
-unreturning, the deliberate stack overflow.
+the cursor advances; a drawn glyph's pixels reach the framebuffer in the negotiated
+channel order (a readback probe — cursor bookkeeping alone would pass with the pixel
+write deleted); `int3` handled and execution resumed; every installed IDT exception
+vector read back present; PIT ticks advance; heap `Box` + 50k-element `Vec`;
+zero-on-free sentinel absent (the scan starts past the allocator's 16-byte Hole
+node); a fresh, deliberately pre-soiled page maps zeroed and writable; the
+page-table audit — no mapping is user-accessible before ring 3 has ever run; every
+CPU-advertised supervisor-hardening bit (SMEP/SMAP/UMIP) is live in CR4; the kernel
+heap is NX; an oversized allocation is refused with the allocator intact; an async
+task completes through its waker; a scripted shell session via injected scancodes
+renders `help`'s full output; a crafted W+X ELF image is refused; the embedded
+`hello` ELF runs at CPL 3 and returns via syscall; the page-table audit again, AFTER
+the ring-3 teardown; `update_user_page` narrows W and NX correctly (the W^X
+plumbing); the console scroll cost is measured; memory stats are reported; and, last
+and unreturning, the deliberate stack overflow.
 
 **The final check is the deliberate stack overflow, and it cannot return.** The
 double-fault handler ends it, which means the handler — not `run` — prints the
