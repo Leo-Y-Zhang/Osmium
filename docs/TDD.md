@@ -1,12 +1,12 @@
 # TDD — Osmium v1 kernel
 
-**Status:** current — matches the shipped code through M8 (preemptive multitasking, 2026-08-18); both open questions are resolved below
+**Status:** current — matches the shipped code through M10 (fault isolation, 2026-08-18; per-task address spaces M9 and preemptive multitasking M8 the same day); both open questions are resolved below
 **Date:** 2026-08-18 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
 
 ## Approach
 
-Osmium is a three-crate Cargo workspace, plus `user/hello` and `user/counter` —
-standalone crates the
+Osmium is a three-crate Cargo workspace, plus `user/hello`, `user/counter` and
+`user/crasher` — standalone crates the
 kernel's build script compiles into the embedded user ELFs. `kernel/` is a `no_std`
 binary built for
 `x86_64-unknown-none`; it owns everything that touches hardware. `kshared/` is a
@@ -340,7 +340,13 @@ per-task costs, so it is a coin flip, and an earlier form of the test that
 asserted it flaked at ~50%; the M9 isolation proof — two instances of ONE
 image at the SAME virtual addresses both run at CPL 3 and each reports the
 pristine `'E'` from its private data segment (a shared page would show the
-first instance's write to the second); the kernel-table audit again, AFTER
+first instance's write to the second); the M10 fault-isolation proof —
+`crasher` page-faults beside `hello` and is terminated alone (vector 14 in
+its exit record, the neighbour pristine, the kernel's CR3 restored), the
+pair run repeated up to 5× until the kill path is seen RESUMING the
+survivor rather than only returning to the launcher, and then the crasher
+run alone, which forces that launcher-return branch deterministically; the
+kernel-table audit again, AFTER
 every ring-3 scenario, in its M9 total form — not one user-accessible entry,
 leaf or intermediate, ever; `update_user_page` narrows
 W and NX correctly (the W^X plumbing, now exercised in a scratch address
@@ -425,6 +431,7 @@ Every green milestone is committed and pushed.
 | **M7** | ELF loading: `user/hello`, a linker-scripted Rust ELF built by the kernel's build script and embedded as bytes; `kshared::elf`, a host-tested refusal-first parser; per-segment W^X via `update_user_page`; the kernel heap made NX. Self-tests: a W+X image refused, the audit re-run after teardown, W^X flag plumbing. | Yes | `git revert`; M6 still proves the ring transition. |
 | **M8** | Preemptive multitasking of ring-3 tasks: `sched` (TCBs, per-task heap-allocated kernel stacks, the naked timer entry with its AC scrub, round-robin switch, `SYS_EXIT` routing), TSS RSP0 made mutable and retargeted per switch, the multi-program loader with cross-image overlap refusal, `user/counter` (an unyielding register-heavy checksum program that holds AC hostile), and the `sched` shell command. Self-tests: exit-order preemption proof, exact checksum across every switch, timer-entry AC scrub, overlap refusal, the existing audits now covering the concurrent run. | Yes | `git revert`; M7's single-program cooperative kernel still boots and passes its battery. |
 | **M9** | Per-task address spaces: `memory::AddressSpace` (kernel PML4 cloned, entry-0 chain deep-copied against the MEASURED bootloader low mappings, user PD slots private), CR3 switched with RSP0 at every context switch and restored when the last task exits, hello's exit code widened to carry its data-segment read (the isolation witness), the M8 cross-image overlap refusal REMOVED (same-VA programs are now the point — `plans_overlap` and its host tests deleted with it), and the audit strengthened to its total form: the kernel table never carries any user-accessible entry. Self-tests: two instances of one image at one VA both run and both read pristine data; the W^X probe moved into a scratch space. | Yes | `git revert`; M8's shared-address-space scheduler still boots and passes its battery (its overlap refusal returns with it). |
+| **M10** | Fault isolation: every ring-3-reachable exception handler forks on the faulting CPL — ring 3 calls `sched::kill_current` (AC scrubbed, fault vector recorded in the exit report, RSP0+CR3 switched to the next ready task or the kernel's own world restored for the launcher return, via naked never-returning helpers); CPL 0 still panics, and NMI/#MC/#DF stay panic-only at any CPL. `user/crasher` (announces itself, then dereferences an unmapped address), the `crash` shell command, and `xtask privacy` typing `crash`. Self-tests: crasher terminated alone beside a surviving hello (repeated until the kill path is seen resuming the survivor), and a fault in the last task returning cleanly to the launcher. | Yes | `git revert`; M9's fault-fatal kernel still boots and passes its battery. |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
 port `0x60` — the controller delivers no further interrupts until it is read — but
@@ -449,6 +456,11 @@ static, and the handler still allocates nothing and blocks on nothing.
 | **Insufficient physical memory at boot** — the machine has less RAM than the boot needs. | CI at the pinned floor; a person on a small machine | Measured at 0.25 MB granularity around the floor: the **bootloader** runs out first, panicking with `FrameAllocationFailed` while mapping the kernel, and the kernel never runs — there is no observed window where the kernel-side `mapping the kernel heap failed` panic fires instead (that path exists but is shadowed by the earlier failure). The bootloader's panic reaches serial; `xtask` recognises it in the captured log and reports a bootloader OOM rather than calling the timeout a kernel hang. | Boot with more memory, or lower `HEAP_SIZE`. The pinned CI RAM value — measured floor plus recorded headroom, per firmware — is the regression test for this. |
 | **No framebuffer from firmware** | A person seeing a blank screen | `boot_info.framebuffer` is `None`. Handled, not a fault: the console stays absent, the kernel logs the fallback over serial, and boot and the battery still run and pass. The shell renders to the console only, so this configuration is boot-proven, not interactive. | None needed; this is a supported degraded configuration. |
 | **Firmware-specific pixel format assumption** — code that works on BIOS VBE and corrupts under UEFI GOP, or vice versa. | Whoever boots the other firmware | The renderer reads `pixel_format`, `stride` and `bytes_per_pixel` from the negotiated `FrameBufferInfo`, and **both firmwares are boot-tested in the CI matrix**. A hard-coded assumption fails one leg of the matrix. | `git revert`; the matrix names which firmware broke. |
+| **A ring-3 program faults** — page fault, #GP, #UD or any other ring-3-reachable exception. | The person at the keyboard, from the `crash`-style report; the battery, from the exit records | **Contained since M10, not a machine failure:** the handler forks on the faulting CPL and `sched::kill_current` terminates only the offender, recording the vector in its exit report — the neighbour and the kernel keep running, which the battery proves every run. A KERNEL-context fault still panics (a kernel bug is not a schedulable event), and NMI/#MC/#DF panic at any CPL — machine-level events, not the current task's doing. | Nothing to undo — this is the designed behaviour. A ring-3 fault that DOES take the machine down is an M10 regression: `git revert` the commit touching `interrupts` or `sched`. |
+| **Scancode queue overflow** — typing faster than the executor drains. | Nobody, in practice | The handler drops the byte it has just read — the newest — and nothing counts the loss, so there is no signal to watch. That is acceptable only because the case is unreachable in interactive use: the queue holds 128 scancodes, and the executor drains it on every wake, so filling it would need something on the order of a hundred keystrokes between two polls of a task that is woken by each one. Lossy by design, and never blocking, is the property that matters in an interrupt handler. | Not a fault. If it ever does happen the visible symptom is a swallowed keystroke, and the bug to fix is whatever is keeping the executor from being scheduled — not the queue. |
+| **Pinned nightly stops resolving or changes behaviour** | The first CI run after the pin moves | Every job fails at toolchain install or at build. | The pin is bumped only in a dedicated pull request that changes nothing else, so reverting that one commit restores a known-good toolchain. |
+| **Bootloader build stages fail to fetch** | First build on a cold cache | `bootloader` is pinned with `=0.11.17`, `Cargo.lock` is committed, and the CI cache is keyed on it. A fetch failure fails the `image-build` job loudly. | Re-run; if persistent, the pin is the thing to investigate, not the kernel. |
+| **A self-test passes vacuously** — asserts a property it does not exercise. | Nobody, which is what makes it the worst entry in this table | Each self-test must be **observed failing once** under a deliberate mutation before it counts as a test: break the zeroing wrapper, break the frame zeroing, remove the IST assignment, stop reading port `0x60`. Both outputs — the failing run and the passing run — are recorded. | Rewrite the test. A test that cannot be made to fail is deleted, not kept for reassurance. |
 
 ## Deferred, with measurement — write-only console scroll
 
@@ -461,10 +473,6 @@ repainted forward-only, so the framebuffer is never read — is deferred until
 either the measured number or a real-hardware boot shows it matters. Recording
 the decision here, with the number, is the point; a silent rewrite for an
 unmeasured cost is exactly what this repo's culture rejects.
-| **Scancode queue overflow** — typing faster than the executor drains. | Nobody, in practice | The handler drops the byte it has just read — the newest — and nothing counts the loss, so there is no signal to watch. That is acceptable only because the case is unreachable in interactive use: the queue holds 128 scancodes, and the executor drains it on every wake, so filling it would need something on the order of a hundred keystrokes between two polls of a task that is woken by each one. Lossy by design, and never blocking, is the property that matters in an interrupt handler. | Not a fault. If it ever does happen the visible symptom is a swallowed keystroke, and the bug to fix is whatever is keeping the executor from being scheduled — not the queue. |
-| **Pinned nightly stops resolving or changes behaviour** | The first CI run after the pin moves | Every job fails at toolchain install or at build. | The pin is bumped only in a dedicated pull request that changes nothing else, so reverting that one commit restores a known-good toolchain. |
-| **Bootloader build stages fail to fetch** | First build on a cold cache | `bootloader` is pinned with `=0.11.17`, `Cargo.lock` is committed, and the CI cache is keyed on it. A fetch failure fails the `image-build` job loudly. | Re-run; if persistent, the pin is the thing to investigate, not the kernel. |
-| **A self-test passes vacuously** — asserts a property it does not exercise. | Nobody, which is what makes it the worst entry in this table | Each self-test must be **observed failing once** under a deliberate mutation before it counts as a test: break the zeroing wrapper, break the frame zeroing, remove the IST assignment, stop reading port `0x60`. Both outputs — the failing run and the passing run — are recorded. | Rewrite the test. A test that cannot be made to fail is deleted, not kept for reassurance. |
 
 ## Rollback
 

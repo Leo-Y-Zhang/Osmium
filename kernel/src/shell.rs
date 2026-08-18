@@ -507,6 +507,17 @@ fn crash_command() {
                     hello.code & 3
                 ),
             );
+            // Which branch the kill took depends on tick phase: almost always
+            // the fault handler resumes hello directly; rarely a timer tick
+            // let hello finish first and the kill returned to the launcher.
+            if report.fault_kill_resumes > 0 {
+                field("kill:    ", "the fault handler resumed hello directly");
+            } else {
+                field(
+                    "kill:    ",
+                    "hello had already finished; the kernel took the fault alone",
+                );
+            }
             field("kernel:  ", "still running - you are typing at it");
         }
         Err(e) => println_con(&format!("crash: an embedded ELF was refused: {e:?}")),

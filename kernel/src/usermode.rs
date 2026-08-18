@@ -28,11 +28,13 @@
 //! carry a single one, before, during or after a run.
 //!
 //! Boundaries, stated so they are not mistaken for isolation guarantees:
-//! - **A misbehaving user program is still fatal to the machine.** Every
-//!   exception handler panics, so a ring-3 fault takes the whole kernel down
-//!   — and with it every other task. Address-space isolation protects tasks'
-//!   MEMORY from each other; fault isolation (terminate the offender, keep
-//!   the rest) is a later milestone.
+//! - **A misbehaving user program is terminated alone (M10).** Every fault
+//!   handler forks on the faulting CPL: a ring-3 fault calls
+//!   `sched::kill_current`, which records the vector and resumes the next
+//!   ready task or returns to the launcher — the machine and every other
+//!   task keep running. A kernel-context fault still panics (a kernel bug is
+//!   not a schedulable event), and NMI/#MC/#DF stay panic-only at any CPL
+//!   (machine-level events, not something the current task did).
 //! - **One run at a time.** The shell issues runs synchronously; the
 //!   scheduler asserts it is never installed while active.
 //! - **Frames are not reclaimed.** The bump allocator never frees, so each

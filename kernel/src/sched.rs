@@ -126,6 +126,12 @@ struct Sched {
     /// save/restore round trip through the context-switch machinery, even
     /// when the round-robin lands back on the same task.
     ring3_round_trips: u64,
+    /// Fault kills that resumed a SURVIVING task (`kill_current`'s
+    /// `Some(next)` branch, M10). Which branch a pair run takes depends on
+    /// tick phase — a tick landing before the fault lets the neighbour finish
+    /// first and routes the kill through the launcher return instead — so the
+    /// battery repeats the run until this counter proves the resume path ran.
+    fault_kill_resumes: u64,
     exit_counter: u64,
 }
 
@@ -148,6 +154,7 @@ static SCHED: Mutex<Sched> = Mutex::new(Sched {
     active: false,
     preemptive_switches: 0,
     ring3_round_trips: 0,
+    fault_kill_resumes: 0,
     exit_counter: 0,
 });
 
@@ -175,6 +182,9 @@ pub struct RunReport {
     pub exits: Vec<TaskExit>,
     pub preemptive_switches: u64,
     pub ring3_round_trips: u64,
+    /// How many fault kills resumed a surviving task (M10) — the kill path's
+    /// `resume_context` branch, as opposed to its return-to-launcher branch.
+    pub fault_kill_resumes: u64,
 }
 
 /// What the launcher hands `install` per task: where to start it, where its
@@ -233,6 +243,7 @@ pub fn install(specs: &[LaunchSpec]) -> u64 {
     sched.active = true;
     sched.preemptive_switches = 0;
     sched.ring3_round_trips = 0;
+    sched.fault_kill_resumes = 0;
     sched.exit_counter = 0;
     crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[0].kstack_top()));
     // Enter task 0's world before `enter_tasks` iretqs into it: its user
@@ -266,6 +277,7 @@ pub fn collect() -> RunReport {
             .collect(),
         preemptive_switches: sched.preemptive_switches,
         ring3_round_trips: sched.ring3_round_trips,
+        fault_kill_resumes: sched.fault_kill_resumes,
     }
 }
 
@@ -546,6 +558,7 @@ pub fn kill_current(fault_vector: u8) -> ! {
     sched.exit_counter += 1;
     match sched.next_ready(cur) {
         Some(next) => {
+            sched.fault_kill_resumes += 1;
             sched.current = next;
             crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
             load_cr3(sched.tasks[next].cr3);

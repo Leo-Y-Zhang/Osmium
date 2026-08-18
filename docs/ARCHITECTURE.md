@@ -145,8 +145,9 @@ degenerate case of the scheduler. In symbol order:
    fault-terminated with the vector that killed it, and takes the same two
    exits `sys_exit` does (resume the next ready task's context with its RSP0
    and CR3, or restore the kernel's world and return to the launcher), via
-   naked never-returning helpers sharing the canonical pop-15/`iretq` restore
-   tail. A CPL-0 fault still panics: a kernel bug is not a schedulable event,
+   naked never-returning helpers sharing the canonical restore tails — the
+   pop-15/`iretq` context resume and the pop-6/`ret` launcher-continuation
+   return. A CPL-0 fault still panics: a kernel bug is not a schedulable event,
    and NMI, machine check and double fault stay panic-only at any CPL because
    they report machine-level events, not something the current task did.
 5. **Teardown and audit.** Teardown is dropping the spaces: the kernel's own

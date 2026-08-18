@@ -666,39 +666,64 @@ fn address_spaces_isolate_same_va() {
 ///    follows in the battery close the run out like any other.
 ///
 /// (Mutations observed: removing the handlers' ring-3 branch panics the
-/// kernel here; mis-reporting the vector fails assertion 1.)
+/// kernel here; mis-reporting the vector fails assertion 1; omitting the
+/// kill path's CR3 switch marks the neighbour faulted; removing the
+/// `fault_kill_resumes` increment fails the resume-coverage floor.)
+///
+/// Which branch of the kill path the pair run takes depends on tick phase: a
+/// 100 Hz tick landing in crasher's short announce-to-fault window lets hello
+/// finish first, routing the kill through the launcher return instead of
+/// `resume_context`. The isolation assertions hold either way, but the
+/// milestone's headline path — kill the offender and RESUME the neighbour
+/// from inside a fault handler — would then go silently unexercised. So the
+/// run repeats (up to 5×) until the report's `fault_kill_resumes` counter
+/// proves the resume branch ran: correct code reaches it on the first try in
+/// ≫99% of runs, so five misses in a row (~1e-10) means the branch is gone,
+/// not unlucky — the M9 repetition-not-hope precedent.
 fn faulting_task_is_contained() {
-    let report = crate::usermode::run_crasher_and_hello()
-        .expect("an embedded ELF was refused for the fault-isolation run");
-    let crasher = &report.exits[0];
-    let hello = &report.exits[1];
-    assert_eq!(
-        crasher.fault,
-        Some(14),
-        "crasher was not terminated by a page fault (fault={:?}, code={:#x})",
-        crasher.fault,
-        crasher.code
-    );
-    assert_eq!(
-        hello.fault, None,
-        "the innocent neighbour was marked faulted"
-    );
-    assert_eq!(
-        hello.code & 3,
-        3,
-        "the surviving hello ran at CPL {} (expected ring 3)",
-        hello.code & 3
-    );
-    assert_eq!(
-        (hello.code >> 8) & 0xff,
-        u64::from(b'E'),
-        "the surviving hello read a non-pristine data segment"
-    );
     use x86_64::registers::control::Cr3;
-    assert_eq!(
-        Cr3::read().0,
-        crate::memory::kernel_cr3(),
-        "the kernel's CR3 was not restored after a run ending in a fault kill"
+    let mut resume_proven = false;
+    for _attempt in 0..5 {
+        let report = crate::usermode::run_crasher_and_hello()
+            .expect("an embedded ELF was refused for the fault-isolation run");
+        let crasher = &report.exits[0];
+        let hello = &report.exits[1];
+        assert_eq!(
+            crasher.fault,
+            Some(14),
+            "crasher was not terminated by a page fault (fault={:?}, code={:#x})",
+            crasher.fault,
+            crasher.code
+        );
+        assert_eq!(
+            hello.fault, None,
+            "the innocent neighbour was marked faulted"
+        );
+        assert_eq!(
+            hello.code & 3,
+            3,
+            "the surviving hello ran at CPL {} (expected ring 3)",
+            hello.code & 3
+        );
+        assert_eq!(
+            (hello.code >> 8) & 0xff,
+            u64::from(b'E'),
+            "the surviving hello read a non-pristine data segment"
+        );
+        assert_eq!(
+            Cr3::read().0,
+            crate::memory::kernel_cr3(),
+            "the kernel's CR3 was not restored after a run ending in a fault kill"
+        );
+        if report.fault_kill_resumes >= 1 {
+            resume_proven = true;
+            break;
+        }
+    }
+    assert!(
+        resume_proven,
+        "five pair runs and the fault kill never resumed the survivor — the \
+         kill path's resume_context branch is unreachable or uncounted"
     );
     serial_println!(
         "[selftest] isolation: a page-faulting task was terminated alone — its neighbour \

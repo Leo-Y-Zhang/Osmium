@@ -107,8 +107,8 @@ page. The `privacy` command reports all of this live.
   deleted). The kernel's own page table never carries a user-accessible entry
   at all, which the page-table audit now asserts in its strongest form
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
-  `keymap` (us/uk), `user`, `sched`, `selftest`, `panic`, `shutdown` — with an
-  insertion cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
+  `keymap` (us/uk), `user`, `sched`, `crash`, `selftest`, `panic`, `shutdown` —
+  with an insertion cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
 - Panic screens that report the failure on both the console and the serial
   port; never a silent hang
 
@@ -129,8 +129,10 @@ Three layers, all run by CI on every push:
   the register file survives every context switch, and the timer entry's
   `EFLAGS.AC` scrub proven against a hostile program), the address-space
   isolation proof (two instances of one image at the same virtual addresses,
-  each seeing only its own memory), per-page W^X
-  flag plumbing,
+  each seeing only its own memory), the fault-isolation proof (a page-faulting
+  program is terminated alone — repeated until the kill path is seen resuming
+  its surviving neighbour — and a fault in the last task alive returns cleanly
+  to the launcher), per-page W^X flag plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
 - **Shipped-image boot** (`cargo xtask test --shipped`): the exact image a user
