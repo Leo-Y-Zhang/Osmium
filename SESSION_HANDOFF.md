@@ -1,62 +1,37 @@
 # Session handoff
 
-## AUTONOMOUS OVERNIGHT MODE — 2026-08-17 night → 2026-08-18 12:00
+**State: v0.1.0 + M6 (ring 3) + M7 (ELF loader), hardened.** An autonomous
+overnight run (17→18 Aug) took Osmium through a full critique → judge →
+implement → adversarial-verify pass on the operator's request. Nothing is in
+flight and nothing is owed.
 
-An overnight improvement run is in progress on the operator's direct request
-("critique it, improve it, refine it, tune it, secure it, optimise it,
-beautify it, perfect it"). Deadline: everything committed, pushed, CI-green
-and reported by 12:00 on 18 Aug.
-
-**Resume protocol for any fresh session:** read this banner, `git log --oneline -10`,
-and the task list; continue from "Next action" below. Full local gate =
-`cargo fmt --check` + clippy (both feature configs) + `cargo test -p kshared` +
-`cargo xtask test --bios`, `--uefi`, `--shipped`. Every green increment is
-committed and pushed immediately; CI is the gate, not local success.
-
-- **State:** Ranks 1-11, 16-subset, 19, 21 all landed, pushed, CI-green.
-  Wave 1 (CI gate hardening, privacy allowlist, sentinel skip, page-permission
-  cluster). Wave 2: M7 ELF loader (`user/hello`, host-tested `kshared::elf`).
-  Wave 3 so far: rank 6 SMEP/SMAP/UMIP, rank 7 pixel-readback probe, rank 8
-  no-persistence hash gate, rank 9 docs sweep + top-up, rank 11 shell
-  discrimination + chords, rank 19 xtask host tests, rank 21 hardware funnel,
-  rank 16 cleanups. All three worktrees merged and removed. Every mutation
-  observed red then reverted; every gate run with pipefail.
-  ⚠ Local `cargo test -p xtask` needs `--release` (Smart App Control blocks
-  the dev-profile bootloader stage-4 build script); CI (ubuntu) is unaffected.
-- **Progress:** ranks 1-14, 16-subset, 17, 19-21 and 13 (screenshot) all
-  landed, pushed, CI-green (screenshot run pending — it carries all of rank
-  17 too). Only rank 15 (dedup zero-on-free into checks.rs) and rank 18
-  (history into kshared) remain from the plan — both optional internal
-  quality. ⚠ Lesson: local clippy uses cached results and MISSED a real
-  question_mark error that CI caught (commit cf9a5.. → 695c1.. green); the
-  "exit 101" I dismissed as build-lock races were real first-run clippy
-  failures. Force a fresh clippy (touch changed files) and never dismiss a
-  clippy 101.
-- **In flight:** Phase 3 — a tester agent (adversarial: break the ELF parser,
-  page audit, SMAP copy, completion) and a security-reviewer agent (ring-3 /
-  ELF / syscall / SMAP surface) are analyzing the night's diff read-only. Hold
-  code edits on selftest.rs/shell.rs/memory until they report; fix real
-  findings, then optionally do 15/18.
-- **Next action:** consume the two Phase-3 reports, fix any real finding
-  (test-first, mutation-observed), then closure from ~11:00: full gates, CI
-  green on final HEAD, gh api notifications (UNKNOWN if it errors, never 0),
-  update project_osmium.md + MEMORY.md, final report.
-- **Standing constraints:** networking on NO roadmap ever; console scroll rework
-  stays DEFERRED (measured ~87 ms/100 scrolls under TCG, needs real-hardware or
-  KVM data first); the four privacy properties are inviolable; exactly one
-  unstable feature (`abi_x86_interrupt`); everything must build on a
-  non-administrator Windows box via `cargo xtask` alone.
-
-## Baseline (pre-overnight state)
-
-**v0.1.0 + M6 complete.** Milestones M0–M6 merged, pushed, CI-green on `main`;
-adversarial-test, security-review and release audits all run and their findings
-fixed. The four engineering documents in `docs/` were reconciled to the shipped
-code as of M6; treat code-vs-doc drift as a defect in whichever is wrong.
-
+- All milestones and the overnight work are merged, pushed and CI-green on
+  `main`. The four engineering documents in `docs/` are reconciled to the
+  shipped code; treat any code-vs-doc drift as a defect in whichever is wrong.
 - Build, run and test commands are in the README (`cargo xtask ...`). On a
-  machine where QEMU is not on PATH, point `OSMIUM_QEMU` at the
-  `qemu-system-x86_64` binary.
-- The RAM floors (21 MiB BIOS / 46 MiB UEFI) are dated manual measurements on
-  QEMU 11.1, recorded in `xtask/src/main.rs`; re-measure before tightening the
-  CI gates.
+  machine without QEMU on PATH, point `OSMIUM_QEMU` at the binary.
+- Local gate = `cargo fmt --all --check`, clippy (both feature configs),
+  `cargo test -p kshared -p xtask`, and `cargo xtask test --bios|--uefi|--shipped`
+  plus `cargo xtask privacy`. Note: `cargo test -p xtask` needs `--release`
+  locally (Smart App Control blocks the dev-profile bootloader build script);
+  CI on ubuntu is unaffected. Force a fresh clippy (`touch` changed files) —
+  cached results can hide a lint CI's fresh run catches.
+
+## What M7 and the overnight run added
+
+- **M7 ELF loader.** `user/hello` is a real linker-scripted Rust ELF parsed by
+  host-tested `kshared::elf` (refusal-by-default), mapped per-segment W^X, run
+  at CPL 3. `kernel/build.rs` builds and embeds it.
+- **SMEP/SMAP/UMIP** (`kernel/src/cpu.rs`), CPUID-gated and CR4-readback-proven;
+  SMAP made genuinely active via a physical-alias copy; the syscall gate scrubs
+  `EFLAGS.AC` so ring 3 cannot disable SMAP.
+- NX heap; an order-independent page-table audit that re-runs after teardown;
+  a console pixel-readback selftest; tab completion; a no-persistence image-hash
+  CI gate; a keystroke-privacy allowlist; release gating; a hardware-report
+  funnel; and a full docs + screenshot refresh.
+
+## Roadmap (PRD Won't-list, unchanged)
+
+ramfs, preemptive scheduling, APIC/HPET, SMP. Networking is on no roadmap. The
+console scroll cell-grid rework stays deferred with its measured number in the
+TDD.
