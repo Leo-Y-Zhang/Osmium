@@ -192,22 +192,25 @@ fn no_stray_user_mappings_after_ring3() {
 fn supervisor_hardening_is_active() {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     let cr4 = Cr4::read();
-    // CPUID leaf 7 is the source of truth for what the CPU supports; it
-    // exists on every x86_64 CPU and `__cpuid_count` is safe on x86_64.
+    // CPUID leaf 7 is the source of truth for what the CPU supports — but only
+    // if the CPU has a leaf 7 (see cpu::supported). This battery runs under
+    // `-cpu max`, where it does; the guard just refuses to read garbage.
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
     let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let advertised = |bit_set: bool| max_leaf >= 7 && bit_set;
     let checks = [
         (
-            leaf7.ebx & (1 << 7) != 0,
+            advertised(leaf7.ebx & (1 << 7) != 0),
             Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION,
             "SMEP",
         ),
         (
-            leaf7.ebx & (1 << 20) != 0,
+            advertised(leaf7.ebx & (1 << 20) != 0),
             Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION,
             "SMAP",
         ),
         (
-            leaf7.ecx & (1 << 2) != 0,
+            advertised(leaf7.ecx & (1 << 2) != 0),
             Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION,
             "UMIP",
         ),

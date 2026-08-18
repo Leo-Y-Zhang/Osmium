@@ -29,9 +29,16 @@ static ENABLED: AtomicU8 = AtomicU8::new(0);
 
 /// CPUID leaf 7, sub-leaf 0: EBX bit 7 = SMEP, bit 20 = SMAP; ECX bit 2 = UMIP.
 fn supported() -> (bool, bool, bool) {
-    // CPUID leaf 7 is available on every x86_64 CPU (the leaf count in EAX of
-    // leaf 0 is >= 7 on all of them). `__cpuid_count` is safe on x86_64: the
-    // instruction is unprivileged and has no side effects beyond its outputs.
+    // Leaf 7 only arrived ~2011. On an older x86_64 (Athlon 64, Core 2, …) the
+    // maximum basic leaf is below 7, and CPUID with EAX past the maximum
+    // returns some OTHER leaf's registers — so reading leaf 7 blind could set
+    // a reserved CR4 bit and #GP the boot on exactly the machines the hardware
+    // funnel invites. Gate on the max basic leaf (leaf 0, EAX) first.
+    if core::arch::x86_64::__cpuid(0).eax < 7 {
+        return (false, false, false);
+    }
+    // `__cpuid_count` is safe on x86_64: the instruction is unprivileged and
+    // has no side effects beyond its outputs.
     let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
     let smep = leaf7.ebx & (1 << 7) != 0;
     let smap = leaf7.ebx & (1 << 20) != 0;
