@@ -8,6 +8,7 @@ pub fn run() -> ! {
     serial_println!("[selftest] boot: reached kernel_main ... ok");
     console_renders_and_advances();
     console_pixels_reach_the_framebuffer();
+    clear_is_correct_and_measured();
     breakpoint_handled_and_returns();
     idt_has_all_installed_vectors();
     timer_ticks_advance();
@@ -484,6 +485,37 @@ fn console_pixels_reach_the_framebuffer() {
     serial_println!(
         "[selftest] console: glyph pixels reach the framebuffer, correct channel ... ok"
     );
+}
+
+/// The row-template `clear` and the `mix` endpoint fast-paths: correctness
+/// first (a wrong fill or a swapped `mix` early-out is a visible bug), then
+/// the measured cost so the boot-path saving is archived in CI.
+fn clear_is_correct_and_measured() {
+    use crate::framebuffer::{BACKGROUND, FOREGROUND, Rgb};
+    // mix endpoints: 0 is background, 255 is foreground; a swapped early-out
+    // fails one of these. (Rgb is Eq but not Debug, so assert! not assert_eq!.)
+    assert!(
+        Rgb::mix(FOREGROUND, BACKGROUND, 0) == BACKGROUND,
+        "mix(.., 0) must be the background colour"
+    );
+    assert!(
+        Rgb::mix(FOREGROUND, BACKGROUND, 255) == FOREGROUND,
+        "mix(.., 255) must be the foreground colour"
+    );
+    if !crate::console::is_initialised() {
+        serial_println!("[selftest] console: clear probe skipped, no framebuffer");
+        return;
+    }
+    let (ok, cycles) = crate::console::with_console(|c| c.clear_probe())
+        .flatten()
+        .expect("clear probe needs a framebuffer");
+    assert!(ok, "clear left a soiled corner — a row was not filled");
+    match crate::time::cycles_to_us(cycles) {
+        Some(us) => {
+            serial_println!("[selftest] perf: full-screen clear in {cycles} cyc (~{us} us) ... ok")
+        }
+        None => serial_println!("[selftest] perf: full-screen clear in {cycles} cyc ... ok"),
+    }
 }
 
 fn console_renders_and_advances() {

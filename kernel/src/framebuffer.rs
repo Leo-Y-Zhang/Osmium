@@ -57,8 +57,18 @@ impl Rgb {
         ((u16::from(self.r) * 30 + u16::from(self.g) * 59 + u16::from(self.b) * 11) / 100) as u8
     }
 
-    /// Linear blend of `fg` over `bg` by `intensity` (0 = bg, 255 = fg).
+    /// Linear blend of `fg` over `bg` by `intensity` (0 = bg, 255 = fg). The
+    /// two endpoints are by far the most common inputs — every fully-covered
+    /// glyph pixel is 255 and every background pixel (a space glyph, the eraser,
+    /// the gaps in every character) is 0 — so they short-circuit the six
+    /// multiplies the general blend would do.
     pub fn mix(fg: Rgb, bg: Rgb, intensity: u8) -> Rgb {
+        if intensity == 0 {
+            return bg;
+        }
+        if intensity == 255 {
+            return fg;
+        }
         let mix = |f: u8, b: u8| {
             ((u16::from(f) * u16::from(intensity) + u16::from(b) * (255 - u16::from(intensity)))
                 / 255) as u8
@@ -85,11 +95,24 @@ impl Display {
         }
     }
 
+    /// Fills the whole framebuffer with `color`. Renders one row through the
+    /// format-aware `set_pixel` path, then replicates its bytes down the
+    /// framebuffer with `copy_within` — turning ~width*height dispatched pixel
+    /// writes (two bounds checks, a stride multiply and a pixel-format match
+    /// each) into `width` writes plus `height-1` row copies. `clear` is on the
+    /// boot path (it runs in `Console::new`, before the console-ready mark)
+    /// and on every `clear`/Ctrl-L, so the saving shows in the archived
+    /// `[boot] console-ready` figure.
     pub fn clear(&mut self, color: Rgb) {
-        for y in 0..self.info.height {
-            for x in 0..self.info.width {
-                self.set_pixel(x, y, color);
-            }
+        let row_bytes = self.info.stride * self.info.bytes_per_pixel;
+        if row_bytes == 0 {
+            return;
+        }
+        for x in 0..self.info.width {
+            self.set_pixel(x, 0, color);
+        }
+        for y in 1..self.info.height {
+            self.buffer.copy_within(0..row_bytes, y * row_bytes);
         }
     }
 

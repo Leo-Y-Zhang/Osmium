@@ -13,20 +13,22 @@ and the task list; continue from "Next action" below. Full local gate =
 `cargo xtask test --bios`, `--uefi`, `--shipped`. Every green increment is
 committed and pushed immediately; CI is the gate, not local success.
 
-- **State:** Wave 1 + Wave 2 landed and pushed, all CI-green:
-  ranks 1-4 (CI grep-gate hardening; keystroke-privacy allowlist; sentinel
-  16-byte skip; page-permission cluster incl. heap NX + order-independent
-  user-mapping audit) and rank 5 (M7 ELF loader: `user/hello` real Rust ELF,
-  host-tested `kshared::elf` parser, per-segment W^X). Every mutation observed
-  red then reverted.
-- **In flight:** three Wave-3 agents in worktrees off `5d7074f`:
-  wt-xtask (rank 8 no-persistence hash gate + rank 19 xtask host tests),
-  wt-docs (rank 9 docs reconciliation sweep), wt-funnel (rank 21 hardware
-  report funnel). Main clone: doing rank 6 (SMEP/SMAP/UMIP) directly.
-- **Next action:** finish rank 6; merge the three worktree branches in order
-  (funnel, xtask, docs — docs last as it is the widest), gate each merge,
-  push. Then remaining Wave-3 ranks 7/11/12/14 as time allows. Closure from
-  11:00: full gates, CI green, gh api notifications, memory update.
+- **State:** Ranks 1-11, 16-subset, 19, 21 all landed, pushed, CI-green.
+  Wave 1 (CI gate hardening, privacy allowlist, sentinel skip, page-permission
+  cluster). Wave 2: M7 ELF loader (`user/hello`, host-tested `kshared::elf`).
+  Wave 3 so far: rank 6 SMEP/SMAP/UMIP, rank 7 pixel-readback probe, rank 8
+  no-persistence hash gate, rank 9 docs sweep + top-up, rank 11 shell
+  discrimination + chords, rank 19 xtask host tests, rank 21 hardware funnel,
+  rank 16 cleanups. All three worktrees merged and removed. Every mutation
+  observed red then reverted; every gate run with pipefail.
+  ⚠ Local `cargo test -p xtask` needs `--release` (Smart App Control blocks
+  the dev-profile bootloader stage-4 build script); CI (ubuntu) is unaffected.
+- **Next action:** remaining Wave-3 as time allows, in value order: rank 20
+  (image budget 3 MiB), rank 14 (boot-perf fill_rows + mix early-outs, uses
+  rank 7's accessor), rank 12 (shell output consistency + format_uptime host
+  test), rank 10 (release/CI hardening), rank 13 (screenshot refresh — LAST,
+  after help text is final), then optional 15/17/18. Then Phase 3 adversarial
+  verification, then closure from 11:00.
 - **Standing constraints:** networking on NO roadmap ever; console scroll rework
   stays DEFERRED (measured ~87 ms/100 scrolls under TCG, needs real-hardware or
   KVM data first); the four privacy properties are inviolable; exactly one

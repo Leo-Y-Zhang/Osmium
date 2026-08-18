@@ -132,6 +132,48 @@ impl Console {
         inside_differs && outside_bg && colour_ok
     }
 
+    /// Proves `clear` fills every row including the last: soils the four
+    /// screen corners with a non-background colour, clears, and asserts all
+    /// four (and the centre) read back as background. A `fill_rows` off-by-one
+    /// that leaves the last row uncopied leaves the soiled bottom corners set,
+    /// failing here. Returns the cycles the clear took, for the perf line.
+    #[cfg(feature = "selftest")]
+    pub fn clear_probe(&mut self) -> Option<(bool, u64)> {
+        use crate::framebuffer::{ACCENT, BACKGROUND};
+        let w = self.display.info.width;
+        let h = self.display.info.height;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let corners = [
+            (0, 0),
+            (w - 1, 0),
+            (0, h - 1),
+            (w - 1, h - 1),
+            (w / 2, h / 2),
+        ];
+        for &(x, y) in &corners {
+            self.display.set_pixel(x, y, ACCENT);
+        }
+        let start = crate::time::rdtsc();
+        self.display.clear(BACKGROUND);
+        let cycles = crate::time::rdtsc().wrapping_sub(start);
+
+        let mut bg = [0u8; 8];
+        let n = match self.display.pixel_bytes(0, 0) {
+            Some(b) => {
+                bg[..b.len()].copy_from_slice(b);
+                b.len()
+            }
+            None => return None,
+        };
+        let bg = &bg[..n];
+        let all_bg = corners
+            .iter()
+            .all(|&(x, y)| self.display.pixel_bytes(x, y) == Some(bg));
+        Some((all_bg, cycles))
+    }
+
     /// Clears the whole screen and homes the cursor.
     pub fn clear_screen(&mut self) {
         self.display.clear(BACKGROUND);
