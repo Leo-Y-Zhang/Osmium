@@ -440,11 +440,15 @@ fn sched_command() {
         Ok(report) => {
             // A SYS_WRITE ends mid-line; drop to a fresh one before the report.
             println_con("");
+            let plural = |n: u64| if n == 1 { "" } else { "s" };
             field(
                 "sched:   ",
                 &format!(
-                    "2 programs, {} preemptive switches, {} timer round-trips",
-                    report.preemptive_switches, report.ring3_round_trips
+                    "2 programs, {} preemptive switch{}, {} timer round-trip{}",
+                    report.preemptive_switches,
+                    plural(report.preemptive_switches),
+                    report.ring3_round_trips,
+                    plural(report.ring3_round_trips)
                 ),
             );
             let order = |seq: u64| if seq == 0 { "first" } else { "second" };

@@ -5,7 +5,7 @@ construction, light by measurement**.
 
 [![CI](https://github.com/Leo-Y-Zhang/Osmium/actions/workflows/ci.yml/badge.svg)](https://github.com/Leo-Y-Zhang/Osmium/actions/workflows/ci.yml)
 
-![The Osmium shell answering `help` and `privacy`](docs/screenshot.png)
+![The Osmium shell answering `help`, then `sched` showing two ring-3 programs preemptively scheduled — the program launched second exits first](docs/screenshot.png)
 
 Osmium boots from BIOS or UEFI, renders its own glyph console on the framebuffer,
 takes keyboard input through an async executor, drops you at a shell, and runs
