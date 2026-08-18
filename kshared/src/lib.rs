@@ -252,6 +252,10 @@ pub const COMMANDS: &[Command] = &[
         help: "  sched         run two ring-3 programs, preemptively scheduled",
     },
     Command {
+        name: "crash",
+        help: "  crash         crash a ring-3 program; the machine survives it",
+    },
+    Command {
         name: "selftest",
         help: "  selftest      run the runtime test subset",
     },
@@ -446,7 +450,10 @@ mod tests {
     fn complete_resolves_unique_ambiguous_and_none() {
         // Unique: only one command starts with "h".
         assert_eq!(complete("h"), Completion::Unique("help"));
+        // clear/crash share "c"; one more letter disambiguates.
+        assert_eq!(complete("c"), Completion::Ambiguous("c"));
         assert_eq!(complete("cl"), Completion::Unique("clear"));
+        assert_eq!(complete("cr"), Completion::Unique("crash"));
         // Ambiguous: sysinfo/sched/selftest/shutdown share only "s".
         assert_eq!(complete("s"), Completion::Ambiguous("s"));
         // Disambiguated by the next letter.

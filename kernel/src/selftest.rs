@@ -26,6 +26,7 @@ pub fn run() -> ! {
     preemptive_scheduling_is_real();
     round_robin_is_sustained();
     address_spaces_isolate_same_va();
+    faulting_task_is_contained();
     no_stray_user_mappings_after_ring3();
     update_user_page_enforces_wx();
     measure_console_scroll();
@@ -648,6 +649,81 @@ fn address_spaces_isolate_same_va() {
         "the scheduler did not restore the kernel's CR3 after the last task exited"
     );
     serial_println!("[selftest] isolation: kernel CR3 restored after every run ... ok");
+}
+
+/// The M10 fault-isolation proof: `crasher` (announces itself, then
+/// dereferences an unmapped address at CPL 3) runs beside `hello`. Before
+/// M10 that page fault panicked the whole kernel — this test existing at all
+/// is the milestone. Assertions, in order of what they prove:
+///
+/// 1. **The offender was terminated, by the right cause.** Its exit record
+///    carries fault vector 14 (#PF), not a voluntary exit — the unreachable
+///    `SYS_EXIT(0xBAD)` in crasher makes a non-faulting run loud.
+/// 2. **The neighbour was untouched**: hello completes at CPL 3 with its
+///    pristine data segment, exactly as in a fault-free run.
+/// 3. **The machine survived**: this function continuing to execute is the
+///    real assertion, and the CR3 read-back plus the kernel-table audit that
+///    follows in the battery close the run out like any other.
+///
+/// (Mutations observed: removing the handlers' ring-3 branch panics the
+/// kernel here; mis-reporting the vector fails assertion 1.)
+fn faulting_task_is_contained() {
+    let report = crate::usermode::run_crasher_and_hello()
+        .expect("an embedded ELF was refused for the fault-isolation run");
+    let crasher = &report.exits[0];
+    let hello = &report.exits[1];
+    assert_eq!(
+        crasher.fault,
+        Some(14),
+        "crasher was not terminated by a page fault (fault={:?}, code={:#x})",
+        crasher.fault,
+        crasher.code
+    );
+    assert_eq!(
+        hello.fault, None,
+        "the innocent neighbour was marked faulted"
+    );
+    assert_eq!(
+        hello.code & 3,
+        3,
+        "the surviving hello ran at CPL {} (expected ring 3)",
+        hello.code & 3
+    );
+    assert_eq!(
+        (hello.code >> 8) & 0xff,
+        u64::from(b'E'),
+        "the surviving hello read a non-pristine data segment"
+    );
+    use x86_64::registers::control::Cr3;
+    assert_eq!(
+        Cr3::read().0,
+        crate::memory::kernel_cr3(),
+        "the kernel's CR3 was not restored after a run ending in a fault kill"
+    );
+    serial_println!(
+        "[selftest] isolation: a page-faulting task was terminated alone — its neighbour \
+         and the kernel survived ... ok"
+    );
+
+    // The kill path's other branch, deterministically: the faulting task is
+    // the LAST alive, so the fault handler must restore the kernel's own
+    // RSP0 and CR3 and return into the launcher continuation. In the pair
+    // run above this branch is only reached by tick-phase luck.
+    let report = crate::usermode::run_crasher_alone()
+        .expect("the crasher ELF was refused for the solo fault run");
+    assert_eq!(
+        report.exits[0].fault,
+        Some(14),
+        "the solo crasher was not terminated by a page fault"
+    );
+    assert_eq!(
+        Cr3::read().0,
+        crate::memory::kernel_cr3(),
+        "the kernel's CR3 was not restored after a fault kill of the last task"
+    );
+    serial_println!(
+        "[selftest] isolation: a fault in the LAST task returns cleanly to the kernel ... ok"
+    );
 }
 
 /// Feeds the loader a crafted image whose single segment claims to be both

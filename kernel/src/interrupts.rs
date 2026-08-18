@@ -50,12 +50,25 @@ pub static BREAKPOINT_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static EXPECTING_DOUBLE_FAULT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Generates a named panicking handler for a fault that carries no error
-/// code. A named handler means a fault gets its correct diagnosis instead of
-/// re-faulting into a misleading #GP off a non-present gate.
+/// True iff the interrupted context was ring 3: the faulting program's CS
+/// selector carries its CPL in the low two bits. This is the M10 fork — a
+/// ring-3 fault is a scheduling event (terminate the task, keep the machine),
+/// a kernel fault is a kernel bug (panic, as ever).
+fn faulted_from_ring3(frame: &InterruptStackFrame) -> bool {
+    (frame.code_segment.0 & 3) == 3
+}
+
+/// Generates a named handler for a fault that carries no error code: a
+/// ring-3 fault kills the offending task (M10 — the machine and every other
+/// task keep running); a kernel-context fault panics with its correct
+/// diagnosis instead of re-faulting into a misleading #GP off a non-present
+/// gate.
 macro_rules! exception {
-    ($name:ident, $msg:literal) => {
+    ($name:ident, $vector:literal, $msg:literal) => {
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            if faulted_from_ring3(&frame) {
+                crate::sched::kill_current($vector);
+            }
             panic!(concat!($msg, "\n{:#?}"), frame);
         }
     };
@@ -63,8 +76,11 @@ macro_rules! exception {
 
 /// The same, for faults that push an error code.
 macro_rules! exception_ec {
-    ($name:ident, $msg:literal) => {
+    ($name:ident, $vector:literal, $msg:literal) => {
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
+            if faulted_from_ring3(&frame) {
+                crate::sched::kill_current($vector);
+            }
             panic!(
                 concat!($msg, " (error code {:#x})\n{:#?}"),
                 error_code, frame
@@ -73,20 +89,32 @@ macro_rules! exception_ec {
     };
 }
 
-exception!(divide_error_handler, "divide error (#DE)");
-exception!(debug_handler, "debug exception (#DB)");
-exception!(nmi_handler, "non-maskable interrupt (NMI)");
-exception!(overflow_handler, "overflow (#OF)");
-exception!(bound_range_handler, "bound range exceeded (#BR)");
-exception!(device_not_available_handler, "device not available (#NM)");
-exception!(x87_floating_point_handler, "x87 floating-point (#MF)");
-exception!(simd_floating_point_handler, "SIMD floating-point (#XM)");
-exception!(virtualization_handler, "virtualization (#VE)");
-exception_ec!(invalid_tss_handler, "invalid TSS (#TS)");
-exception_ec!(segment_not_present_handler, "segment not present (#NP)");
-exception_ec!(stack_segment_fault_handler, "stack-segment fault (#SS)");
-exception_ec!(alignment_check_handler, "alignment check (#AC)");
-exception_ec!(cp_protection_handler, "control-protection (#CP)");
+exception!(divide_error_handler, 0, "divide error (#DE)");
+exception!(debug_handler, 1, "debug exception (#DB)");
+exception!(overflow_handler, 4, "overflow (#OF)");
+exception!(bound_range_handler, 5, "bound range exceeded (#BR)");
+exception!(
+    device_not_available_handler,
+    7,
+    "device not available (#NM)"
+);
+exception!(x87_floating_point_handler, 16, "x87 floating-point (#MF)");
+exception!(simd_floating_point_handler, 19, "SIMD floating-point (#XM)");
+exception!(virtualization_handler, 20, "virtualization (#VE)");
+exception_ec!(invalid_tss_handler, 10, "invalid TSS (#TS)");
+exception_ec!(segment_not_present_handler, 11, "segment not present (#NP)");
+exception_ec!(stack_segment_fault_handler, 12, "stack-segment fault (#SS)");
+exception_ec!(alignment_check_handler, 17, "alignment check (#AC)");
+exception_ec!(cp_protection_handler, 21, "control-protection (#CP)");
+
+// NMI stays panic-only regardless of the interrupted CPL: it reports a
+// machine-level event (hardware error, watchdog), not a fault the current
+// task caused, so terminating whichever task happened to be running would
+// misattribute it. Machine check and double fault are excluded for the same
+// reason (and run on IST stacks).
+extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
+    panic!("non-maskable interrupt (NMI)\n{frame:#?}");
+}
 
 extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
     panic!("machine check (#MC) — hardware reported an unrecoverable error\n{frame:#?}");
@@ -216,6 +244,9 @@ extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    if faulted_from_ring3(&frame) {
+        crate::sched::kill_current(6);
+    }
     panic!("invalid opcode\n{frame:#?}");
 }
 
@@ -223,6 +254,9 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    if faulted_from_ring3(&frame) {
+        crate::sched::kill_current(13);
+    }
     panic!("general protection fault (error code {error_code:#x})\n{frame:#?}");
 }
 
@@ -230,6 +264,9 @@ extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    if faulted_from_ring3(&frame) {
+        crate::sched::kill_current(14);
+    }
     panic!(
         "page fault at {:?} ({error_code:?})\n{frame:#?}",
         Cr2::read()

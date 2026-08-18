@@ -83,6 +83,10 @@ struct Task {
     cr3: PhysFrame,
     ready: bool,
     exit_code: u64,
+    /// Set when the task was TERMINATED by the kernel for a ring-3 fault
+    /// (M10) rather than exiting voluntarily: the exception vector that
+    /// killed it. A faulted task's `exit_code` is 0.
+    fault: Option<u8>,
     /// Order of exit across the run: 0 for the first task to exit, 1 for the
     /// next. The battery's preemption proof is this field.
     exit_seq: u64,
@@ -160,6 +164,9 @@ pub struct TaskExit {
     pub code: u64,
     /// 0 = exited first, 1 = second, ...
     pub seq: u64,
+    /// `Some(vector)` if the kernel terminated the task for a ring-3 fault
+    /// (M10) instead of the task exiting voluntarily.
+    pub fault: Option<u8>,
 }
 
 /// The launcher-facing summary of a completed scheduler run.
@@ -214,6 +221,7 @@ pub fn install(specs: &[LaunchSpec]) -> u64 {
             cr3: spec.cr3,
             ready: true,
             exit_code: 0,
+            fault: None,
             exit_seq: 0,
         });
     }
@@ -253,6 +261,7 @@ pub fn collect() -> RunReport {
             .map(|t| TaskExit {
                 code: t.exit_code,
                 seq: t.exit_seq,
+                fault: t.fault,
             })
             .collect(),
         preemptive_switches: sched.preemptive_switches,
@@ -497,6 +506,116 @@ pub unsafe extern "C" fn enter_tasks(first_rsp: u64) {
         "pop rcx",
         "pop rax",
         "iretq",
+        cont = sym crate::usermode::KERNEL_CONTINUATION_RSP,
+    )
+}
+
+/// Terminates the CURRENT task in response to a ring-3 fault (M10) and never
+/// returns: the fault handlers call this instead of panicking when the
+/// faulting context was CPL 3, which is what turns "a user program crashed"
+/// from a machine-down event into a scheduling event. The dying task's
+/// registers need no saving — it will never resume — so a typed
+/// `x86-interrupt` handler can do this without a naked entry: mark the task
+/// dead, then either resume the next ready task's saved context or restore
+/// the launcher continuation, exactly as `sys_exit` does.
+///
+/// Must be called from an exception handler taken from ring 3 (IF is 0 —
+/// exception gates — which the SCHED lock discipline requires). Kernel-context
+/// faults must keep panicking: a kernel bug is not a schedulable event.
+pub fn kill_current(fault_vector: u8) -> ! {
+    // Scrub EFLAGS.AC before doing real work: an exception gate, like every
+    // gate, clears IF but NOT AC, and the faulting program may have held AC
+    // set (the M8 lesson). The typed handlers between the gate and here touch
+    // no user memory, so scrubbing at the top of the kill path is early
+    // enough.
+    // SAFETY: pushfq/and/popfq only clears a flag; IF is already 0 from the
+    // gate, so popfq cannot re-enable interrupts.
+    unsafe {
+        core::arch::asm!("pushfq", "and dword ptr [rsp], 0xFFFBFFFF", "popfq");
+    }
+    let mut sched = SCHED.lock();
+    assert!(
+        sched.active,
+        "a ring-3 fault arrived while no scheduler run was active"
+    );
+    let cur = sched.current;
+    sched.tasks[cur].ready = false;
+    sched.tasks[cur].exit_code = 0;
+    sched.tasks[cur].fault = Some(fault_vector);
+    sched.tasks[cur].exit_seq = sched.exit_counter;
+    sched.exit_counter += 1;
+    match sched.next_ready(cur) {
+        Some(next) => {
+            sched.current = next;
+            crate::gdt::set_privilege_stack(VirtAddr::new(sched.tasks[next].kstack_top()));
+            load_cr3(sched.tasks[next].cr3);
+            let rsp = sched.tasks[next].saved_rsp;
+            drop(sched); // release before leaving this context forever
+            // SAFETY: `rsp` is the next task's saved context (the one layout
+            // every save/restore path shares); RSP0 and CR3 already point at
+            // that task's world.
+            unsafe { resume_context(rsp) }
+        }
+        None => {
+            sched.active = false;
+            crate::gdt::set_privilege_stack(crate::gdt::default_privilege_stack_top());
+            load_cr3(crate::memory::kernel_cr3());
+            drop(sched);
+            // SAFETY: the continuation was saved by `enter_tasks` before any
+            // ring-3 instruction could execute, and the kernel's own RSP0 and
+            // CR3 are restored above.
+            unsafe { return_to_launcher() }
+        }
+    }
+}
+
+/// Abandons the current (dying) context and resumes a saved one: the shared
+/// 15-pop + `iretq` restore tail, callable from Rust for the kill path.
+///
+/// # Safety
+/// `rsp` must be a saved context in the canonical layout, with RSP0 and CR3
+/// already pointing at its task.
+#[unsafe(naked)]
+unsafe extern "C" fn resume_context(rsp: u64) -> ! {
+    core::arch::naked_asm!(
+        "mov rsp, rdi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+    )
+}
+
+/// Abandons the current (dying) context and returns into `run_programs`: the
+/// launcher-continuation restore, callable from Rust for the kill path when
+/// the faulting task was the last one alive.
+///
+/// # Safety
+/// `KERNEL_CONTINUATION_RSP` must hold the continuation `enter_tasks` saved,
+/// and the kernel's default RSP0 and own CR3 must already be restored.
+#[unsafe(naked)]
+unsafe extern "C" fn return_to_launcher() -> ! {
+    core::arch::naked_asm!(
+        "mov rsp, [rip + {cont}]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "ret",
         cont = sym crate::usermode::KERNEL_CONTINUATION_RSP,
     )
 }

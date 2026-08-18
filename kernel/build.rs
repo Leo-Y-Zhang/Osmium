@@ -12,6 +12,7 @@ use std::process::Command;
 fn main() {
     build_user_program("hello", "link.ld", "HELLO_ELF");
     build_user_program("counter", "link.ld", "COUNTER_ELF");
+    build_user_program("crasher", "link.ld", "CRASHER_ELF");
     // The same counter source at a second base (see link_alt.ld): the battery
     // schedules two unyielding programs against each other, and linking one
     // source twice is how it gets two of them. Built unconditionally (a few

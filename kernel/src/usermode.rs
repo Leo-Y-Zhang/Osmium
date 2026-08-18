@@ -79,6 +79,10 @@ pub const MAX_TASKS: usize = 2;
 /// same-VA isolation.
 static HELLO_ELF: &[u8] = include_bytes!(env!("HELLO_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("COUNTER_ELF"));
+/// The fault-isolation demo program (M10): announces itself, then page-faults
+/// at CPL 3. Linked at hello's base — legal since M9, and running the pair at
+/// identical addresses exercises address-space isolation in the same breath.
+static CRASHER_ELF: &[u8] = include_bytes!(env!("CRASHER_ELF"));
 #[cfg(feature = "selftest")]
 static COUNTER_ALT_ELF: &[u8] = include_bytes!(env!("COUNTER_ALT_ELF"));
 
@@ -121,6 +125,24 @@ pub fn run_hello_twice() -> Result<RunReport, ElfError> {
 #[cfg(feature = "selftest")]
 pub fn run_two_counters() -> Result<RunReport, ElfError> {
     run_programs(&[COUNTER_ELF, COUNTER_ALT_ELF])
+}
+
+/// The M10 fault-isolation demonstration, shared by the `crash` shell command
+/// and the battery: `crasher` (announces itself, then page-faults at CPL 3)
+/// launched first, `hello` second. The kernel must terminate the crasher and
+/// nothing else — hello completes normally and the machine keeps running.
+pub fn run_crasher_and_hello() -> Result<RunReport, ElfError> {
+    run_programs(&[CRASHER_ELF, HELLO_ELF])
+}
+
+/// The crasher alone: deterministically exercises the kill path's other
+/// branch — the faulting task is the LAST one alive, so the kernel must
+/// restore its own world and return to the launcher from inside a fault
+/// handler. (In the pair run that branch is only reached if a timer tick
+/// happens to let hello exit first.)
+#[cfg(feature = "selftest")]
+pub fn run_crasher_alone() -> Result<RunReport, ElfError> {
+    run_programs(&[CRASHER_ELF])
 }
 
 /// Parses, maps into per-task address spaces, schedules and tears down up to

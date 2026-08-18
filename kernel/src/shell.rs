@@ -287,6 +287,7 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "privacy" => privacy(),
         "user" => user_command(),
         "sched" => sched_command(),
+        "crash" => crash_command(),
         "keymap" => keymap(args, layout_name, decoder),
         // Fixed message on purpose: the argument would be typed input, and
         // panics are reported on the serial port — which typed input must
@@ -475,6 +476,40 @@ fn sched_command() {
             );
         }
         Err(e) => println_con(&format!("sched: an embedded ELF was refused: {e:?}")),
+    }
+}
+
+/// The fault-isolation demonstration (M10): `crasher` announces itself with a
+/// `!` and dereferences an unmapped address; the kernel terminates it — and
+/// only it. `hello` runs to completion beside it, and the prompt this report
+/// returns to is itself the proof the machine survived.
+fn crash_command() {
+    match crate::usermode::run_crasher_and_hello() {
+        Ok(report) => {
+            println_con("");
+            let crasher = &report.exits[0];
+            let hello = &report.exits[1];
+            match crasher.fault {
+                Some(vector) => field(
+                    "crasher: ",
+                    &format!("terminated by the kernel (fault vector {vector}); nothing else was"),
+                ),
+                None => field(
+                    "crasher: ",
+                    &format!("exited {:#x} without faulting (unexpected)", crasher.code),
+                ),
+            }
+            field(
+                "hello:   ",
+                &format!(
+                    "unharmed - exited with CS={:#x} (CPL {})",
+                    hello.code & 0xff,
+                    hello.code & 3
+                ),
+            );
+            field("kernel:  ", "still running - you are typing at it");
+        }
+        Err(e) => println_con(&format!("crash: an embedded ELF was refused: {e:?}")),
     }
 }
 
