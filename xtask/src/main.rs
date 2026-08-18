@@ -238,6 +238,9 @@ fn build_kernel(selftest: bool) -> Result<PathBuf> {
         "--target",
         "x86_64-unknown-none",
         "--release",
+        // Build from the committed Cargo.lock; a CI kernel build must never
+        // silently re-resolve a dependency to a newer version than was tested.
+        "--locked",
     ]);
     if selftest {
         cmd.args(["--features", "selftest"]);

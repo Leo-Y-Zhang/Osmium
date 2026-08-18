@@ -19,6 +19,19 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      # Gate the tag on the SAME proofs main is gated on, before publishing:
+      # the selftest battery on both firmwares and the keystroke-privacy run.
+      # Without these a tag could publish an image that boots to a shell but
+      # fails the battery or leaks keystrokes.
+      - name: Self-test battery (BIOS)
+        shell: bash
+        run: cargo xtask test --bios | tee battery-bios.log
+      - name: Self-test battery (UEFI)
+        shell: bash
+        run: cargo xtask test --uefi | tee battery-uefi.log
+      - name: Keystroke-privacy proof
+        shell: bash
+        run: cargo xtask privacy | tee serial-privacy.log
       - name: Build shipped images
         run: cargo xtask build
       - name: Boot-prove the exact BIOS image
@@ -29,6 +42,9 @@ jobs:
         run: cargo xtask test --shipped --uefi --image=target/img/osmium-uefi.img | tee serial-uefi.log
       - name: Checksums
         working-directory: target/img
+        # shell: bash for pipefail — a sha256sum failure must not be masked by
+        # tee's exit status (the repo's own tee-without-pipefail lesson).
+        shell: bash
         run: sha256sum osmium-bios.img osmium-uefi.img | tee SHA256SUMS
       - name: Publish release
         env:
