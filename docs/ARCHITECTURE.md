@@ -87,9 +87,13 @@ that the handler is forbidden to touch.
 
 The `Console` renders each keystroke to the framebuffer through `render_input`,
 which also draws the caret. No function on this path writes to serial; CI's
-`input-path-has-no-serial` gate greps `shell.rs` and `task/keyboard.rs` to keep
-it that way, and `cargo xtask privacy` proves it at runtime by typing a sentinel
-and asserting the serial log never contains it.
+`input-path-has-no-serial` gate greps every file that handles keystroke-derived
+bytes — `shell.rs`, `task/keyboard.rs`, `usermode.rs`, `sched.rs` and, since
+M12, `fs.rs`, which now stores typed text — to keep it that way. `cargo xtask
+privacy` proves it at runtime, and in its stronger current form: rather than
+searching the serial log for the sentinel it typed, it requires the log to be
+**empty** after boot, so a leak of any shape fails it (a per-scancode hex dump
+defeated the older sentinel-blocklist version, which is why it was replaced).
 
 ## The ring-3 round trip
 
@@ -227,13 +231,21 @@ There is one, it is flat, and it never touches a disk.
 **All of the logic is in `kshared::ramfs`, none of it in the kernel.** That is
 the point rather than a tidiness preference: `kshared` may not allocate and may
 not touch hardware, so the filesystem is a fixed table of up to 8 entries over
-a fixed 8 KiB byte arena, which makes every rule it enforces decidable from its
-own state — and therefore host-testable. Eleven tests cover creation, every
-refusal, both arena boundaries, compaction and the delete scrub, and each was
-observed failing under its own mutation on a laptop rather than inferred from a
-boot log. The kernel's `fs` module owns exactly one static instance behind a
-mutex that no interrupt handler ever touches, and the shell's `ls`/`write`/
-`cat`/`rm` are thin wrappers that turn an `FsError` into a sentence.
+a fixed 1 KiB byte arena, which makes every rule it enforces decidable from its
+own state — and therefore host-testable. Seventeen tests cover creation, every
+refusal, both arena boundaries from both an empty and a partly-used arena,
+compaction (including around zero-length files, whose shared `start` is the one
+case the fix-up boundary could get wrong), the delete scrub, the scrub oracle's
+own ability to report dirt, the error-message mapping and the shell's argument
+splitting. Every one has been watched failing under a mutation on a laptop
+rather than inferred from a boot log — though the pairing is many-to-many, not
+one mutation per test: three separate mutations kill the compaction test, and
+`create_read_roundtrip` needed a mutation of its own (contents never copied
+into the arena) because the original set left it green. The capacities are
+also chosen so every refusal is reachable from the shipped shell, not only
+from a host test. The kernel's `fs` module owns exactly one static instance
+behind a mutex that no interrupt handler ever touches, and the shell's
+`ls`/`write`/`cat`/`rm` are thin wrappers over it.
 
 **Refusal-first, in the ELF loader's shape.** A name that is empty, longer than
 32 bytes, or not printable ASCII is refused; so is one containing a space or a
@@ -257,6 +269,14 @@ the very boot CI sha256s the disk image around. The keystroke gate went further
 still: `cargo xtask privacy` now types the sentinel **into a file** and prints
 it back with `cat`, so the whole filesystem path — the typed command, the
 stored bytes and the rendered output — has to leave the serial port silent.
+
+One limit of that gate, stated rather than glossed: it proves **silence**, not
+that the filesystem did anything. Its positive control is the clean shutdown,
+which shows the keystrokes were decoded and executed; if a `write` were refused,
+`cat` would print an error, serial would still be empty, and the gate would pass
+without the stored-bytes path ever being exercised. What proves the filesystem
+actually works is the boot battery and the seventeen host tests. The two are
+complementary and neither is asked to carry the other's claim.
 
 ## Where to read next
 

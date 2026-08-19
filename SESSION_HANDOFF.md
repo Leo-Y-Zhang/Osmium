@@ -1,8 +1,24 @@
 # Session handoff
 
-**State: v0.3.0 — M6 (ring 3) + M7 (ELF loader) + M8 (preemptive
-multitasking) + M9 (per-task address spaces), hardened.** M8 and M9 both
-landed 2026-08-18. Nothing is in flight and nothing is owed.
+**State: v0.6.0 — M6 (ring 3) + M7 (ELF loader) + M8 (preemptive
+multitasking) + M9 (per-task address spaces) + M10 (fault isolation) +
+M11 (frame reclamation) + M12 (a RAM-only filesystem), hardened.** M8-M11
+landed 2026-08-18, M12 on 2026-08-19. Nothing is in flight and nothing is
+owed.
+
+- **M10:** every fault handler forks on the faulting CPL — ring 3 goes to
+  `sched::kill_current`, which terminates that task alone and resumes the
+  next (or returns to the launcher); CPL 0 still panics, and NMI/#MC/#DF
+  panic at any CPL. The `crash` command demonstrates it.
+- **M11:** frames are reclaimed. The allocator has a free list, scrubbing
+  both at free time and again at hand-out, and each `AddressSpace` records
+  every frame it pulls and returns exactly that set on drop.
+- **M12:** `kshared::ramfs` — a flat, allocator-free namespace over a fixed
+  arena; `ls`/`write`/`cat`/`rm`. Deleting scrubs and compacts. The privacy
+  gates were extended over it rather than around it.
+- ⚠ **Toolchain:** the pin must stay on an LLVM-**22** nightly
+  (`nightly-2026-08-05`). LLVM 23 raises a `wcslen` libcall the UEFI
+  bootloader cannot link, which breaks CI as well as local builds.
 
 - All milestones are merged, pushed and CI-green on `main`. The four
   engineering documents in `docs/` are reconciled to the shipped code; treat

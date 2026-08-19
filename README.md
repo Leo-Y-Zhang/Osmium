@@ -154,8 +154,9 @@ Three layers, all run by CI on every push:
 - **Shipped-image boot** (`cargo xtask test --shipped`): the exact image a user
   would boot must reach the shell.
 - **Host tests** (`cargo test -p kshared`): the line editor, command parser,
-  frame-range arithmetic and the ELF parser are pure logic and are tested
-  natively.
+  frame-range arithmetic, the ELF parser and the filesystem are pure logic and
+  are tested natively — the filesystem lives there precisely so its rules can
+  be watched failing on a laptop instead of inferred from a boot log.
 
 Every battery test has been observed failing at least once via deliberate
 mutation — delete the heap scrub, delete the frame scrub, break the waker,

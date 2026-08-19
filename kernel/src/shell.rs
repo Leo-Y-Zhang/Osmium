@@ -529,22 +529,6 @@ fn crash_command() {
     }
 }
 
-/// Renders a [`kshared::ramfs::FsError`] as a sentence that names the rule
-/// that refused, so a refusal is a diagnosis rather than a shrug — the same
-/// contract the ELF loader's errors keep.
-fn fs_error(e: kshared::ramfs::FsError) -> &'static str {
-    use kshared::ramfs::FsError::*;
-    match e {
-        NameEmpty => "a file name is required",
-        NameTooLong => "that name is too long",
-        NameNotAllowed => "names must be printable ASCII with no spaces and no path separators",
-        DuplicateName => "a file of that name already exists (delete it first)",
-        TableFull => "no free file slots",
-        ArenaFull => "not enough space left in the filesystem",
-        NotFound => "no such file",
-    }
-}
-
 /// `ls` — every file in RAM, with the space it occupies. The footer states
 /// where the bytes live, because "filesystem" invites the assumption of a
 /// disk and there isn't one.
@@ -556,7 +540,13 @@ fn ls() {
         } else {
             for name in fs.names() {
                 let len = fs.len_of(name).unwrap_or(0);
-                field(name, &format!("{len} bytes"));
+                // `field` writes label and value back to back, so every call
+                // site bakes its own separator into the label. A bare name
+                // would print `notes.txt5 bytes`, leaving only the colour
+                // change to mark the boundary — and colour is never the only
+                // cue here. The two trailing spaces survive a name longer
+                // than the column.
+                field(&format!("{name:<16}  "), &format!("{len} bytes"));
             }
         }
         field(
@@ -570,13 +560,13 @@ fn ls() {
 /// to overwrite: a name that exists must be deleted first, so a typo cannot
 /// silently destroy a file.
 fn write_file(args: &str) {
-    let (name, text) = match args.split_once(char::is_whitespace) {
-        Some((name, rest)) => (name, rest.trim_start()),
-        None => (args, ""),
-    };
+    // The split lives in kshared so its edge cases — no arguments, a name
+    // with no text, runs of spaces — are decided by host tests rather than
+    // discovered on screen.
+    let (name, text) = kshared::ramfs::split_write_args(args);
     match crate::fs::with_fs(|fs| fs.create(name, text.as_bytes())) {
         Ok(()) => field("written: ", &format!("{name} ({} bytes)", text.len())),
-        Err(e) => error(fs_error(e)),
+        Err(e) => error(e.message()),
     }
 }
 
@@ -592,7 +582,7 @@ fn cat(args: &str) {
             // future writer of arbitrary bytes cannot make `cat` panic.
             Err(_) => error("that file is not valid UTF-8"),
         },
-        Err(e) => error(fs_error(e)),
+        Err(e) => error(e.message()),
     });
 }
 
@@ -602,7 +592,7 @@ fn rm(args: &str) {
     let name = args.trim();
     match crate::fs::with_fs(|fs| fs.delete(name)) {
         Ok(()) => field("deleted: ", &format!("{name} (its bytes were scrubbed)")),
-        Err(e) => error(fs_error(e)),
+        Err(e) => error(e.message()),
     }
 }
 

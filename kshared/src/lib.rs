@@ -1,6 +1,9 @@
 //! Pure logic shared by the kernel and testable on the host: address
-//! arithmetic, and (in later milestones) command parsing and the line editor.
-//! Nothing in this crate may touch hardware or require an allocator.
+//! arithmetic, the line editor, the command table, the ELF parser and the
+//! RAM-only filesystem. Nothing in this crate may touch hardware or require
+//! an allocator — which is what keeps every rule in it decidable from its own
+//! state, and therefore observable failing on a laptop rather than inferred
+//! from a boot log.
 
 #![cfg_attr(not(test), no_std)]
 

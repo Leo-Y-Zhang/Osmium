@@ -204,9 +204,13 @@ The three privacy claims, stated as properties of the build rather than settings
    dependency graph, so the claim covers code written here and crates pulled in
    transitively. Osmium cannot phone
    home for the same reason a hammer cannot: it has no mechanism.
-2. **No persistence.** There is no filesystem and no storage driver, so the kernel
-   cannot write to the medium it booted from. Osmium is a live system: a cold boot
-   is a clean slate, every time, with no state to clear because none was kept.
+2. **No persistence.** There is no storage driver, so the kernel cannot write to
+   the medium it booted from. The filesystem added in M12 does not weaken this
+   and is not an exception to it: it exists only in RAM, has no path to a disk,
+   and every CI boot sha256s the disk image before and after a run that
+   deliberately creates, reads and deletes files. Osmium is a live system: a cold
+   boot is a clean slate, every time, with no state to clear because none was
+   kept.
 3. **Freed memory is zeroed.** Every heap block is overwritten before it is returned
    to the allocator, and every physical frame is zeroed before it is first handed
    out. Data that has been freed cannot be observed by the next allocation. This is

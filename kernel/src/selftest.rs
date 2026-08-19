@@ -755,17 +755,17 @@ fn faulting_task_is_contained() {
     );
 }
 
-/// Feeds the loader a crafted image whose single segment claims to be both
-/// writable and executable; the parse must refuse it. Asserts on the PURE
-/// `parse_elf64`, not `run_elf` — a refusal gate whose failure mode is
-/// "map the hostile bytes and iretq to ring 3" is the wrong shape (that is
-/// exactly what happened when the guard was mutated out during verification).
 /// The M12 filesystem, from the kernel's side. `kshared::ramfs`'s own rules
 /// are host-tested (creation, refusals, compaction, the delete scrub); what
 /// only a boot can show is the part above them:
 ///
-/// 1. **A cold boot starts with no files.** The observable form of "nothing
-///    persists" — there is no disk to load from and nothing seeds the arena.
+/// 1. **Nothing seeds the arena** — precisely that, and not more. A single
+///    boot cannot observe a previous one, so this is only half of the
+///    no-persistence claim. The other half is the image-hash gate: the files
+///    created below are written during the very boot CI sha256s the disk
+///    image around, so they are proven never to have reached it. Empty at
+///    boot AND nothing written to disk is what makes a cold boot a clean
+///    slate; neither check claims it alone.
 /// 2. **There is exactly ONE filesystem, and the shell shares it.** A file
 ///    created here is readable through the same accessor the shell uses; a
 ///    `with_fs` that handed out a fresh instance per call would fail here
@@ -777,11 +777,19 @@ fn faulting_task_is_contained() {
 /// the existing no-persistence gate: CI sha256s the disk image before and
 /// after the run, so these writes prove themselves to have stayed in RAM.
 fn ramfs_starts_empty_and_round_trips() {
-    let (count, used, _) = crate::fs::with_fs(|fs| fs.stats());
+    let (count, used, arena_clean) =
+        crate::fs::with_fs(|fs| (fs.stats().0, fs.stats().1, fs.tail_is_clean()));
     assert_eq!(
         (count, used),
         (0, 0),
-        "the filesystem was not empty at boot — something persisted or seeded it"
+        "the filesystem was not empty at boot — something in the kernel wrote \
+         to it before the battery ran"
+    );
+    // The table being empty says nothing about the arena behind it, and the
+    // check is free: at boot every byte of it must be zero.
+    assert!(
+        arena_clean,
+        "the file table was empty at boot but the arena was not blank"
     );
     crate::fs::with_fs(|fs| {
         fs.create("selftest.txt", b"osmium-ramfs-sentinel")
@@ -812,6 +820,11 @@ fn ramfs_starts_empty_and_round_trips() {
     );
 }
 
+/// Feeds the loader a crafted image whose single segment claims to be both
+/// writable and executable; the parse must refuse it. Asserts on the PURE
+/// `parse_elf64`, not `run_elf` — a refusal gate whose failure mode is
+/// "map the hostile bytes and iretq to ring 3" is the wrong shape (that is
+/// exactly what happened when the guard was mutated out during verification).
 fn elf_loader_refuses_wx() {
     use kshared::elf::{ElfError, USER_IMAGE_BASE};
     let mut img = alloc::vec![0u8; 64 + 56 + 16];

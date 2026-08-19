@@ -113,7 +113,11 @@ jobs:
           # sched.rs joined at M8 for the same reason: the timer entry and
           # SYS_EXIT path run while user programs execute, so they must never
           # grow a serial or log call either.
-          files="kernel/src/shell.rs kernel/src/task/keyboard.rs kernel/src/usermode.rs kernel/src/sched.rs"
+          # fs.rs joined at M12: typed text is now STORED, so the filesystem
+          # accessor handles keystroke-derived bytes and sits squarely on the
+          # input path — a debug print there would leak exactly what this
+          # allowlist exists to prevent.
+          files="kernel/src/shell.rs kernel/src/task/keyboard.rs kernel/src/usermode.rs kernel/src/sched.rs kernel/src/fs.rs"
           for p in $files; do
             test -e "$p" || { echo "gate path missing: $p" >&2; exit 1; }
           done
