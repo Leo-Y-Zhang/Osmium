@@ -24,11 +24,13 @@ than a policy:
   absent, not disabled. Enforced by CI's `no-network-no-storage` gate, which
   greps the kernel sources, manifests and the resolved dependency graph on
   every push, so neither hand-written code nor a transitive crate can creep in.
-- **No persistence.** RAM-only live system: no disk writes, no filesystem; a
-  cold boot is a clean slate. The same CI gate covers storage drivers, and
-  every CI boot sha256s the disk image before and after the run and fails if a
-  byte changed — the no-persistence claim is checked behaviourally, not just
-  by the absence of a driver.
+- **No persistence.** RAM-only live system: no disk writes, and the filesystem
+  (M12) exists only in memory, so a cold boot is a clean slate. The same CI
+  gate covers storage drivers, and every CI boot sha256s the disk image before
+  and after the run and fails if a byte changed — with the battery now
+  *creating, reading and deleting files* during that boot, so the claim is
+  checked behaviourally against the filesystem itself rather than just by the
+  absence of a driver.
 - **Freed memory is zeroed.** Heap blocks are scrubbed before they re-enter the
   free list, and physical frames are scrubbed both as they are handed out and
   the moment they are reclaimed (M11) — verified by boot-time sentinel
@@ -38,8 +40,9 @@ than a policy:
   never reaches the serial port. This one holds by construction — the input
   path contains no serial writes, and the `panic` command's message is fixed in
   the source precisely so typed text has no route there. A CI job boots the
-  shipped image, types a sentinel through the QEMU monitor, and fails if the
-  serial port emits anything at all after boot.
+  shipped image, types a sentinel through the QEMU monitor — including *into a
+  file*, which it then prints back with `cat` — and fails if the serial port
+  emits anything at all after boot.
 
 The kernel also drops user code to ring 3 under the CPU-advertised SMEP, SMAP
 and UMIP protections, so a supervisor bug cannot execute or blindly read a user
@@ -107,8 +110,14 @@ page. The `privacy` command reports all of this live.
   write to the second — and did, when the CR3 switch was deliberately
   deleted). The kernel's own page table never carries a user-accessible entry
   at all, which the page-table audit now asserts in its strongest form
+- **A RAM-only filesystem**: a flat namespace of small files in a fixed arena,
+  with no allocator and no disk — `write`, `ls`, `cat`, `rm`. Refusal-first
+  like the ELF loader (bad names, duplicates, a full table or arena are each a
+  named error), and deleting scrubs the file's bytes and compacts the arena, so
+  freed space is reusable and deleted content does not linger
 - The shell: `help`, `echo`, `clear`, `mem`, `uptime`, `sysinfo`, `privacy`,
-  `keymap` (us/uk), `user`, `sched`, `crash`, `selftest`, `panic`, `shutdown` —
+  `keymap` (us/uk), `ls`, `write`, `cat`, `rm`, `user`, `sched`, `crash`,
+  `selftest`, `panic`, `shutdown` —
   with an insertion cursor, arrow keys, Home/End, Ctrl-U/L/C, and history
 - Panic screens that report the failure on both the console and the serial
   port; never a silent hang
@@ -136,7 +145,9 @@ Three layers, all run by CI on every push:
   to the launcher), the frame-reclamation proof (in-use frames land exactly
   back on the pre-run baseline, warm runs are served entirely from the free
   list, and both scrubs — at free time and again at hand-out — are proven
-  separately, each observed failing on its own), per-page W^X flag
+  separately, each observed failing on its own), the filesystem round trip
+  (empty at boot, one shared instance, a file created, read back and deleted
+  with its bytes scrubbed), per-page W^X flag
   plumbing,
   and stack-overflow-to-double-fault — on BIOS *and* UEFI at the pinned
   minimal RAM sizes.
@@ -204,9 +215,11 @@ kernel-context fault still panics, because a kernel bug is not a schedulable
 event (try it: the `crash` shell command page-faults a program next to a
 healthy one); frame reclamation landed as M11 — a run's frames all come back,
 scrubbed, so repeated runs no longer creep towards RAM exhaustion (try it:
-`user`, then `mem`, twice — in-use holds still while reclaimed grows). Still
-ahead: a RAM-disk filesystem, APIC/HPET, and SMP. Networking is on no
-roadmap; if it ever lands, it ships off by default.
+`user`, then `mem`, twice — in-use holds still while reclaimed grows); a
+RAM-only filesystem landed as M12 (`write`, `ls`, `cat`, `rm` — flat,
+refusal-first, and deleting scrubs the bytes and compacts the arena). Still
+ahead: APIC/HPET and SMP. Networking is on no roadmap; if it ever lands, it
+ships off by default.
 
 ## Try it without building
 

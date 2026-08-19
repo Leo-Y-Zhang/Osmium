@@ -220,6 +220,44 @@ bit-exact, a program that holds `EFLAGS.AC` set for its whole run never
 gets it past the entry scrub, and two instances of one image at one virtual
 address each see only their own memory.
 
+## The filesystem (M12)
+
+There is one, it is flat, and it never touches a disk.
+
+**All of the logic is in `kshared::ramfs`, none of it in the kernel.** That is
+the point rather than a tidiness preference: `kshared` may not allocate and may
+not touch hardware, so the filesystem is a fixed table of up to 8 entries over
+a fixed 8 KiB byte arena, which makes every rule it enforces decidable from its
+own state — and therefore host-testable. Eleven tests cover creation, every
+refusal, both arena boundaries, compaction and the delete scrub, and each was
+observed failing under its own mutation on a laptop rather than inferred from a
+boot log. The kernel's `fs` module owns exactly one static instance behind a
+mutex that no interrupt handler ever touches, and the shell's `ls`/`write`/
+`cat`/`rm` are thin wrappers that turn an `FsError` into a sentence.
+
+**Refusal-first, in the ELF loader's shape.** A name that is empty, longer than
+32 bytes, or not printable ASCII is refused; so is one containing a space or a
+path separator, which is what makes "there is no path traversal here" a refusal
+rather than a promise — the namespace is flat by construction and no parser is
+involved. Writes never replace: a duplicate name is `DuplicateName`, so a typo
+cannot silently destroy a file. A full table and a full arena are separate
+diagnoses.
+
+**Deleting scrubs and compacts.** The file's bytes are removed, every later
+file slides down over the hole, and the tail the survivors vacated is zeroed —
+so no deleted content and no stale copy left by the slide survives anywhere in
+the arena. Compaction is not a performance choice: an arena that only bumped
+forwards would leak capacity exactly the way the frame allocator leaked frames
+before M11, and the same standard applies.
+
+**What this does to the privacy claims: it strengthens them.** Files exist only
+in RAM, so the no-persistence gate already covers them — and now covers them
+*behaviourally*, because the battery creates, reads and deletes files during
+the very boot CI sha256s the disk image around. The keystroke gate went further
+still: `cargo xtask privacy` now types the sentinel **into a file** and prints
+it back with `cat`, so the whole filesystem path — the typed command, the
+stored bytes and the rendered output — has to leave the serial port silent.
+
 ## Where to read next
 
 - The full memory map, global-state table and unsafe-block inventory are in

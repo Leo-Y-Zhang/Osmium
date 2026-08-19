@@ -121,8 +121,20 @@ appear in a v1 pull request.
   loader in `kshared` that refuses W+X segments, out-of-window addresses and
   malformed images; segments are mapped with per-segment W^X permissions. The
   shell is still compiled into the kernel.
-- **Filesystems: no ramfs, no FAT32.** The bootloader's ramdisk facility is not
-  used. Nothing is mounted.
+- ~~**Filesystems: no ramfs, no FAT32.**~~ **A ramfs was delivered as M12
+  (2026-08-19); FAT32 and mounting remain out.** `kshared::ramfs` is a flat,
+  allocator-free namespace of small files in a fixed arena: refusal-first
+  (empty, over-long, non-printable or path-separator names, duplicates, a
+  full table, a full arena — each a named error), and deleting a file scrubs
+  its bytes and compacts the arena, so freed space is genuinely reusable
+  rather than lost to a bump cursor. All of it is host-tested, every test
+  observed failing under its own mutation. **The privacy claims tightened
+  rather than loosened**: files exist only in RAM, so the no-persistence gate
+  (CI sha256s the disk image around every boot, and the battery now creates
+  files during that boot) covers them, and the keystroke-privacy gate types
+  a sentinel *into a file* and prints it back, so serial must stay silent
+  through the whole filesystem path. The bootloader's ramdisk facility is
+  still not used and nothing is mounted.
 - ~~**Preemptive scheduling.**~~ **Delivered as M8 (2026-08-18) — for ring-3
   tasks.** The PIT tick now drives a round-robin context switch between user
   programs, each with its own kernel stack (TSS RSP0 is retargeted per switch):

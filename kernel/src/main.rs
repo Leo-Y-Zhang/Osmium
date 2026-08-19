@@ -13,6 +13,7 @@ extern crate alloc;
 mod console;
 mod cpu;
 mod framebuffer;
+mod fs;
 mod gdt;
 mod interrupts;
 mod logger;

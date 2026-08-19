@@ -21,6 +21,7 @@ pub fn run() -> ! {
     heap_refuses_oversized_allocation();
     async_task_with_waker_runs();
     shell_processes_a_scripted_session();
+    ramfs_starts_empty_and_round_trips();
     elf_loader_refuses_wx();
     user_program_runs_in_ring3();
     preemptive_scheduling_is_real();
@@ -759,6 +760,58 @@ fn faulting_task_is_contained() {
 /// `parse_elf64`, not `run_elf` — a refusal gate whose failure mode is
 /// "map the hostile bytes and iretq to ring 3" is the wrong shape (that is
 /// exactly what happened when the guard was mutated out during verification).
+/// The M12 filesystem, from the kernel's side. `kshared::ramfs`'s own rules
+/// are host-tested (creation, refusals, compaction, the delete scrub); what
+/// only a boot can show is the part above them:
+///
+/// 1. **A cold boot starts with no files.** The observable form of "nothing
+///    persists" — there is no disk to load from and nothing seeds the arena.
+/// 2. **There is exactly ONE filesystem, and the shell shares it.** A file
+///    created here is readable through the same accessor the shell uses; a
+///    `with_fs` that handed out a fresh instance per call would fail here
+///    while every host test still passed.
+/// 3. **Deleting scrubs**, checked through the kernel instance rather than a
+///    test fixture.
+///
+/// Creating files during this boot is also what puts the filesystem under
+/// the existing no-persistence gate: CI sha256s the disk image before and
+/// after the run, so these writes prove themselves to have stayed in RAM.
+fn ramfs_starts_empty_and_round_trips() {
+    let (count, used, _) = crate::fs::with_fs(|fs| fs.stats());
+    assert_eq!(
+        (count, used),
+        (0, 0),
+        "the filesystem was not empty at boot — something persisted or seeded it"
+    );
+    crate::fs::with_fs(|fs| {
+        fs.create("selftest.txt", b"osmium-ramfs-sentinel")
+            .expect("creating a file in an empty filesystem was refused");
+    });
+    // A SEPARATE accessor call: this is what proves the instance is shared
+    // and static rather than conjured per call.
+    let read_back = crate::fs::with_fs(|fs| {
+        let bytes = fs
+            .read("selftest.txt")
+            .expect("the file just created was not found");
+        bytes == b"osmium-ramfs-sentinel"
+    });
+    assert!(
+        read_back,
+        "the file read back different bytes than were written"
+    );
+    crate::fs::with_fs(|fs| {
+        fs.delete("selftest.txt").expect("deleting the file failed");
+        assert!(
+            fs.tail_is_clean(),
+            "a deleted file's bytes survived in the kernel's arena"
+        );
+        assert_eq!(fs.stats().0, 0, "the file table did not shrink on delete");
+    });
+    serial_println!(
+        "[selftest] fs: empty at boot, one shared instance, round-tripped and scrubbed ... ok"
+    );
+}
+
 fn elf_loader_refuses_wx() {
     use kshared::elf::{ElfError, USER_IMAGE_BASE};
     let mut img = alloc::vec![0u8; 64 + 56 + 16];

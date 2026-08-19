@@ -5,6 +5,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod elf;
+pub mod ramfs;
 
 /// Aligns `addr` upwards to `align`, which must be a power of two.
 pub const fn align_up(addr: u64, align: u64) -> u64 {
@@ -242,6 +243,22 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "keymap",
         help: "  keymap [us|uk] show or switch keyboard layout",
+    },
+    Command {
+        name: "ls",
+        help: "  ls            list files in RAM (nothing is ever on disk)",
+    },
+    Command {
+        name: "write",
+        help: "  write <name> <text>  create a file from the rest of the line",
+    },
+    Command {
+        name: "cat",
+        help: "  cat <name>    print a file",
+    },
+    Command {
+        name: "rm",
+        help: "  rm <name>     delete a file; its bytes are scrubbed",
     },
     Command {
         name: "user",

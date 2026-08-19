@@ -285,6 +285,10 @@ fn execute(line: &str, layout_name: &mut &'static str, decoder: &mut EventDecode
         "uptime" => uptime(),
         "sysinfo" => sysinfo(layout_name),
         "privacy" => privacy(),
+        "ls" => ls(),
+        "write" => write_file(args),
+        "cat" => cat(args),
+        "rm" => rm(args),
         "user" => user_command(),
         "sched" => sched_command(),
         "crash" => crash_command(),
@@ -522,6 +526,83 @@ fn crash_command() {
             field("kernel:  ", "still running - you are typing at it");
         }
         Err(e) => println_con(&format!("crash: an embedded ELF was refused: {e:?}")),
+    }
+}
+
+/// Renders a [`kshared::ramfs::FsError`] as a sentence that names the rule
+/// that refused, so a refusal is a diagnosis rather than a shrug — the same
+/// contract the ELF loader's errors keep.
+fn fs_error(e: kshared::ramfs::FsError) -> &'static str {
+    use kshared::ramfs::FsError::*;
+    match e {
+        NameEmpty => "a file name is required",
+        NameTooLong => "that name is too long",
+        NameNotAllowed => "names must be printable ASCII with no spaces and no path separators",
+        DuplicateName => "a file of that name already exists (delete it first)",
+        TableFull => "no free file slots",
+        ArenaFull => "not enough space left in the filesystem",
+        NotFound => "no such file",
+    }
+}
+
+/// `ls` — every file in RAM, with the space it occupies. The footer states
+/// where the bytes live, because "filesystem" invites the assumption of a
+/// disk and there isn't one.
+fn ls() {
+    crate::fs::with_fs(|fs| {
+        let (count, used, total) = fs.stats();
+        if count == 0 {
+            println_con("no files");
+        } else {
+            for name in fs.names() {
+                let len = fs.len_of(name).unwrap_or(0);
+                field(name, &format!("{len} bytes"));
+            }
+        }
+        field(
+            "",
+            &format!("{count} file(s), {used}/{total} bytes, all in RAM - nothing is on disk"),
+        );
+    });
+}
+
+/// `write <name> <text>` — creates a file from the rest of the line. Refuses
+/// to overwrite: a name that exists must be deleted first, so a typo cannot
+/// silently destroy a file.
+fn write_file(args: &str) {
+    let (name, text) = match args.split_once(char::is_whitespace) {
+        Some((name, rest)) => (name, rest.trim_start()),
+        None => (args, ""),
+    };
+    match crate::fs::with_fs(|fs| fs.create(name, text.as_bytes())) {
+        Ok(()) => field("written: ", &format!("{name} ({} bytes)", text.len())),
+        Err(e) => error(fs_error(e)),
+    }
+}
+
+/// `cat <name>` — prints a file to the console. Like every other command's
+/// output it never reaches the serial port, which `cargo xtask privacy`
+/// proves by typing this command and asserting serial stays silent.
+fn cat(args: &str) {
+    let name = args.trim();
+    crate::fs::with_fs(|fs| match fs.read(name) {
+        Ok(bytes) => match core::str::from_utf8(bytes) {
+            Ok(text) => println_con(text),
+            // A file written by `write` is always UTF-8; this arm exists so a
+            // future writer of arbitrary bytes cannot make `cat` panic.
+            Err(_) => error("that file is not valid UTF-8"),
+        },
+        Err(e) => error(fs_error(e)),
+    });
+}
+
+/// `rm <name>` — deletes a file. Its bytes are scrubbed and the arena is
+/// compacted, so the space is genuinely reusable and the contents are gone.
+fn rm(args: &str) {
+    let name = args.trim();
+    match crate::fs::with_fs(|fs| fs.delete(name)) {
+        Ok(()) => field("deleted: ", &format!("{name} (its bytes were scrubbed)")),
+        Err(e) => error(fs_error(e)),
     }
 }
 

@@ -1,11 +1,13 @@
 # TDD — Osmium v1 kernel
 
-**Status:** current — matches the shipped code through M11 (frame reclamation, 2026-08-18; fault isolation M10, per-task address spaces M9 and preemptive multitasking M8 the same day); both open questions are resolved below
+**Status:** current — matches the shipped code through M12 (a RAM-only filesystem, 2026-08-19; frame reclamation M11, fault isolation M10, per-task address spaces M9 and preemptive multitasking M8 on 2026-08-18); both open questions are resolved below
 **Date:** 2026-08-18 · **PRD:** [PRD.md](PRD.md) · **Repo:** `Leo-Y-Zhang/Osmium`
 
 ## Approach
 
-Osmium is a three-crate Cargo workspace, plus `user/hello`, `user/counter` and
+Osmium is a three-crate Cargo workspace (`kshared` carries the pure logic:
+address arithmetic, the line editor, the command table, the ELF parser and —
+since M12 — the filesystem), plus `user/hello`, `user/counter` and
 `user/crasher` — standalone crates the
 kernel's build script compiles into the embedded user ELFs. `kernel/` is a `no_std`
 binary built for
@@ -94,6 +96,7 @@ interrupt-context deadlocks.
 | `TIMER_ENTRY_AC` | `AtomicBool`, `#[cfg(feature = "selftest")]` only | M8 | Atomic, `SeqCst` | **Yes** — set by the timer's Rust half if `EFLAGS.AC` survived the naked entry's scrub; the battery asserts it never did while a hostile program held AC set |
 | `KERNEL_CR3`, `PHYS_OFFSET` | `AtomicU64` × 2 | M9, once at `memory::init` | Write-once, then read-only | `KERNEL_CR3` is read by the scheduler's run-complete path (IF=0) to restore the kernel's root; `PHYS_OFFSET` only from launcher context |
 | `BOOT_TSC`, `MARKS` | `AtomicU64`, `[AtomicU64; 3]` | First line of `kernel_main`; one `stamp` per boot phase (M5) | Atomic, `Relaxed` | No |
+| `FS` | `Mutex<kshared::ramfs::Ramfs>`: the file table and an 8 KiB content arena, all in `.bss` (M12) | Const-initialised empty; nothing seeds it, which is what "a cold boot is a clean slate" means here and what the battery asserts before anything writes | `spin::Mutex`, taken with a plain `lock` from task context only. Held across whole operations so a file is never observed half-written | **No.** No handler touches the filesystem, and nothing in it allocates, so it cannot deadlock against IRQ context or violate the handlers-never-allocate rule |
 | `CYCLES_PER_MS` | `AtomicU64`, `#[cfg(feature = "selftest")]` only | `time::calibrate`, battery builds only | Atomic, `Relaxed` | No |
 
 **The concurrency rule, stated once and enforced everywhere:** an interrupt handler
@@ -278,6 +281,7 @@ mod task;        // executor (cooperative), keyboard (ScancodeStream)
 mod sched;       // M8: preemptive round-robin of ring-3 tasks — TCBs, per-task
                  //   kernel stacks, the naked timer entry, context switch, SYS_EXIT
 mod usermode;    // ring 3: run_programs over kshared::elf, int 0x80 entry, teardown
+mod fs;          // M12: the one static kshared::ramfs instance + its lock discipline
 mod shell;       // prompt, dispatch, command implementations
 mod selftest;    // #[cfg(feature = "selftest")] battery; arms EXPECTING_DOUBLE_FAULT last
 mod qemu;        // exit_success() / exit_failure() via port 0xf4
@@ -328,7 +332,9 @@ page-table audit — no mapping is user-accessible before ring 3 has ever run; e
 CPU-advertised supervisor-hardening bit (SMEP/SMAP/UMIP) is live in CR4; the kernel
 heap is NX; an oversized allocation is refused with the allocator intact; an async
 task completes through its waker; a scripted shell session via injected scancodes
-renders `help`'s full output; a crafted W+X ELF image is refused; the embedded
+renders `help`'s full output; the M12 filesystem is empty at boot and
+round-trips a file through the kernel's own shared accessor, scrubbed on
+delete; a crafted W+X ELF image is refused; the embedded
 `hello` ELF runs at CPL 3 and returns via syscall; the M8 preemption proof —
 `counter` (an unyielding 30M-iteration compute loop holding `EFLAGS.AC` hostile)
 launched first and `hello` second, asserting hello exits first, ≥1 preemptive
@@ -443,6 +449,7 @@ Every green milestone is committed and pushed.
 | **M8** | Preemptive multitasking of ring-3 tasks: `sched` (TCBs, per-task heap-allocated kernel stacks, the naked timer entry with its AC scrub, round-robin switch, `SYS_EXIT` routing), TSS RSP0 made mutable and retargeted per switch, the multi-program loader with cross-image overlap refusal, `user/counter` (an unyielding register-heavy checksum program that holds AC hostile), and the `sched` shell command. Self-tests: exit-order preemption proof, exact checksum across every switch, timer-entry AC scrub, overlap refusal, the existing audits now covering the concurrent run. | Yes | `git revert`; M7's single-program cooperative kernel still boots and passes its battery. |
 | **M9** | Per-task address spaces: `memory::AddressSpace` (kernel PML4 cloned, entry-0 chain deep-copied against the MEASURED bootloader low mappings, user PD slots private), CR3 switched with RSP0 at every context switch and restored when the last task exits, hello's exit code widened to carry its data-segment read (the isolation witness), the M8 cross-image overlap refusal REMOVED (same-VA programs are now the point — `plans_overlap` and its host tests deleted with it), and the audit strengthened to its total form: the kernel table never carries any user-accessible entry. Self-tests: two instances of one image at one VA both run and both read pristine data; the W^X probe moved into a scratch space. | Yes | `git revert`; M8's shared-address-space scheduler still boots and passes its battery (its overlap refusal returns with it). |
 | **M10** | Fault isolation: every ring-3-reachable exception handler forks on the faulting CPL — ring 3 calls `sched::kill_current` (AC scrubbed, fault vector recorded in the exit report, RSP0+CR3 switched to the next ready task or the kernel's own world restored for the launcher return, via naked never-returning helpers); CPL 0 still panics, and NMI/#MC/#DF stay panic-only at any CPL. `user/crasher` (announces itself, then dereferences an unmapped address), the `crash` shell command, and `xtask privacy` typing `crash`. Self-tests: crasher terminated alone beside a surviving hello (repeated until the kill path is seen resuming the survivor), and a fault in the last task returning cleanly to the launcher. | Yes | `git revert`; M9's fault-fatal kernel still boots and passes its battery. |
+| **M12** | A RAM-only filesystem: `kshared::ramfs`, a flat namespace of up to 8 files over a fixed 8 KiB arena, allocator-free and host-tested. Refusal-first (`NameEmpty`, `NameTooLong`, `NameNotAllowed` — printable ASCII, no spaces, no path separators, which is what makes "no traversal" a refusal rather than a promise — `DuplicateName`, `TableFull`, `ArenaFull`, `NotFound`); `delete` scrubs the file's bytes and compacts the arena so freed space is reusable, the same standard M11 held the frame allocator to. The kernel owns one static instance behind a mutex never touched from interrupt context; `ls`/`write`/`cat`/`rm` in the shell; `xtask privacy` now types the sentinel INTO a file and `cat`s it back. Self-tests: eleven host tests covering every rule and boundary, plus a boot test for what only a boot shows — empty at boot, one shared instance, round-trip and scrub through the kernel's own accessor. | Yes | `git revert`; the kernel simply has no files again (nothing else depends on the module). |
 | **M11** | Frame reclamation: the allocator gains a free list (`deallocate_frame` scrubs at free time, asserts against double frees and foreign frames; `allocate_frame` prefers the list and still scrubs on hand-out), and each `AddressSpace` records every frame it pulls — the constructor's three table clones plus everything the mapping machinery allocates, captured by a recording adapter at the single allocation choke point — and returns exactly that set on drop, with an assert that the space is not the active CR3. `mem` and the battery's stats line report in-use and reclaimed counts. Self-tests: in-use frames land exactly on the pre-run baseline after ring-3 runs, warm runs are served entirely from the free list (the gross counter stops moving), and a freed frame reads back zero through the physical alias before any reallocation. | Yes | `git revert`; M10's leaking kernel still boots and passes its battery (its "frames are not reclaimed" boundary statement returns with it). |
 
 **How the sequencing worked out:** the keyboard interrupt lands at M2 and must read
@@ -628,6 +635,24 @@ must be seen to break it.
   probe fails: "a freed frame kept its bytes"). The three failures are three
   different assertions, which is the point — leak, no-reuse and scrub-loss
   are separately observable, so none can mask another.
+- *Mutation, M12 (all thirteen observed failing 2026-08-19):* the eleven host
+  tests were each observed failing under a named mutation of `kshared::ramfs`
+  — delete's tail scrub removed (the deleted bytes survive in the arena);
+  survivor offsets not shifted after compaction (a later file reads garbage);
+  contents not compacted at all; freed bytes not returned to the arena (the
+  filesystem form of M11's leak — the arena refuses a refill it should
+  accept); the duplicate check removed (a write silently replaces); the arena
+  bound off by one (`>=`, so an exact fill is wrongly refused); the table-full
+  check removed; path separators allowed in names; `read` ignoring the start
+  offset; a `read` miss falling through to entry 0 instead of `NotFound`; and
+  empty contents refused. The two kernel-side claims were mutated separately,
+  because no host test can reach them: an accessor that loses state between
+  calls (the round-trip fails with `NotFound`, which is what proves there is
+  ONE shared instance) and a seeded arena (the empty-at-boot assertion
+  fires). ⚠ The harness verifies each mutation actually changed the file
+  before trusting the run — an unapplied `sed` otherwise reads exactly like a
+  passing test and proves nothing, which happened once and was caught by that
+  check.
 - *Mutation, M11 adversarial-review round (observed failing 2026-08-18):*
   remove the scrub `allocate_frame` performs when it serves from the FREE
   LIST (the new `scrub_on_reuse_probe` fails with "a frame served from the

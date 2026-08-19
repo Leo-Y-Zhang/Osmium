@@ -162,6 +162,15 @@ fn privacy() -> Result<()> {
     send_line_as_keys(&mut monitor, "user")?;
     send_line_as_keys(&mut monitor, "sched")?;
     send_line_as_keys(&mut monitor, "crash")?;
+    // M12: the filesystem is typed through as well, writing the sentinel INTO
+    // a file and printing it back out. That extends the empty-post-boot-serial
+    // allowlist over the whole ramfs path — a `cat` that reached the serial
+    // port, or a debug print in create/read/delete, fails the gate. Note the
+    // sentinel travels twice: as a typed command and as file contents.
+    send_line_as_keys(&mut monitor, &format!("write secret {SENTINEL}"))?;
+    send_line_as_keys(&mut monitor, "ls")?;
+    send_line_as_keys(&mut monitor, "cat secret")?;
+    send_line_as_keys(&mut monitor, "rm secret")?;
     send_line_as_keys(&mut monitor, "shutdown")?;
 
     let status = loop {
