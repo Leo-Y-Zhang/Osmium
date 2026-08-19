@@ -1,10 +1,29 @@
 # Session handoff
 
-**State: v0.6.0 — M6 (ring 3) + M7 (ELF loader) + M8 (preemptive
-multitasking) + M9 (per-task address spaces) + M10 (fault isolation) +
-M11 (frame reclamation) + M12 (a RAM-only filesystem), hardened.** M8-M11
-landed 2026-08-18, M12 on 2026-08-19. Nothing is in flight and nothing is
-owed.
+**State: v0.6.0, and the project is deliberately CLOSED here.** M6 (ring 3)
++ M7 (ELF loader) + M8 (preemptive multitasking) + M9 (per-task address
+spaces) + M10 (fault isolation) + M11 (frame reclamation) + M12 (a RAM-only
+filesystem), all hardened. M8-M11 landed 2026-08-18, M12 on 2026-08-19.
+Nothing is in flight and nothing is owed.
+
+## Why it stops here, and what would actually be worth doing
+
+The roadmap's remaining items are **APIC/HPET** and **SMP**. Both were
+considered and both were judged poor value for this project: they are large,
+mostly plumbing, and — the deciding argument — they add little that a CI job
+can *falsify*. This repo's thesis is machine-checked claims, not feature
+count, so more surface with no new proof is a cost rather than a gain.
+Networking is on no roadmap, ever, and that is a thesis decision.
+
+**The one genuinely valuable next step needs hardware, not code:** every
+claim here is proven under QEMU. Writing a release image to a USB stick and
+booting a real x86_64 machine would add something no further commit can. The
+report form and `docs/HARDWARE.md` are already in place for exactly that.
+
+Accepted, deliberate limits (do not "fix" these without re-reading why):
+a faulting *kernel* is still fatal by design; there is one core; the shell is
+compiled in; and the filesystem's capacities are small on purpose, chosen so
+that every refusal it can return is reachable from the shipped prompt.
 
 - **M10:** every fault handler forks on the faulting CPL — ring 3 goes to
   `sched::kill_current`, which terminates that task alone and resumes the
@@ -23,6 +42,12 @@ owed.
 - All milestones are merged, pushed and CI-green on `main`. The four
   engineering documents in `docs/` are reconciled to the shipped code; treat
   any code-vs-doc drift as a defect in whichever is wrong.
+- **The published v0.6.0 images were verified independently of CI** on
+  2026-08-19: downloaded from the releases page, checksummed against the
+  published `SHA256SUMS`, and booted on both firmwares with
+  `cargo xtask test --shipped --bios|--uefi --image=<path>`. That flag pair
+  matters — `--image=` alone waits for a *selftest* verdict the shipped image
+  never emits, and looks like a hang.
 - Build, run and test commands are in the README (`cargo xtask ...`). On a
   machine without QEMU on PATH, point `OSMIUM_QEMU` at the binary.
 - Local gate = `cargo fmt --all --check`, clippy (both feature configs),
