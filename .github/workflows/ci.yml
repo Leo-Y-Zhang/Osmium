@@ -14,6 +14,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: these jobs only ever read the checkout. Declared
+# explicitly so the workflow keeps its own floor even if the repository
+# default token permission is widened later.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -21,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install # reads rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --locked -p kernel -p kshared --target x86_64-unknown-none --features selftest -- -D warnings
       # The shipped configuration too: the shell only compiles without the
@@ -60,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - shell: bash
         # Two hardening rules, both learned from gates that could not fail:
         # (1) explicit if/exit, not `! grep` — set -e ignores an inverted
@@ -134,7 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo test --locked -p kshared -p xtask
 
   boot-test:
@@ -146,7 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: Boot selftest (${{ matrix.firmware }})
         # shell: bash is load-bearing: it turns on pipefail, without which a
@@ -171,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: Boot the shipped image (${{ matrix.firmware }})
         # shell: bash for pipefail — see the boot-test note.

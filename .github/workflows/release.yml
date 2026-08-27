@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       # Gate the tag on the SAME proofs main is gated on, before publishing:
       # the selftest battery on both firmwares and the keystroke-privacy run.
