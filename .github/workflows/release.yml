@@ -7,15 +7,20 @@ on:
   push:
     tags: ['v*']
 
+# Read-only by default; only the job that publishes the release gets write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
@@ -49,12 +54,15 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Passed through the environment, not interpolated into the script,
+          # so a tag name can never be parsed as shell.
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
+          gh release create "$TAG" \
             target/img/osmium-bios.img \
             target/img/osmium-uefi.img \
             target/img/SHA256SUMS \
             THIRD_PARTY_LICENSES.md \
             serial-bios.log serial-uefi.log \
-            --title "Osmium ${{ github.ref_name }}" \
+            --title "Osmium $TAG" \
             --notes "Bootable BIOS and UEFI images, boot-proven in this CI run (see the attached serial logs). Verify with SHA256SUMS. Try it: \`qemu-system-x86_64 -drive format=raw,file=osmium-bios.img -m 24M\`."
